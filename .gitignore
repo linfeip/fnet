@@ -1,0 +1,20 @@
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Binaries & object files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Benchmark binaries & logs
+go-websocket-benchmark/output/bin/
+go-websocket-benchmark/output/log/
+*.log
