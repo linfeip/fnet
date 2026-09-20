@@ -23,29 +23,36 @@ import (
 // outbound side (outBuf, write state) and serialises direct socket writes.
 // The reactor's FeedInput therefore never waits behind a writer that is inside
 // a write syscall.
+type vcCallbacks struct {
+	onWritable   func()
+	onClose      func()
+	directWrite  func([]byte) (int, error)
+	directWritev func([][]byte) (int, error)
+}
+
 type VirtualConn struct {
 	local  net.Addr
 	remote net.Addr
 
+	raddrIPv4 [4]byte
+	raddrPort uint16
+
 	fd int
 	c  *conn
 
-	mu           sync.Mutex
-	inCond       *sync.Cond
-	inBuf        []byte
-	inReadOff    int
-	readEOF      bool
-	readErr      error
-	readDeadline time.Time
+	mu               sync.Mutex
+	inCond           *sync.Cond
+	inBuf            []byte
+	inReadOff        int
+	readEOF          bool
+	readErr          error
+	readDeadlineNano int64
 
-	wmu           sync.Mutex
-	outBuf        []byte
-	writeErr      error
-	writeDeadline time.Time
-	onWritable    func()                      // notify reactor that outbound data is queued
-	onClose       func()                      // notify owner that Close was called
-	directWrite   func([]byte) (int, error)   // fast-path direct socket write
-	directWritev  func([][]byte) (int, error) // fast-path direct vector socket write
+	wmu               sync.Mutex
+	outBuf            []byte
+	writeErr          error
+	writeDeadlineNano int64
+	cb                *vcCallbacks
 
 	closed atomic.Bool
 }
@@ -72,32 +79,39 @@ func (vc *VirtualConn) condLocked() *sync.Cond {
 	return vc.inCond
 }
 
+func (vc *VirtualConn) callbacksLocked() *vcCallbacks {
+	if vc.cb == nil {
+		vc.cb = new(vcCallbacks)
+	}
+	return vc.cb
+}
+
 func (vc *VirtualConn) doDirectWrite(b []byte) (int, error) {
 	if vc.fd > 0 {
 		return writeFD(vc.fd, b)
 	}
-	if vc.directWrite != nil {
-		return vc.directWrite(b)
+	if vc.cb != nil && vc.cb.directWrite != nil {
+		return vc.cb.directWrite(b)
 	}
 	return 0, nil
 }
 
 func (vc *VirtualConn) canDirectWrite() bool {
-	return vc.fd > 0 || vc.directWrite != nil
+	return vc.fd > 0 || (vc.cb != nil && vc.cb.directWrite != nil)
 }
 
 func (vc *VirtualConn) doDirectWritev(iovs [][]byte) (int, error) {
 	if vc.fd > 0 {
 		return writevFD(vc.fd, iovs)
 	}
-	if vc.directWritev != nil {
-		return vc.directWritev(iovs)
+	if vc.cb != nil && vc.cb.directWritev != nil {
+		return vc.cb.directWritev(iovs)
 	}
 	return 0, nil
 }
 
 func (vc *VirtualConn) canDirectWritev() bool {
-	return vc.fd > 0 || vc.directWritev != nil
+	return vc.fd > 0 || (vc.cb != nil && vc.cb.directWritev != nil)
 }
 
 func (vc *VirtualConn) notifyWritable() {
@@ -105,8 +119,8 @@ func (vc *VirtualConn) notifyWritable() {
 		vc.c.reactor.armWrite(vc.c)
 		return
 	}
-	if vc.onWritable != nil {
-		vc.onWritable()
+	if vc.cb != nil && vc.cb.onWritable != nil {
+		vc.cb.onWritable()
 	}
 }
 
@@ -115,8 +129,8 @@ func (vc *VirtualConn) notifyClose() {
 		vc.c.server.closeConnGraceful(vc.c, nil)
 		return
 	}
-	if vc.onClose != nil {
-		vc.onClose()
+	if vc.cb != nil && vc.cb.onClose != nil {
+		vc.cb.onClose()
 	}
 }
 
@@ -125,7 +139,7 @@ func (vc *VirtualConn) notifyClose() {
 // EPOLLOUT / EVFILT_WRITE.
 func (vc *VirtualConn) SetWritableCallback(fn func()) {
 	vc.wmu.Lock()
-	vc.onWritable = fn
+	vc.callbacksLocked().onWritable = fn
 	vc.wmu.Unlock()
 }
 
@@ -133,7 +147,7 @@ func (vc *VirtualConn) SetWritableCallback(fn func()) {
 // called. The server uses it to release the socket owned by the reactor.
 func (vc *VirtualConn) SetCloseCallback(fn func()) {
 	vc.wmu.Lock()
-	vc.onClose = fn
+	vc.callbacksLocked().onClose = fn
 	vc.wmu.Unlock()
 }
 
@@ -141,7 +155,7 @@ func (vc *VirtualConn) SetCloseCallback(fn func()) {
 // write to the underlying socket before buffering.
 func (vc *VirtualConn) SetDirectWrite(fn func([]byte) (int, error)) {
 	vc.wmu.Lock()
-	vc.directWrite = fn
+	vc.callbacksLocked().directWrite = fn
 	vc.wmu.Unlock()
 }
 
@@ -149,7 +163,7 @@ func (vc *VirtualConn) SetDirectWrite(fn func([]byte) (int, error)) {
 // vector write (writev) to the underlying socket before buffering.
 func (vc *VirtualConn) SetDirectWritev(fn func([][]byte) (int, error)) {
 	vc.wmu.Lock()
-	vc.directWritev = fn
+	vc.callbacksLocked().directWritev = fn
 	vc.wmu.Unlock()
 }
 
@@ -370,8 +384,9 @@ func (vc *VirtualConn) Read(b []byte) (int, error) {
 		if vc.readEOF || vc.closed.Load() {
 			return 0, io.EOF
 		}
-		if !vc.readDeadline.IsZero() {
-			remain := time.Until(vc.readDeadline)
+		if vc.readDeadlineNano > 0 {
+			now := time.Now().UnixNano()
+			remain := time.Duration(vc.readDeadlineNano - now)
 			if remain <= 0 {
 				return 0, syscall.ETIMEDOUT
 			}
@@ -384,7 +399,7 @@ func (vc *VirtualConn) Read(b []byte) (int, error) {
 			})
 			vc.condLocked().Wait()
 			timer.Stop()
-			if !vc.readDeadline.IsZero() && time.Now().After(vc.readDeadline) && len(vc.inBuf) == vc.inReadOff {
+			if vc.readDeadlineNano > 0 && time.Now().UnixNano() > vc.readDeadlineNano && len(vc.inBuf) == vc.inReadOff {
 				return 0, syscall.ETIMEDOUT
 			}
 			continue
@@ -405,7 +420,7 @@ func (vc *VirtualConn) checkWritableLocked() error {
 	if vc.writeErr != nil {
 		return vc.writeErr
 	}
-	if !vc.writeDeadline.IsZero() && time.Now().After(vc.writeDeadline) {
+	if vc.writeDeadlineNano > 0 && time.Now().UnixNano() > vc.writeDeadlineNano {
 		return syscall.ETIMEDOUT
 	}
 	return nil
@@ -601,6 +616,12 @@ func (vc *VirtualConn) RemoteAddr() net.Addr {
 	if vc.remote != nil {
 		return vc.remote
 	}
+	if vc.raddrPort != 0 {
+		return &net.TCPAddr{
+			IP:   net.IPv4(vc.raddrIPv4[0], vc.raddrIPv4[1], vc.raddrIPv4[2], vc.raddrIPv4[3]),
+			Port: int(vc.raddrPort),
+		}
+	}
 	return &net.TCPAddr{}
 }
 
@@ -614,8 +635,12 @@ func (vc *VirtualConn) SetDeadline(t time.Time) error {
 
 // SetReadDeadline implements net.Conn.
 func (vc *VirtualConn) SetReadDeadline(t time.Time) error {
+	var nano int64
+	if !t.IsZero() {
+		nano = t.UnixNano()
+	}
 	vc.mu.Lock()
-	vc.readDeadline = t
+	vc.readDeadlineNano = nano
 	if vc.inCond != nil {
 		vc.inCond.Broadcast()
 	}
@@ -625,8 +650,12 @@ func (vc *VirtualConn) SetReadDeadline(t time.Time) error {
 
 // SetWriteDeadline implements net.Conn.
 func (vc *VirtualConn) SetWriteDeadline(t time.Time) error {
+	var nano int64
+	if !t.IsZero() {
+		nano = t.UnixNano()
+	}
 	vc.wmu.Lock()
-	vc.writeDeadline = t
+	vc.writeDeadlineNano = nano
 	vc.wmu.Unlock()
 	return nil
 }

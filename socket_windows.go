@@ -166,6 +166,15 @@ func acceptFD(fd int) (int, net.Addr, error) {
 	return id, c.RemoteAddr(), nil
 }
 
+func acceptConn(lnFD int, laddr net.Addr) (int, *VirtualConn, error) {
+	nfd, raddr, err := acceptFD(lnFD)
+	if err != nil {
+		return -1, nil, err
+	}
+	vc := NewVirtualConn(laddr, raddr)
+	return nfd, vc, nil
+}
+
 func listenNonblock(network, address string) (int, net.Addr, error) {
 	ln, err := net.Listen(network, address)
 	if err != nil {

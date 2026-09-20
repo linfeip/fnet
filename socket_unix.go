@@ -40,6 +40,22 @@ func writevFD(fd int, iovs [][]byte) (int, error) {
 	return unix.Writev(fd, iovs)
 }
 
+func acceptConn(lnFD int, laddr net.Addr) (int, *VirtualConn, error) {
+	nfd, sa, err := sysAccept(lnFD)
+	if err != nil {
+		return -1, nil, err
+	}
+	_ = unix.SetsockoptInt(nfd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	vc := NewVirtualConn(laddr, nil)
+	if sa4, ok := sa.(*unix.SockaddrInet4); ok {
+		vc.raddrIPv4 = sa4.Addr
+		vc.raddrPort = uint16(sa4.Port)
+	} else if sa != nil {
+		vc.remote = sockaddrToAddr(sa)
+	}
+	return nfd, vc, nil
+}
+
 func acceptFD(fd int) (int, net.Addr, error) {
 	nfd, sa, err := sysAccept(fd)
 	if err != nil {

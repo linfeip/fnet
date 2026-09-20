@@ -50,7 +50,18 @@ type WSAttacher interface {
 	AttachWS(handler WSHandler) (*VirtualConn, error)
 }
 
-func newResponseWriter(conn net.Conn, bufr ...*bufio.Reader) *responseWriter {
+var responseWriterPool = sync.Pool{
+	New: func() any {
+		return &responseWriter{
+			header:        make(http.Header, 8),
+			status:        http.StatusOK,
+			contentLength: -1,
+		}
+	},
+}
+
+func acquireResponseWriter(c *conn, conn net.Conn, bufr ...*bufio.Reader) *responseWriter {
+	w := responseWriterPool.Get().(*responseWriter)
 	var r *bufio.Reader
 	if len(bufr) > 0 {
 		r = bufr[0]
@@ -58,13 +69,34 @@ func newResponseWriter(conn net.Conn, bufr ...*bufio.Reader) *responseWriter {
 	if r == nil {
 		r = bufio.NewReader(conn)
 	}
-	return &responseWriter{
-		conn:          conn,
-		bufr:          r,
-		header:        make(http.Header),
-		status:        http.StatusOK,
-		contentLength: -1,
+	w.c = c
+	w.conn = conn
+	w.bufr = r
+	w.bufw = nil
+	w.bufwPooled = false
+	w.status = http.StatusOK
+	w.wroteHeader = false
+	w.wroteBody = false
+	w.hijacked = false
+	w.contentLength = -1
+	w.chunked = false
+	w.closeConn = false
+	w.bodyBuf.Reset()
+	if w.header == nil {
+		w.header = make(http.Header, 8)
+	} else {
+		clear(w.header)
 	}
+	return w
+}
+
+func releaseResponseWriter(w *responseWriter) {
+	w.releaseBuffers()
+	responseWriterPool.Put(w)
+}
+
+func newResponseWriter(conn net.Conn, bufr ...*bufio.Reader) *responseWriter {
+	return acquireResponseWriter(nil, conn, bufr...)
 }
 
 func (w *responseWriter) SetClose(close bool) {
@@ -236,8 +268,11 @@ func (w *responseWriter) releaseBuffers() {
 		w.bufw = nil
 		w.bufwPooled = false
 	}
+	w.conn = nil
 	w.bufr = nil
-	w.header = nil
+	if w.header != nil {
+		clear(w.header)
+	}
 	w.c = nil
 }
 

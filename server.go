@@ -49,6 +49,7 @@ type Server struct {
 	lnMu        sync.Mutex
 	listeners   map[int]net.Addr // listener fd -> local address
 	mainPoller  Poller
+	conns       connTable
 	reactors    []*subReactor
 	nextReactor atomic.Uint64
 	closing     atomic.Bool
@@ -59,7 +60,6 @@ type subReactor struct {
 	id     int
 	server *Server
 	poller Poller
-	conns  connTable
 	rbuf   []byte // per-reactor read buffer
 
 	// Work handed to the reactor goroutine from other goroutines.
@@ -127,8 +127,11 @@ func (t *connTable) store(fd int, c *conn) {
 		oldChunks = *p
 	}
 	newLen := len(oldChunks)
-	if cIdx >= newLen {
-		newLen = cIdx + 1
+	if newLen == 0 {
+		newLen = 32
+	}
+	for cIdx >= newLen {
+		newLen *= 2
 	}
 	newChunks := make([]*connChunk, newLen)
 	copy(newChunks, oldChunks)
@@ -359,11 +362,11 @@ func (s *Server) Close() error {
 		_ = mp.Wake()
 	}
 
+	s.conns.forEach(func(c *conn) bool {
+		s.closeConn(c)
+		return true
+	})
 	for _, r := range reactors {
-		r.conns.forEach(func(c *conn) bool {
-			s.closeConn(c)
-			return true
-		})
 		_ = r.poller.Wake()
 	}
 
@@ -398,7 +401,7 @@ func (s *Server) acceptLoop() error {
 
 func (s *Server) handleAccept(lnFD int, laddr net.Addr) {
 	for {
-		nfd, raddr, err := acceptFD(lnFD)
+		nfd, vc, err := acceptConn(lnFD, laddr)
 		if err != nil {
 			// EAGAIN / EWOULDBLOCK: backlog drained. Anything else: give up for now.
 			return
@@ -407,7 +410,6 @@ func (s *Server) handleAccept(lnFD int, laddr net.Addr) {
 		idx := s.nextReactor.Add(1) % uint64(len(s.reactors))
 		r := s.reactors[idx]
 
-		vc := NewVirtualConn(laddr, raddr)
 		c := &conn{
 			fd:      nfd,
 			vc:      vc,
@@ -416,7 +418,7 @@ func (s *Server) handleAccept(lnFD int, laddr net.Addr) {
 		}
 		vc.attachConn(nfd, c)
 
-		r.conns.store(nfd, c)
+		s.conns.store(nfd, c)
 		if err := r.poller.AddRead(nfd); err != nil {
 			s.closeConn(c)
 			continue
@@ -453,7 +455,7 @@ func (r *subReactor) loop() {
 			continue
 		}
 		for _, ev := range events {
-			c := r.conns.get(ev.Fd)
+			c := r.server.conns.get(ev.Fd)
 			if c == nil {
 				continue
 			}
@@ -812,7 +814,7 @@ func (s *Server) closeConnWithErr(c *conn, err error) {
 	c.wsHandler = nil
 	c.mu.Unlock()
 
-	c.reactor.conns.delete(c.fd)
+	s.conns.delete(c.fd)
 	_ = c.vc.Close()
 
 	if handler != nil {
@@ -877,8 +879,7 @@ func (s *Server) serveConn(c *conn) {
 			_ = rw.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
 		}
 
-		w := newResponseWriter(rw, reader)
-		w.c = c
+		w := acquireResponseWriter(c, rw, reader)
 		if req.Close || strings.EqualFold(req.Header.Get("Connection"), "close") {
 			w.SetClose(true)
 		}
@@ -895,7 +896,7 @@ func (s *Server) serveConn(c *conn) {
 				reader.Reset(nil)
 				readerPool.Put(reader)
 				pooled = false
-				w.releaseBuffers()
+				releaseResponseWriter(w)
 				c.vc.CompactOrRelease()
 				if c.vc.InputLen() > 0 {
 					c.reactor.scheduleWS(c)
@@ -910,7 +911,9 @@ func (s *Server) serveConn(c *conn) {
 		_, _ = io.Copy(io.Discard, req.Body)
 		_ = req.Body.Close()
 
-		if req.Close || strings.EqualFold(w.header.Get("Connection"), "close") {
+		closeAfter := req.Close || strings.EqualFold(w.header.Get("Connection"), "close")
+		releaseResponseWriter(w)
+		if closeAfter {
 			s.closeConnGraceful(c, io.EOF)
 			return
 		}

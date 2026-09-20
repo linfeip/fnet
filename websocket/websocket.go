@@ -138,8 +138,13 @@ func (u *Upgrader) UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventH
 
 	bridge := &wsHandlerBridge{conn: conn, handler: h}
 	if attacher != nil {
-		_, err := attacher.AttachWS(bridge)
+		vc, err := attacher.AttachWS(bridge)
 		if err == nil {
+			if vc != nil {
+				conn.conn = vc
+				conn.reader = nil
+				conn.rw = readWriter{}
+			}
 			bridge.OnOpen()
 			return conn, nil
 		}
