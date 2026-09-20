@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"fnet"
+	"github.com/linfeip/fnet"
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"

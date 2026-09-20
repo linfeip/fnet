@@ -6,8 +6,8 @@ import (
 	"log"
 	"net/http"
 
-	"fnet"
-	"fnet/websocket"
+	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/websocket"
 )
 
 func main() {

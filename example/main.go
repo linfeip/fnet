@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"fnet"
+	"github.com/linfeip/fnet"
 )
 
 func main() {

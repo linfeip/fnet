@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"fnet"
-	"fnet/websocket"
+	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/websocket"
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"

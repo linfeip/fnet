@@ -1,4 +1,4 @@
-module fnet
+module github.com/linfeip/fnet
 
 go 1.26.4
 
