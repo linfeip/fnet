@@ -8,10 +8,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/gobwas/ws"
 )
 
 // Server is a high-performance HTTP/HTTPS server driven by a native poller
@@ -30,6 +33,7 @@ type Server struct {
 	// IdleTimeout closes keep-alive connections after this idle period (0 = disable keep-alive loop beyond one request).
 	IdleTimeout time.Duration
 
+	lnMu     sync.Mutex
 	poller   Poller
 	lnFD     int
 	lnAddr   net.Addr
@@ -40,11 +44,26 @@ type Server struct {
 	wakeFDs  map[int]struct{} // fds needing write interest
 }
 
+const (
+	connStateIdle = iota
+	connStateWorking
+	connStateHijacked
+	connStateWSEventDriven
+	connStateClosed
+)
+
+const maxHeaderBuffer = 64 * 1024 // 64KB max buffered header to prevent memory exhaustion
+
 type conn struct {
 	fd     int
 	vc     *VirtualConn
 	server *Server
 	once   sync.Once
+
+	mu        sync.Mutex
+	state     int
+	wsWorking bool
+	wsHandler WSHandler
 }
 
 // ListenAndServe starts a plain HTTP server.
@@ -80,16 +99,19 @@ func (s *Server) serve(tlsCfg *tls.Config) error {
 	if err != nil {
 		return err
 	}
-	s.lnFD = fd
-	s.lnAddr = addr
 
 	p, err := NewPoller()
 	if err != nil {
 		_ = closeFD(fd)
 		return err
 	}
+
+	s.lnMu.Lock()
+	s.lnFD = fd
+	s.lnAddr = addr
 	s.poller = p
 	s.wakeFDs = make(map[int]struct{})
+	s.lnMu.Unlock()
 
 	if err := s.poller.AddRead(fd); err != nil {
 		_ = s.poller.Close()
@@ -105,19 +127,24 @@ func (s *Server) Close() error {
 	if !s.closing.CompareAndSwap(false, true) {
 		return nil
 	}
-	if s.poller != nil {
-		_ = s.poller.Delete(s.lnFD)
+	s.lnMu.Lock()
+	p := s.poller
+	lnFD := s.lnFD
+	s.lnMu.Unlock()
+
+	if p != nil && lnFD > 0 {
+		_ = p.Delete(lnFD)
 	}
-	if s.lnFD > 0 {
-		_ = closeFD(s.lnFD)
+	if lnFD > 0 {
+		_ = closeFD(lnFD)
 	}
 	s.conns.Range(func(key, value any) bool {
 		c := value.(*conn)
 		s.closeConn(c)
 		return true
 	})
-	if s.poller != nil {
-		_ = s.poller.Close()
+	if p != nil {
+		_ = p.Close()
 	}
 	s.wg.Wait()
 	return nil
@@ -173,7 +200,12 @@ func (s *Server) handleAccept() {
 			return
 		}
 		vc := NewVirtualConn(s.lnAddr, raddr)
-		c := &conn{fd: nfd, vc: vc, server: s}
+		c := &conn{
+			fd:     nfd,
+			vc:     vc,
+			server: s,
+			state:  connStateIdle,
+		}
 		fd := nfd
 		vc.SetWritableCallback(func() {
 			s.armWrite(fd)
@@ -186,8 +218,8 @@ func (s *Server) handleAccept() {
 			s.closeConn(c)
 			continue
 		}
-		s.wg.Add(1)
-		go s.serveConn(c)
+		// Newly accepted connection remains in connStateIdle.
+		// Poller will dispatch a worker goroutine on-demand only when a complete HTTP header arrives.
 	}
 }
 
@@ -199,6 +231,7 @@ func (s *Server) handleRead(c *conn, buf []byte) {
 		}
 		if err != nil {
 			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+				s.checkAndDispatch(c)
 				return
 			}
 			c.vc.FeedError(err)
@@ -209,6 +242,99 @@ func (s *Server) handleRead(c *conn, buf []byte) {
 			c.vc.FeedEOF()
 			s.closeConn(c)
 			return
+		}
+	}
+}
+
+func (s *Server) checkAndDispatch(c *conn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.state == connStateClosed {
+		return
+	}
+
+	if c.state == connStateWSEventDriven {
+		if !c.wsWorking && c.vc.HasCompleteWSFrame() {
+			c.wsWorking = true
+			s.wg.Add(1)
+			go s.serveWSConn(c)
+		}
+		return
+	}
+
+	if c.state != connStateIdle {
+		return
+	}
+
+	if s.TLSConfig != nil {
+		if c.vc.HasBufferedInput() {
+			c.state = connStateWorking
+			s.wg.Add(1)
+			go s.serveConn(c)
+		}
+		return
+	}
+
+	// Defend against slow/malicious connections buffering large data without \r\n\r\n
+	if c.vc.InputLen() > maxHeaderBuffer && !c.vc.HasCompleteHeader() {
+		go s.closeConn(c)
+		return
+	}
+
+	if c.vc.HasCompleteHeader() {
+		c.state = connStateWorking
+		s.wg.Add(1)
+		go s.serveConn(c)
+	}
+}
+
+func (s *Server) serveWSConn(c *conn) {
+	defer s.wg.Done()
+
+	for {
+		c.mu.Lock()
+		if c.state != connStateWSEventDriven {
+			c.wsWorking = false
+			c.mu.Unlock()
+			return
+		}
+
+		h, payload, ok, err := c.vc.PopWSFrame()
+		if err != nil {
+			c.wsWorking = false
+			c.mu.Unlock()
+			s.closeConnWithErr(c, err)
+			return
+		}
+		if !ok {
+			c.wsWorking = false
+			c.mu.Unlock()
+			return
+		}
+		handler := c.wsHandler
+		c.mu.Unlock()
+
+		if h.OpCode == ws.OpClose {
+			_ = ws.WriteFrame(c.vc, ws.NewCloseFrame(ws.NewCloseFrameBody(ws.StatusNormalClosure, "")))
+			s.flushConnSync(c)
+			s.closeConnWithErr(c, nil)
+			return
+		}
+
+		if h.OpCode == ws.OpPing {
+			_ = ws.WriteFrame(c.vc, ws.NewPongFrame(payload))
+			s.flushConnSync(c)
+			continue
+		}
+
+		if h.OpCode == ws.OpPong {
+			continue
+		}
+
+		if handler != nil {
+			handler.OnMessage(byte(h.OpCode), payload)
+			s.flushConnSync(c)
 		}
 	}
 }
@@ -273,8 +399,18 @@ func (s *Server) flushWriteInterest() {
 	}
 }
 
-func (s *Server) closeConn(c *conn) {
+func (s *Server) closeConnWithErr(c *conn, err error) {
 	c.once.Do(func() {
+		c.mu.Lock()
+		c.state = connStateClosed
+		handler := c.wsHandler
+		c.wsHandler = nil
+		c.mu.Unlock()
+
+		if handler != nil {
+			handler.OnClose(err)
+		}
+
 		s.conns.Delete(c.fd)
 		_ = s.poller.Delete(c.fd)
 		_ = c.vc.Close()
@@ -282,12 +418,12 @@ func (s *Server) closeConn(c *conn) {
 	})
 }
 
+func (s *Server) closeConn(c *conn) {
+	s.closeConnWithErr(c, io.EOF)
+}
+
 func (s *Server) serveConn(c *conn) {
 	defer s.wg.Done()
-	defer func() {
-		s.flushConnSync(c)
-		s.closeConn(c)
-	}()
 
 	var rw net.Conn = c.vc
 	if s.TLSConfig != nil {
@@ -296,6 +432,7 @@ func (s *Server) serveConn(c *conn) {
 			_ = tlsConn.SetReadDeadline(time.Now().Add(s.ReadTimeout))
 		}
 		if err := tlsConn.Handshake(); err != nil {
+			s.closeConn(c)
 			return
 		}
 		rw = tlsConn
@@ -308,9 +445,8 @@ func (s *Server) serveConn(c *conn) {
 		}
 		req, err := http.ReadRequest(reader)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-				return
-			}
+			s.flushConnSync(c)
+			s.closeConn(c)
 			return
 		}
 		req.RemoteAddr = c.vc.RemoteAddr().String()
@@ -320,24 +456,73 @@ func (s *Server) serveConn(c *conn) {
 		}
 
 		w := newResponseWriter(rw, reader)
+		w.c = c
+		if req.Close || strings.EqualFold(req.Header.Get("Connection"), "close") {
+			w.SetClose(true)
+		}
 		s.Handler.ServeHTTP(w, req)
 		if w.Hijacked() {
 			// Connection was hijacked (e.g. WebSocket).
-			// Handler took over the connection lifecycle; worker returns upon handler completion.
+			c.mu.Lock()
+			if c.state == connStateWSEventDriven {
+				c.mu.Unlock()
+				s.flushConnSync(c)
+				s.checkAndDispatch(c)
+				return
+			}
+			c.state = connStateHijacked
+			c.mu.Unlock()
+			s.flushConnSync(c)
+			s.closeConn(c)
 			return
 		}
 		_ = w.finish()
+		_, _ = io.Copy(io.Discard, req.Body)
 		_ = req.Body.Close()
 
-		if req.Close || w.header.Get("Connection") == "close" {
+		if req.Close || strings.EqualFold(w.header.Get("Connection"), "close") {
+			s.flushConnSync(c)
+			s.closeConn(c)
 			return
 		}
-		if s.IdleTimeout > 0 {
-			_ = rw.SetReadDeadline(time.Now().Add(s.IdleTimeout))
-		} else {
-			// Single-request mode by default for simplicity/safety.
+
+		s.flushConnSync(c)
+
+		// Unshift any excess buffered bytes read by bufio.Reader back to c.vc
+		if reader.Buffered() > 0 {
+			rem := make([]byte, reader.Buffered())
+			_, _ = io.ReadFull(reader, rem)
+			c.vc.UnshiftInput(rem)
+		}
+
+		// Check if there is an immediately pipelined complete HTTP request
+		c.mu.Lock()
+		if c.state == connStateClosed {
+			c.mu.Unlock()
 			return
 		}
+
+		if s.TLSConfig == nil && c.vc.HasCompleteHeader() {
+			c.mu.Unlock()
+			reader.Reset(rw)
+			continue
+		}
+
+		if s.TLSConfig != nil {
+			c.mu.Unlock()
+			if s.IdleTimeout > 0 {
+				_ = rw.SetReadDeadline(time.Now().Add(s.IdleTimeout))
+				continue
+			}
+			s.closeConn(c)
+			return
+		}
+
+		// No complete request pending. Revert connection to Idle state under Poller custody,
+		// and terminate this worker goroutine to avoid idle goroutine holding.
+		c.state = connStateIdle
+		c.mu.Unlock()
+		return
 	}
 }
 

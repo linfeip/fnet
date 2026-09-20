@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"fnet"
+
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
 )
@@ -39,6 +41,44 @@ type Upgrader struct {
 
 	// Header contains optional headers to include in the 101 response.
 	Header http.Header
+
+	// Optional event-driven callbacks. When OnMessage is set, Upgrade will
+	// automatically operate in event-driven mode (zero goroutines while idle).
+	OnOpen    func(c *Conn)
+	OnMessage func(c *Conn, op OpCode, payload []byte)
+	OnClose   func(c *Conn, err error)
+}
+
+// EventHandler defines the callbacks for event-driven WebSocket connections.
+// In event-driven mode, fnet parses WebSocket frames in its reactor and calls
+// OnMessage on-demand, holding 0 goroutines when the connection is idle.
+type EventHandler struct {
+	OnOpen    func(c *Conn)
+	OnMessage func(c *Conn, op OpCode, payload []byte)
+	OnClose   func(c *Conn, err error)
+}
+
+type wsHandlerBridge struct {
+	conn    *Conn
+	handler EventHandler
+}
+
+func (b *wsHandlerBridge) OnOpen() {
+	if b.handler.OnOpen != nil {
+		b.handler.OnOpen(b.conn)
+	}
+}
+
+func (b *wsHandlerBridge) OnMessage(opcode byte, payload []byte) {
+	if b.handler.OnMessage != nil {
+		b.handler.OnMessage(b.conn, OpCode(opcode), payload)
+	}
+}
+
+func (b *wsHandlerBridge) OnClose(err error) {
+	if b.handler.OnClose != nil {
+		b.handler.OnClose(b.conn, err)
+	}
 }
 
 // DefaultUpgrader is a ready-to-use Upgrader with sensible defaults.
@@ -49,8 +89,56 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 	return DefaultUpgrader.Upgrade(w, r)
 }
 
+// UpgradeEvent upgrades the HTTP connection using DefaultUpgrader in event-driven mode.
+func UpgradeEvent(w http.ResponseWriter, r *http.Request, handler EventHandler) (*Conn, error) {
+	return DefaultUpgrader.UpgradeEvent(w, r, handler)
+}
+
 // Upgrade upgrades an incoming HTTP request to a WebSocket connection.
+// If u.OnMessage is configured, it operates in event-driven mode (zero goroutines while idle).
+// Otherwise, it returns a classic blocking *Conn for manual ReadMessage calls.
 func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
+	if u.OnMessage != nil {
+		return u.UpgradeEvent(w, r, EventHandler{
+			OnOpen:    u.OnOpen,
+			OnMessage: u.OnMessage,
+			OnClose:   u.OnClose,
+		})
+	}
+	return u.upgradeInternal(w, r)
+}
+
+// UpgradeEvent upgrades an incoming HTTP request to an event-driven WebSocket connection.
+// It executes the WebSocket handshake, registers the event callbacks, and instructs
+// fnet to manage the connection in its poller. The HTTP ServeHTTP handler can (and should)
+// return immediately, releasing the request goroutine.
+// While idle, 0 goroutines are held by this connection.
+func (u *Upgrader) UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventHandler) (*Conn, error) {
+	conn, err := u.upgradeInternal(w, r)
+	if err != nil {
+		return nil, err
+	}
+
+	var attacher fnet.WSAttacher
+	if a, ok := w.(fnet.WSAttacher); ok {
+		attacher = a
+	} else if a, ok := conn.conn.(fnet.WSAttacher); ok {
+		attacher = a
+	}
+
+	if attacher != nil {
+		bridge := &wsHandlerBridge{conn: conn, handler: h}
+		if _, err := attacher.AttachWS(bridge); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		bridge.OnOpen()
+	}
+
+	return conn, nil
+}
+
+func (u *Upgrader) upgradeInternal(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 	if u.CheckOrigin != nil && !u.CheckOrigin(r) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return nil, errors.New("fnet/websocket: origin not allowed")

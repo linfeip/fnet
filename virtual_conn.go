@@ -1,12 +1,15 @@
 package fnet
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/gobwas/ws"
 )
 
 // VirtualConn is a concurrency-safe net.Conn adapter. The reactor feeds
@@ -76,6 +79,99 @@ func (vc *VirtualConn) FeedInput(b []byte) {
 	}
 	vc.inBuf = append(vc.inBuf, b...)
 	vc.inCond.Signal()
+	vc.mu.Unlock()
+}
+
+// HasCompleteHeader reports whether the buffered input contains a complete HTTP header
+// marked by \r\n\r\n or \n\n.
+func (vc *VirtualConn) HasCompleteHeader() bool {
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	return bytes.Contains(vc.inBuf, []byte("\r\n\r\n")) || bytes.Contains(vc.inBuf, []byte("\n\n"))
+}
+
+// HasCompleteWSFrame reports whether vc.inBuf contains at least one complete WebSocket frame.
+func (vc *VirtualConn) HasCompleteWSFrame() bool {
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+
+	if len(vc.inBuf) < 2 {
+		return false
+	}
+	r := bytes.NewReader(vc.inBuf)
+	h, err := ws.ReadHeader(r)
+	if err != nil {
+		return false
+	}
+	headerSize := len(vc.inBuf) - r.Len()
+	return len(vc.inBuf) >= headerSize+int(h.Length)
+}
+
+// PopWSFrame extracts the next complete WebSocket frame from the input buffer.
+// If complete, it returns header, payload (unmasked if masked), found=true, nil.
+// If the buffer does not have a complete frame yet, it returns found=false, nil without advancing inBuf.
+// If the frame header is corrupted or violates protocol, it returns found=false, err.
+func (vc *VirtualConn) PopWSFrame() (ws.Header, []byte, bool, error) {
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+
+	if len(vc.inBuf) < 2 {
+		return ws.Header{}, nil, false, nil
+	}
+
+	r := bytes.NewReader(vc.inBuf)
+	h, err := ws.ReadHeader(r)
+	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return ws.Header{}, nil, false, nil
+		}
+		return ws.Header{}, nil, false, err
+	}
+
+	headerSize := len(vc.inBuf) - r.Len()
+	totalSize := headerSize + int(h.Length)
+	if len(vc.inBuf) < totalSize {
+		return ws.Header{}, nil, false, nil
+	}
+
+	var payload []byte
+	if h.Length > 0 {
+		payload = make([]byte, h.Length)
+		copy(payload, vc.inBuf[headerSize:totalSize])
+		if h.Masked {
+			ws.Cipher(payload, h.Mask, 0)
+		}
+	}
+
+	vc.inBuf = vc.inBuf[totalSize:]
+	if len(vc.inBuf) == 0 {
+		vc.inBuf = vc.inBuf[:0]
+	}
+
+	return h, payload, true, nil
+}
+
+// HasBufferedInput reports whether there is any pending input data in the read buffer.
+func (vc *VirtualConn) HasBufferedInput() bool {
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	return len(vc.inBuf) > 0
+}
+
+// InputLen returns the length of unconsumed input buffer.
+func (vc *VirtualConn) InputLen() int {
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	return len(vc.inBuf)
+}
+
+// UnshiftInput prepends unconsumed bytes back to the front of the inbound buffer.
+func (vc *VirtualConn) UnshiftInput(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	vc.mu.Lock()
+	vc.inBuf = append(append([]byte(nil), b...), vc.inBuf...)
 	vc.mu.Unlock()
 }
 

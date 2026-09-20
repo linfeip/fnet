@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -258,3 +259,161 @@ func (c *bufferConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
 func (c *bufferConn) SetDeadline(time.Time) error      { return nil }
 func (c *bufferConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *bufferConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestZeroGoroutinesOnIdleConnections(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "pong")
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	srv := &Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer func() { _ = srv.Close() }()
+
+	// Wait for server to start
+	time.Sleep(50 * time.Millisecond)
+
+	initialGoroutines := runtime.NumGoroutine()
+
+	// Open 200 idle TCP connections without sending any HTTP request data
+	const connCount = 200
+	conns := make([]net.Conn, connCount)
+	for i := 0; i < connCount; i++ {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("failed to dial: %v", err)
+		}
+		conns[i] = c
+		defer c.Close()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// In the new event-driven architecture, 200 idle connections must NOT spawn 200 worker goroutines.
+	// We expect runtime.NumGoroutine to remain roughly equal to initialGoroutines (+-3).
+	currentGoroutines := runtime.NumGoroutine()
+	diff := currentGoroutines - initialGoroutines
+	if diff > 10 {
+		t.Fatalf("goroutine leak on idle connections: initial=%d, current=%d, diff=%d (expected <= 10)",
+			initialGoroutines, currentGoroutines, diff)
+	}
+}
+
+func TestPartialHeaderDelayedDispatch(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "hello from server")
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	srv := &Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer func() { _ = srv.Close() }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// 1. Send incomplete header (no \r\n\r\n yet)
+	_, err = conn.Write([]byte("GET /echo HTTP/1.1\r\nHost: localhost\r\n"))
+	if err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 2. Now send the delimiter \r\n\r\n to complete the header
+	_, err = conn.Write([]byte("\r\n"))
+	if err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	// 3. We should immediately receive the HTTP response
+	buf := make([]byte, 1024)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+
+	resp := string(buf[:n])
+	if !strings.Contains(resp, "200 OK") || !strings.Contains(resp, "hello from server") {
+		t.Fatalf("unexpected response: %s", resp)
+	}
+}
+
+func TestKeepAliveGoroutineRecycle(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/keep", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "keepalive-ok")
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	srv := &Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer func() { _ = srv.Close() }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// First request on connection
+	req1 := "GET /keep HTTP/1.1\r\nHost: localhost\r\n\r\n"
+	if _, err := conn.Write([]byte(req1)); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 1024)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read 1 failed: %v", err)
+	}
+	if !strings.Contains(string(buf[:n]), "keepalive-ok") {
+		t.Fatalf("bad response 1: %s", string(buf[:n]))
+	}
+
+	// Wait for worker goroutine to exit and return connection to Poller Idle state
+	time.Sleep(50 * time.Millisecond)
+
+	// Second request on the SAME persistent connection
+	req2 := "GET /keep HTTP/1.1\r\nHost: localhost\r\n\r\n"
+	if _, err := conn.Write([]byte(req2)); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err = conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read 2 failed: %v", err)
+	}
+	if !strings.Contains(string(buf[:n]), "keepalive-ok") {
+		t.Fatalf("bad response 2: %s", string(buf[:n]))
+	}
+}

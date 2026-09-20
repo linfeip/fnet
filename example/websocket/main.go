@@ -40,31 +40,27 @@ func main() {
 </html>`)
 	})
 
-	// 2. 高性能 WebSocket 接口（极简兼具高可用性）
+	// 2. 百万并发事件驱动 WebSocket 接口（百万长连接空闲零协程占用）
 	upgrader := &websocket.Upgrader{
 		// 默认允许所有跨域请求，也可自定义 CheckOrigin
 		CheckOrigin: func(r *http.Request) bool { return true },
+		// 注册事件驱动回调：连接空闲时 0 协程常驻，帧到齐按需派发
+		OnOpen: func(c *websocket.Conn) {
+			log.Printf("[WS] 客户端建立连接: %s", c.RemoteAddr())
+		},
+		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+			// 原样回显（Echo）
+			_ = c.WriteMessage(op, msg)
+		},
+		OnClose: func(c *websocket.Conn, err error) {
+			log.Printf("[WS] 客户端断开连接: %v", err)
+		},
 	}
 
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		// 升级 HTTP 连接到 WebSocket
-		conn, err := upgrader.Upgrade(w, r)
-		if err != nil {
+		// 升级 HTTP 连接到 WebSocket（底层自动注册事件驱动模式，Handler 立即退出释放协程）
+		if _, err := upgrader.Upgrade(w, r); err != nil {
 			log.Printf("[WS] 升级失败: %v", err)
-			return
-		}
-		defer conn.Close()
-
-		log.Printf("[WS] 客户端建立连接: %s", conn.RemoteAddr())
-
-		// 使用 conn.Handle 极简处理 Echo 消息（自动响应 Ping/Pong 控制帧）
-		err = conn.Handle(func(op websocket.OpCode, msg []byte) error {
-			// 原样回显（Echo）
-			return conn.WriteMessage(op, msg)
-		})
-
-		if err != nil {
-			log.Printf("[WS] 客户端断开连接: %v", err)
 		}
 	})
 
