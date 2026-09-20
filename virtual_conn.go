@@ -1,6 +1,7 @@
 package fnet
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -33,6 +34,8 @@ type VirtualConn struct {
 	deadlineTimer *time.Timer
 
 	onWritable func() // optional: notify reactor that outbound data is pending
+
+	directWrite func([]byte) (int, error) // optional: fast-path direct socket write
 }
 
 // NewVirtualConn creates a VirtualConn with the given addresses.
@@ -50,6 +53,14 @@ func NewVirtualConn(local, remote net.Addr) *VirtualConn {
 func (vc *VirtualConn) SetWritableCallback(fn func()) {
 	vc.mu.Lock()
 	vc.onWritable = fn
+	vc.mu.Unlock()
+}
+
+// SetDirectWrite registers a callback invoked to attempt a direct non-blocking
+// write to the underlying socket before buffering.
+func (vc *VirtualConn) SetDirectWrite(fn func([]byte) (int, error)) {
+	vc.mu.Lock()
+	vc.directWrite = fn
 	vc.mu.Unlock()
 }
 
@@ -181,13 +192,31 @@ func (vc *VirtualConn) Write(b []byte) (int, error) {
 		vc.mu.Unlock()
 		return 0, syscall.ETIMEDOUT
 	}
+
+	origLen := len(b)
+	if len(vc.outBuf) == 0 && vc.directWrite != nil {
+		n, err := vc.directWrite(b)
+		if n == len(b) {
+			vc.mu.Unlock()
+			return n, nil
+		}
+		if n > 0 {
+			b = b[n:]
+		}
+		if err != nil && !errors.Is(err, syscall.EAGAIN) && !errors.Is(err, syscall.EWOULDBLOCK) {
+			vc.writeErr = err
+			vc.mu.Unlock()
+			return n, err
+		}
+	}
+
 	vc.outBuf = append(vc.outBuf, b...)
 	cb := vc.onWritable
 	vc.mu.Unlock()
 	if cb != nil {
 		cb()
 	}
-	return len(b), nil
+	return origLen, nil
 }
 
 // Close implements net.Conn.

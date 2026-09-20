@@ -178,6 +178,9 @@ func (s *Server) handleAccept() {
 		vc.SetWritableCallback(func() {
 			s.armWrite(fd)
 		})
+		vc.SetDirectWrite(func(b []byte) (int, error) {
+			return writeFD(fd, b)
+		})
 		s.conns.Store(nfd, c)
 		if err := s.poller.AddRead(nfd); err != nil {
 			s.closeConn(c)

@@ -85,8 +85,14 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error
 	return &Conn{
 		conn:     netConn,
 		reader:   reader,
+		rw:       readWriter{Reader: reader, Writer: netConn},
 		protocol: hs.Protocol,
 	}, nil
+}
+
+type readWriter struct {
+	io.Reader
+	io.Writer
 }
 
 // Conn represents an active WebSocket connection.
@@ -95,6 +101,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error
 type Conn struct {
 	conn     net.Conn
 	reader   io.Reader
+	rw       readWriter
 	protocol string
 	closed   atomic.Bool
 	writeMu  sync.Mutex
@@ -103,14 +110,7 @@ type Conn struct {
 // ReadMessage reads the next data message from the peer.
 // Control frames (Ping, Pong, Close) are automatically handled and replied to.
 func (c *Conn) ReadMessage() (OpCode, []byte, error) {
-	rw := struct {
-		io.Reader
-		io.Writer
-	}{
-		Reader: c.reader,
-		Writer: c.conn,
-	}
-	payload, op, err := wsutil.ReadClientData(rw)
+	payload, op, err := wsutil.ReadClientData(&c.rw)
 	return op, payload, err
 }
 
