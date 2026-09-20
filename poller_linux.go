@@ -3,6 +3,7 @@
 package fnet
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 type epollPoller struct {
 	mu     sync.Mutex
 	fd     int
+	wakeFD int
 	events []unix.EpollEvent
 }
 
@@ -21,9 +23,24 @@ func newPoller() (Poller, error) {
 	if err != nil {
 		return nil, fmt.Errorf("epoll_create1: %w", err)
 	}
+	wakeFD, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+	if err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("eventfd: %w", err)
+	}
+	ev := &unix.EpollEvent{
+		Events: unix.EPOLLIN,
+		Fd:     int32(wakeFD),
+	}
+	if err := unix.EpollCtl(fd, unix.EPOLL_CTL_ADD, wakeFD, ev); err != nil {
+		_ = unix.Close(wakeFD)
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("epoll_ctl wakeFD: %w", err)
+	}
 	return &epollPoller{
 		fd:     fd,
-		events: make([]unix.EpollEvent, 128),
+		wakeFD: wakeFD,
+		events: make([]unix.EpollEvent, 1024),
 	}, nil
 }
 
@@ -72,6 +89,11 @@ func (p *epollPoller) Wait(timeout time.Duration) ([]Event, error) {
 	out := make([]Event, 0, n)
 	for i := 0; i < n; i++ {
 		ev := p.events[i]
+		if int(ev.Fd) == p.wakeFD {
+			var buf [8]byte
+			_, _ = unix.Read(p.wakeFD, buf[:])
+			continue
+		}
 		e := Event{Fd: int(ev.Fd)}
 		if ev.Events&(unix.EPOLLERR) != 0 {
 			e.Error = true
@@ -90,6 +112,17 @@ func (p *epollPoller) Wait(timeout time.Duration) ([]Event, error) {
 	return out, nil
 }
 
+func (p *epollPoller) Wake() error {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], 1)
+	_, err := unix.Write(p.wakeFD, buf[:])
+	if err != nil && err != unix.EAGAIN && err != unix.EWOULDBLOCK {
+		return err
+	}
+	return nil
+}
+
 func (p *epollPoller) Close() error {
+	_ = unix.Close(p.wakeFD)
 	return unix.Close(p.fd)
 }

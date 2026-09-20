@@ -479,3 +479,57 @@ func TestWebSocketEventDrivenPingPong(t *testing.T) {
 		t.Fatalf("expected pong payload %q, got %q", pingPayload, frame.Payload)
 	}
 }
+
+func BenchmarkWebSocketEcho(b *testing.B) {
+	port := getFreePort(&testing.T{})
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Upgrade(w, r)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.Handle(func(op websocket.OpCode, msg []byte) error {
+			return conn.WriteMessage(op, msg)
+		})
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	clientConn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		b.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	payload := make([]byte, 1024)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.SetBytes(1024)
+
+	for i := 0; i < b.N; i++ {
+		if err := wsutil.WriteClientBinary(clientConn, payload); err != nil {
+			b.Fatalf("write: %v", err)
+		}
+		resp, err := wsutil.ReadServerBinary(clientConn)
+		if err != nil {
+			b.Fatalf("read: %v", err)
+		}
+		if len(resp) != 1024 {
+			b.Fatalf("bad resp len: %d", len(resp))
+		}
+	}
+}

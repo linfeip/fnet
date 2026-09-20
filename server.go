@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,7 +18,7 @@ import (
 	"github.com/gobwas/ws"
 )
 
-// Server is a high-performance HTTP/HTTPS server driven by a native poller
+// Server is a high-performance HTTP/HTTPS server driven by native multi-reactor pollers
 // (epoll / kqueue / WSAPoll). TLS and HTTP parsing reuse the Go standard library.
 type Server struct {
 	// Addr is the TCP address to listen on (e.g. ":8080").
@@ -32,14 +33,24 @@ type Server struct {
 	WriteTimeout time.Duration
 	// IdleTimeout closes keep-alive connections after this idle period (0 = disable keep-alive loop beyond one request).
 	IdleTimeout time.Duration
+	// NumPollers specifies the number of I/O sub-reactors. Defaults to runtime.GOMAXPROCS(0).
+	NumPollers int
 
-	lnMu     sync.Mutex
+	lnMu        sync.Mutex
+	lnFD        int
+	lnAddr      net.Addr
+	mainPoller  Poller
+	reactors    []*subReactor
+	nextReactor atomic.Uint64
+	closing     atomic.Bool
+	wg          sync.WaitGroup
+}
+
+type subReactor struct {
+	id       int
+	server   *Server
 	poller   Poller
-	lnFD     int
-	lnAddr   net.Addr
 	conns    sync.Map // fd -> *conn
-	closing  atomic.Bool
-	wg       sync.WaitGroup
 	notifyMu sync.Mutex
 	wakeFDs  map[int]struct{} // fds needing write interest
 }
@@ -55,10 +66,11 @@ const (
 const maxHeaderBuffer = 64 * 1024 // 64KB max buffered header to prevent memory exhaustion
 
 type conn struct {
-	fd     int
-	vc     *VirtualConn
-	server *Server
-	once   sync.Once
+	fd      int
+	vc      *VirtualConn
+	server  *Server
+	reactor *subReactor
+	once    sync.Once
 
 	mu        sync.Mutex
 	state     int
@@ -100,26 +112,58 @@ func (s *Server) serve(tlsCfg *tls.Config) error {
 		return err
 	}
 
-	p, err := NewPoller()
+	num := s.NumPollers
+	if num <= 0 {
+		num = runtime.GOMAXPROCS(0)
+	}
+	if num < 1 {
+		num = 1
+	}
+	if num > 64 {
+		num = 64
+	}
+
+	mainP, err := NewPoller()
 	if err != nil {
 		_ = closeFD(fd)
 		return err
 	}
 
+	reactors := make([]*subReactor, num)
+	for i := 0; i < num; i++ {
+		p, err := NewPoller()
+		if err != nil {
+			_ = mainP.Close()
+			for j := 0; j < i; j++ {
+				_ = reactors[j].poller.Close()
+			}
+			_ = closeFD(fd)
+			return err
+		}
+		r := &subReactor{
+			id:      i,
+			server:  s,
+			poller:  p,
+			wakeFDs: make(map[int]struct{}),
+		}
+		reactors[i] = r
+		s.wg.Add(1)
+		go r.loop()
+	}
+
 	s.lnMu.Lock()
 	s.lnFD = fd
 	s.lnAddr = addr
-	s.poller = p
-	s.wakeFDs = make(map[int]struct{})
+	s.mainPoller = mainP
+	s.reactors = reactors
 	s.lnMu.Unlock()
 
-	if err := s.poller.AddRead(fd); err != nil {
-		_ = s.poller.Close()
-		_ = closeFD(fd)
+	if err := mainP.AddRead(fd); err != nil {
+		_ = s.Close()
 		return err
 	}
 
-	return s.loop()
+	return s.acceptLoop()
 }
 
 // Close stops the server and closes the listening socket.
@@ -128,34 +172,39 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.lnMu.Lock()
-	p := s.poller
+	mp := s.mainPoller
 	lnFD := s.lnFD
+	reactors := s.reactors
 	s.lnMu.Unlock()
 
-	if p != nil && lnFD > 0 {
-		_ = p.Delete(lnFD)
+	if mp != nil && lnFD > 0 {
+		_ = mp.Delete(lnFD)
 	}
 	if lnFD > 0 {
 		_ = closeFD(lnFD)
 	}
-	s.conns.Range(func(key, value any) bool {
-		c := value.(*conn)
-		s.closeConn(c)
-		return true
-	})
-	if p != nil {
-		_ = p.Close()
+	if mp != nil {
+		_ = mp.Wake()
+		_ = mp.Close()
 	}
+
+	for _, r := range reactors {
+		r.conns.Range(func(key, value any) bool {
+			c := value.(*conn)
+			s.closeConn(c)
+			return true
+		})
+		_ = r.poller.Wake()
+		_ = r.poller.Close()
+	}
+
 	s.wg.Wait()
 	return nil
 }
 
-func (s *Server) loop() error {
-	buf := make([]byte, 32*1024)
+func (s *Server) acceptLoop() error {
 	for !s.closing.Load() {
-		s.flushWriteInterest()
-
-		events, err := s.poller.Wait(50 * time.Millisecond)
+		events, err := s.mainPoller.Wait(100 * time.Millisecond)
 		if err != nil {
 			if s.closing.Load() {
 				return nil
@@ -165,25 +214,6 @@ func (s *Server) loop() error {
 		for _, ev := range events {
 			if ev.Fd == s.lnFD {
 				s.handleAccept()
-				continue
-			}
-			v, ok := s.conns.Load(ev.Fd)
-			if !ok {
-				continue
-			}
-			c := v.(*conn)
-			if ev.Error || ev.Hangup {
-				if ev.Readable {
-					s.handleRead(c, buf)
-				}
-				s.closeConn(c)
-				continue
-			}
-			if ev.Readable {
-				s.handleRead(c, buf)
-			}
-			if ev.Writable {
-				s.handleWrite(c, buf)
 			}
 		}
 	}
@@ -199,22 +229,31 @@ func (s *Server) handleAccept() {
 			}
 			return
 		}
+
+		idx := s.nextReactor.Add(1) % uint64(len(s.reactors))
+		r := s.reactors[idx]
+
 		vc := NewVirtualConn(s.lnAddr, raddr)
 		c := &conn{
-			fd:     nfd,
-			vc:     vc,
-			server: s,
-			state:  connStateIdle,
+			fd:      nfd,
+			vc:      vc,
+			server:  s,
+			reactor: r,
+			state:   connStateIdle,
 		}
 		fd := nfd
 		vc.SetWritableCallback(func() {
-			s.armWrite(fd)
+			r.armWrite(fd)
 		})
 		vc.SetDirectWrite(func(b []byte) (int, error) {
 			return writeFD(fd, b)
 		})
-		s.conns.Store(nfd, c)
-		if err := s.poller.AddRead(nfd); err != nil {
+		vc.SetDirectWritev(func(iovs [][]byte) (int, error) {
+			return writevFD(fd, iovs)
+		})
+
+		r.conns.Store(nfd, c)
+		if err := r.poller.AddRead(nfd); err != nil {
 			s.closeConn(c)
 			continue
 		}
@@ -223,7 +262,43 @@ func (s *Server) handleAccept() {
 	}
 }
 
-func (s *Server) handleRead(c *conn, buf []byte) {
+func (r *subReactor) loop() {
+	defer r.server.wg.Done()
+	buf := make([]byte, 64*1024)
+	for !r.server.closing.Load() {
+		r.flushWriteInterest()
+
+		events, err := r.poller.Wait(50 * time.Millisecond)
+		if err != nil {
+			if r.server.closing.Load() {
+				return
+			}
+			continue
+		}
+		for _, ev := range events {
+			v, ok := r.conns.Load(ev.Fd)
+			if !ok {
+				continue
+			}
+			c := v.(*conn)
+			if ev.Error || ev.Hangup {
+				if ev.Readable {
+					r.handleRead(c, buf)
+				}
+				r.server.closeConn(c)
+				continue
+			}
+			if ev.Readable {
+				r.handleRead(c, buf)
+			}
+			if ev.Writable {
+				r.handleWrite(c, buf)
+			}
+		}
+	}
+}
+
+func (r *subReactor) handleRead(c *conn, buf []byte) {
 	for {
 		n, err := readFD(c.fd, buf)
 		if n > 0 {
@@ -231,18 +306,79 @@ func (s *Server) handleRead(c *conn, buf []byte) {
 		}
 		if err != nil {
 			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-				s.checkAndDispatch(c)
+				r.server.checkAndDispatch(c)
 				return
 			}
 			c.vc.FeedError(err)
-			s.closeConn(c)
+			r.server.closeConn(c)
 			return
 		}
 		if n == 0 {
 			c.vc.FeedEOF()
-			s.closeConn(c)
+			r.server.closeConn(c)
 			return
 		}
+	}
+}
+
+func (r *subReactor) handleWrite(c *conn, buf []byte) {
+	for {
+		n, remaining := c.vc.DrainWrite(buf)
+		if n == 0 {
+			_ = r.poller.ModRead(c.fd)
+			return
+		}
+		written := 0
+		for written < n {
+			wn, err := writeFD(c.fd, buf[written:n])
+			if wn > 0 {
+				written += wn
+			}
+			if err != nil {
+				if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+					if written < n {
+						c.vc.UnshiftWrite(append([]byte(nil), buf[written:n]...))
+					}
+					_ = r.poller.ModReadWrite(c.fd)
+					return
+				}
+				c.vc.FeedError(err)
+				r.server.closeConn(c)
+				return
+			}
+		}
+		if !remaining && !c.vc.PendingWrite() {
+			_ = r.poller.ModRead(c.fd)
+			return
+		}
+	}
+}
+
+func (r *subReactor) armWrite(fd int) {
+	r.notifyMu.Lock()
+	r.wakeFDs[fd] = struct{}{}
+	r.notifyMu.Unlock()
+	_ = r.poller.Wake()
+}
+
+func (r *subReactor) flushWriteInterest() {
+	r.notifyMu.Lock()
+	if len(r.wakeFDs) == 0 {
+		r.notifyMu.Unlock()
+		return
+	}
+	fds := make([]int, 0, len(r.wakeFDs))
+	for fd := range r.wakeFDs {
+		fds = append(fds, fd)
+	}
+	r.wakeFDs = make(map[int]struct{})
+	r.notifyMu.Unlock()
+
+	for _, fd := range fds {
+		if _, ok := r.conns.Load(fd); !ok {
+			continue
+		}
+		_ = r.poller.ModReadWrite(fd)
 	}
 }
 
@@ -324,7 +460,6 @@ func (s *Server) serveWSConn(c *conn) {
 
 		if h.OpCode == ws.OpPing {
 			_ = ws.WriteFrame(c.vc, ws.NewPongFrame(payload))
-			s.flushConnSync(c)
 			continue
 		}
 
@@ -334,68 +469,7 @@ func (s *Server) serveWSConn(c *conn) {
 
 		if handler != nil {
 			handler.OnMessage(byte(h.OpCode), payload)
-			s.flushConnSync(c)
 		}
-	}
-}
-
-func (s *Server) handleWrite(c *conn, buf []byte) {
-	for {
-		n, remaining := c.vc.DrainWrite(buf)
-		if n == 0 {
-			_ = s.poller.ModRead(c.fd)
-			return
-		}
-		written := 0
-		for written < n {
-			wn, err := writeFD(c.fd, buf[written:n])
-			if wn > 0 {
-				written += wn
-			}
-			if err != nil {
-				if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-					if written < n {
-						c.vc.UnshiftWrite(append([]byte(nil), buf[written:n]...))
-					}
-					_ = s.poller.ModReadWrite(c.fd)
-					return
-				}
-				c.vc.FeedError(err)
-				s.closeConn(c)
-				return
-			}
-		}
-		if !remaining && !c.vc.PendingWrite() {
-			_ = s.poller.ModRead(c.fd)
-			return
-		}
-	}
-}
-
-func (s *Server) armWrite(fd int) {
-	s.notifyMu.Lock()
-	s.wakeFDs[fd] = struct{}{}
-	s.notifyMu.Unlock()
-}
-
-func (s *Server) flushWriteInterest() {
-	s.notifyMu.Lock()
-	if len(s.wakeFDs) == 0 {
-		s.notifyMu.Unlock()
-		return
-	}
-	fds := make([]int, 0, len(s.wakeFDs))
-	for fd := range s.wakeFDs {
-		fds = append(fds, fd)
-	}
-	s.wakeFDs = make(map[int]struct{})
-	s.notifyMu.Unlock()
-
-	for _, fd := range fds {
-		if _, ok := s.conns.Load(fd); !ok {
-			continue
-		}
-		_ = s.poller.ModReadWrite(fd)
 	}
 }
 
@@ -411,8 +485,10 @@ func (s *Server) closeConnWithErr(c *conn, err error) {
 			handler.OnClose(err)
 		}
 
-		s.conns.Delete(c.fd)
-		_ = s.poller.Delete(c.fd)
+		if c.reactor != nil {
+			c.reactor.conns.Delete(c.fd)
+			_ = c.reactor.poller.Delete(c.fd)
+		}
 		_ = c.vc.Close()
 		_ = closeFD(c.fd)
 	})
@@ -472,8 +548,7 @@ func (s *Server) serveConn(c *conn) {
 			}
 			c.state = connStateHijacked
 			c.mu.Unlock()
-			s.flushConnSync(c)
-			s.closeConn(c)
+			// Caller took over connection lifecycle; do not close here.
 			return
 		}
 		_ = w.finish()

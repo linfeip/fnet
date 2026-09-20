@@ -23,8 +23,9 @@ type VirtualConn struct {
 	mu     sync.Mutex
 	inCond *sync.Cond
 
-	inBuf  []byte
-	outBuf []byte
+	inBuf     []byte
+	inReadOff int
+	outBuf    []byte
 
 	closed   bool
 	readEOF  bool
@@ -38,7 +39,8 @@ type VirtualConn struct {
 
 	onWritable func() // optional: notify reactor that outbound data is pending
 
-	directWrite func([]byte) (int, error) // optional: fast-path direct socket write
+	directWrite  func([]byte) (int, error)   // optional: fast-path direct socket write
+	directWritev func([][]byte) (int, error) // optional: fast-path direct vector socket write
 }
 
 // NewVirtualConn creates a VirtualConn with the given addresses.
@@ -67,6 +69,14 @@ func (vc *VirtualConn) SetDirectWrite(fn func([]byte) (int, error)) {
 	vc.mu.Unlock()
 }
 
+// SetDirectWritev registers a callback invoked to attempt a direct non-blocking
+// vector write (writev) to the underlying socket before buffering.
+func (vc *VirtualConn) SetDirectWritev(fn func([][]byte) (int, error)) {
+	vc.mu.Lock()
+	vc.directWritev = fn
+	vc.mu.Unlock()
+}
+
 // FeedInput appends network data for subsequent Read calls.
 func (vc *VirtualConn) FeedInput(b []byte) {
 	if len(b) == 0 {
@@ -76,6 +86,16 @@ func (vc *VirtualConn) FeedInput(b []byte) {
 	if vc.closed || vc.readEOF {
 		vc.mu.Unlock()
 		return
+	}
+	if vc.inReadOff > 0 {
+		if vc.inReadOff == len(vc.inBuf) {
+			vc.inBuf = vc.inBuf[:0]
+			vc.inReadOff = 0
+		} else if vc.inReadOff > 4096 {
+			copy(vc.inBuf, vc.inBuf[vc.inReadOff:])
+			vc.inBuf = vc.inBuf[:len(vc.inBuf)-vc.inReadOff]
+			vc.inReadOff = 0
+		}
 	}
 	vc.inBuf = append(vc.inBuf, b...)
 	vc.inCond.Signal()
@@ -87,7 +107,8 @@ func (vc *VirtualConn) FeedInput(b []byte) {
 func (vc *VirtualConn) HasCompleteHeader() bool {
 	vc.mu.Lock()
 	defer vc.mu.Unlock()
-	return bytes.Contains(vc.inBuf, []byte("\r\n\r\n")) || bytes.Contains(vc.inBuf, []byte("\n\n"))
+	buf := vc.inBuf[vc.inReadOff:]
+	return bytes.Contains(buf, []byte("\r\n\r\n")) || bytes.Contains(buf, []byte("\n\n"))
 }
 
 // HasCompleteWSFrame reports whether vc.inBuf contains at least one complete WebSocket frame.
@@ -95,16 +116,17 @@ func (vc *VirtualConn) HasCompleteWSFrame() bool {
 	vc.mu.Lock()
 	defer vc.mu.Unlock()
 
-	if len(vc.inBuf) < 2 {
+	buf := vc.inBuf[vc.inReadOff:]
+	if len(buf) < 2 {
 		return false
 	}
-	r := bytes.NewReader(vc.inBuf)
+	r := bytes.NewReader(buf)
 	h, err := ws.ReadHeader(r)
 	if err != nil {
 		return false
 	}
-	headerSize := len(vc.inBuf) - r.Len()
-	return len(vc.inBuf) >= headerSize+int(h.Length)
+	headerSize := len(buf) - r.Len()
+	return len(buf) >= headerSize+int(h.Length)
 }
 
 // PopWSFrame extracts the next complete WebSocket frame from the input buffer.
@@ -115,11 +137,12 @@ func (vc *VirtualConn) PopWSFrame() (ws.Header, []byte, bool, error) {
 	vc.mu.Lock()
 	defer vc.mu.Unlock()
 
-	if len(vc.inBuf) < 2 {
+	buf := vc.inBuf[vc.inReadOff:]
+	if len(buf) < 2 {
 		return ws.Header{}, nil, false, nil
 	}
 
-	r := bytes.NewReader(vc.inBuf)
+	r := bytes.NewReader(buf)
 	h, err := ws.ReadHeader(r)
 	if err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -128,24 +151,25 @@ func (vc *VirtualConn) PopWSFrame() (ws.Header, []byte, bool, error) {
 		return ws.Header{}, nil, false, err
 	}
 
-	headerSize := len(vc.inBuf) - r.Len()
+	headerSize := len(buf) - r.Len()
 	totalSize := headerSize + int(h.Length)
-	if len(vc.inBuf) < totalSize {
+	if len(buf) < totalSize {
 		return ws.Header{}, nil, false, nil
 	}
 
 	var payload []byte
 	if h.Length > 0 {
 		payload = make([]byte, h.Length)
-		copy(payload, vc.inBuf[headerSize:totalSize])
+		copy(payload, buf[headerSize:totalSize])
 		if h.Masked {
 			ws.Cipher(payload, h.Mask, 0)
 		}
 	}
 
-	vc.inBuf = vc.inBuf[totalSize:]
-	if len(vc.inBuf) == 0 {
+	vc.inReadOff += totalSize
+	if vc.inReadOff == len(vc.inBuf) {
 		vc.inBuf = vc.inBuf[:0]
+		vc.inReadOff = 0
 	}
 
 	return h, payload, true, nil
@@ -155,14 +179,14 @@ func (vc *VirtualConn) PopWSFrame() (ws.Header, []byte, bool, error) {
 func (vc *VirtualConn) HasBufferedInput() bool {
 	vc.mu.Lock()
 	defer vc.mu.Unlock()
-	return len(vc.inBuf) > 0
+	return len(vc.inBuf) > vc.inReadOff
 }
 
 // InputLen returns the length of unconsumed input buffer.
 func (vc *VirtualConn) InputLen() int {
 	vc.mu.Lock()
 	defer vc.mu.Unlock()
-	return len(vc.inBuf)
+	return len(vc.inBuf) - vc.inReadOff
 }
 
 // UnshiftInput prepends unconsumed bytes back to the front of the inbound buffer.
@@ -171,7 +195,12 @@ func (vc *VirtualConn) UnshiftInput(b []byte) {
 		return
 	}
 	vc.mu.Lock()
-	vc.inBuf = append(append([]byte(nil), b...), vc.inBuf...)
+	rem := vc.inBuf[vc.inReadOff:]
+	newBuf := make([]byte, 0, len(b)+len(rem))
+	newBuf = append(newBuf, b...)
+	newBuf = append(newBuf, rem...)
+	vc.inBuf = newBuf
+	vc.inReadOff = 0
 	vc.mu.Unlock()
 }
 
@@ -208,7 +237,11 @@ func (vc *VirtualConn) DrainWrite(dst []byte) (n int, remaining bool) {
 	n = copy(dst, vc.outBuf)
 	vc.outBuf = vc.outBuf[n:]
 	if len(vc.outBuf) == 0 {
-		vc.outBuf = vc.outBuf[:0]
+		if cap(vc.outBuf) > 64*1024 {
+			vc.outBuf = nil
+		} else {
+			vc.outBuf = vc.outBuf[:0]
+		}
 	}
 	return n, len(vc.outBuf) > 0
 }
@@ -237,14 +270,23 @@ func (vc *VirtualConn) Read(b []byte) (int, error) {
 	defer vc.mu.Unlock()
 
 	for {
-		if vc.readErr != nil && len(vc.inBuf) == 0 {
+		if vc.readErr != nil && len(vc.inBuf) == vc.inReadOff {
 			return 0, vc.readErr
 		}
-		if len(vc.inBuf) > 0 {
-			n := copy(b, vc.inBuf)
-			vc.inBuf = vc.inBuf[n:]
-			if len(vc.inBuf) == 0 {
-				vc.inBuf = vc.inBuf[:0]
+		if len(vc.inBuf) > vc.inReadOff {
+			n := copy(b, vc.inBuf[vc.inReadOff:])
+			vc.inReadOff += n
+			if vc.inReadOff == len(vc.inBuf) {
+				if cap(vc.inBuf) > 64*1024 {
+					vc.inBuf = nil
+				} else {
+					vc.inBuf = vc.inBuf[:0]
+				}
+				vc.inReadOff = 0
+			} else if vc.inReadOff > 4096 && vc.inReadOff > len(vc.inBuf)/2 {
+				copy(vc.inBuf, vc.inBuf[vc.inReadOff:])
+				vc.inBuf = vc.inBuf[:len(vc.inBuf)-vc.inReadOff]
+				vc.inReadOff = 0
 			}
 			return n, nil
 		}
@@ -263,7 +305,7 @@ func (vc *VirtualConn) Read(b []byte) (int, error) {
 			})
 			vc.inCond.Wait()
 			timer.Stop()
-			if !vc.readDeadline.IsZero() && time.Now().After(vc.readDeadline) && len(vc.inBuf) == 0 {
+			if !vc.readDeadline.IsZero() && time.Now().After(vc.readDeadline) && len(vc.inBuf) == vc.inReadOff {
 				return 0, syscall.ETIMEDOUT
 			}
 			continue
@@ -313,6 +355,69 @@ func (vc *VirtualConn) Write(b []byte) (int, error) {
 		cb()
 	}
 	return origLen, nil
+}
+
+// WriteVector writes multiple byte slices in a single logical write operation,
+// using direct vector write (writev) when possible to avoid multiple syscalls
+// and memory copies.
+func (vc *VirtualConn) WriteVector(iovs [][]byte) (int, error) {
+	totalLen := 0
+	for _, b := range iovs {
+		totalLen += len(b)
+	}
+	if totalLen == 0 {
+		return 0, nil
+	}
+
+	vc.mu.Lock()
+	if vc.closed || vc.writeEOF {
+		vc.mu.Unlock()
+		return 0, net.ErrClosed
+	}
+	if vc.writeErr != nil {
+		err := vc.writeErr
+		vc.mu.Unlock()
+		return 0, err
+	}
+	if !vc.writeDeadline.IsZero() && time.Now().After(vc.writeDeadline) {
+		vc.mu.Unlock()
+		return 0, syscall.ETIMEDOUT
+	}
+
+	written := 0
+	if len(vc.outBuf) == 0 && vc.directWritev != nil {
+		n, err := vc.directWritev(iovs)
+		if n > 0 {
+			written = n
+		}
+		if written == totalLen {
+			vc.mu.Unlock()
+			return totalLen, nil
+		}
+		if err != nil && !errors.Is(err, syscall.EAGAIN) && !errors.Is(err, syscall.EWOULDBLOCK) {
+			vc.writeErr = err
+			vc.mu.Unlock()
+			return written, err
+		}
+	}
+
+	remToSkip := written
+	for _, b := range iovs {
+		if remToSkip >= len(b) {
+			remToSkip -= len(b)
+			continue
+		}
+		chunk := b[remToSkip:]
+		remToSkip = 0
+		vc.outBuf = append(vc.outBuf, chunk...)
+	}
+
+	cb := vc.onWritable
+	vc.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+	return totalLen, nil
 }
 
 // Close implements net.Conn.

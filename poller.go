@@ -26,6 +26,8 @@ type Poller interface {
 	// Wait blocks until events are ready or timeout elapses.
 	// timeout < 0 waits forever; timeout == 0 is non-blocking.
 	Wait(timeout time.Duration) ([]Event, error)
+	// Wake interrupts a blocked Wait call immediately.
+	Wake() error
 	// Close releases poller resources.
 	Close() error
 }

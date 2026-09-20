@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -183,6 +184,31 @@ type readWriter struct {
 	io.Writer
 }
 
+// VectorWriter is an optional interface implemented by connections that support
+// zero-copy scatter-gather vector writes (e.g. *fnet.VirtualConn via writev).
+type VectorWriter interface {
+	WriteVector(iovs [][]byte) (int, error)
+}
+
+// formatServerHeader encodes an unmasked server WebSocket frame header into bts.
+// It returns the number of bytes written (2, 4, or 10).
+func formatServerHeader(bts []byte, op OpCode, length int) int {
+	bts[0] = 0x80 | byte(op)
+	switch {
+	case length <= 125:
+		bts[1] = byte(length)
+		return 2
+	case length <= 65535:
+		bts[1] = 126
+		binary.BigEndian.PutUint16(bts[2:4], uint16(length))
+		return 4
+	default:
+		bts[1] = 127
+		binary.BigEndian.PutUint64(bts[2:10], uint64(length))
+		return 10
+	}
+}
+
 // Conn represents an active WebSocket connection.
 // It uses github.com/gobwas/ws and wsutil under the hood for high performance,
 // RFC-compliant framing, and fast SIMD/SWAR unmasking.
@@ -195,11 +221,124 @@ type Conn struct {
 	writeMu  sync.Mutex
 }
 
+func (c *Conn) writeFrameLocked(op OpCode, payload []byte) error {
+	var hBuf [10]byte
+	hLen := formatServerHeader(hBuf[:], op, len(payload))
+	iovs := [][]byte{hBuf[:hLen], payload}
+
+	if vw, ok := c.conn.(VectorWriter); ok {
+		_, err := vw.WriteVector(iovs)
+		return err
+	}
+
+	if len(payload) <= 4096 {
+		buf := make([]byte, hLen+len(payload))
+		copy(buf, hBuf[:hLen])
+		copy(buf[hLen:], payload)
+		_, err := c.conn.Write(buf)
+		return err
+	}
+
+	return wsutil.WriteServerMessage(c.conn, op, payload)
+}
+
 // ReadMessage reads the next data message from the peer.
 // Control frames (Ping, Pong, Close) are automatically handled and replied to.
+// Payload is allocated directly matching header length to avoid io.ReadAll reallocation.
 func (c *Conn) ReadMessage() (OpCode, []byte, error) {
-	payload, op, err := wsutil.ReadClientData(&c.rw)
-	return op, payload, err
+	for {
+		header, err := ws.ReadHeader(c.reader)
+		if err != nil {
+			return 0, nil, err
+		}
+
+		if header.OpCode.IsControl() {
+			var ctrlPayload []byte
+			if header.Length > 0 {
+				ctrlPayload = make([]byte, header.Length)
+				if _, err := io.ReadFull(c.reader, ctrlPayload); err != nil {
+					return 0, nil, err
+				}
+				if header.Masked {
+					ws.Cipher(ctrlPayload, header.Mask, 0)
+				}
+			}
+
+			if header.OpCode == OpClose {
+				c.writeMu.Lock()
+				_ = c.writeFrameLocked(OpClose, ws.NewCloseFrameBody(ws.StatusNormalClosure, ""))
+				c.writeMu.Unlock()
+				return 0, nil, io.EOF
+			}
+			if header.OpCode == OpPing {
+				c.writeMu.Lock()
+				_ = c.writeFrameLocked(OpPong, ctrlPayload)
+				c.writeMu.Unlock()
+				continue
+			}
+			if header.OpCode == OpPong {
+				continue
+			}
+			continue
+		}
+
+		// Data frame (Text, Binary, Continuation)
+		payload := make([]byte, header.Length)
+		if header.Length > 0 {
+			if _, err := io.ReadFull(c.reader, payload); err != nil {
+				return 0, nil, err
+			}
+			if header.Masked {
+				ws.Cipher(payload, header.Mask, 0)
+			}
+		}
+
+		if header.Fin {
+			return header.OpCode, payload, nil
+		}
+
+		// Handle fragmented messages: read subsequent continuation frames
+		msgOp := header.OpCode
+		for {
+			nextHdr, err := ws.ReadHeader(c.reader)
+			if err != nil {
+				return 0, nil, err
+			}
+			if nextHdr.OpCode.IsControl() {
+				var ctrlPayload []byte
+				if nextHdr.Length > 0 {
+					ctrlPayload = make([]byte, nextHdr.Length)
+					if _, err := io.ReadFull(c.reader, ctrlPayload); err != nil {
+						return 0, nil, err
+					}
+					if nextHdr.Masked {
+						ws.Cipher(ctrlPayload, nextHdr.Mask, 0)
+					}
+				}
+				if nextHdr.OpCode == OpPing {
+					c.writeMu.Lock()
+					_ = c.writeFrameLocked(OpPong, ctrlPayload)
+					c.writeMu.Unlock()
+				}
+				continue
+			}
+			if nextHdr.Length > 0 {
+				part := make([]byte, nextHdr.Length)
+				if _, err := io.ReadFull(c.reader, part); err != nil {
+					return 0, nil, err
+				}
+				if nextHdr.Masked {
+					ws.Cipher(part, nextHdr.Mask, 0)
+				}
+				payload = append(payload, part...)
+			}
+			if nextHdr.Fin {
+				break
+			}
+		}
+
+		return msgOp, payload, nil
+	}
 }
 
 // ReadText reads the next text message as string.
@@ -230,7 +369,7 @@ func (c *Conn) ReadBinary() ([]byte, error) {
 func (c *Conn) WriteMessage(op OpCode, payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return wsutil.WriteServerMessage(c.conn, op, payload)
+	return c.writeFrameLocked(op, payload)
 }
 
 // WriteText sends a text message.
@@ -247,21 +386,21 @@ func (c *Conn) WriteBinary(payload []byte) error {
 func (c *Conn) WritePing(data []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return ws.WriteFrame(c.conn, ws.NewPingFrame(data))
+	return c.writeFrameLocked(OpPing, data)
 }
 
 // WritePong sends a Pong control frame.
 func (c *Conn) WritePong(data []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return ws.WriteFrame(c.conn, ws.NewPongFrame(data))
+	return c.writeFrameLocked(OpPong, data)
 }
 
 // Close gracefully closes the WebSocket connection by sending a Close control frame.
 func (c *Conn) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
 		c.writeMu.Lock()
-		_ = ws.WriteFrame(c.conn, ws.NewCloseFrame(ws.NewCloseFrameBody(ws.StatusNormalClosure, "")))
+		_ = c.writeFrameLocked(OpClose, ws.NewCloseFrameBody(ws.StatusNormalClosure, ""))
 		c.writeMu.Unlock()
 		return c.conn.Close()
 	}

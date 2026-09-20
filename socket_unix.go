@@ -33,6 +33,10 @@ func writeFD(fd int, buf []byte) (int, error) {
 	return unix.Write(fd, buf)
 }
 
+func writevFD(fd int, iovs [][]byte) (int, error) {
+	return unix.Writev(fd, iovs)
+}
+
 func acceptFD(fd int) (int, net.Addr, error) {
 	nfd, sa, err := unix.Accept(fd)
 	if err != nil {

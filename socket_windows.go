@@ -120,6 +120,26 @@ func writeFD(fd int, buf []byte) (int, error) {
 	return e.conn.Write(buf)
 }
 
+func writevFD(fd int, iovs [][]byte) (int, error) {
+	total := 0
+	for _, b := range iovs {
+		if len(b) == 0 {
+			continue
+		}
+		n, err := writeFD(fd, b)
+		if n > 0 {
+			total += n
+		}
+		if err != nil {
+			return total, err
+		}
+		if n < len(b) {
+			return total, nil
+		}
+	}
+	return total, nil
+}
+
 func acceptFD(fd int) (int, net.Addr, error) {
 	v, ok := winFDs.Load(fd)
 	if !ok {

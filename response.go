@@ -260,6 +260,21 @@ func (c *hijackedConn) Read(b []byte) (int, error) {
 	return c.r.Read(b)
 }
 
+func (c *hijackedConn) WriteVector(iovs [][]byte) (int, error) {
+	if wv, ok := c.Conn.(interface{ WriteVector([][]byte) (int, error) }); ok {
+		return wv.WriteVector(iovs)
+	}
+	total := 0
+	for _, b := range iovs {
+		n, err := c.Conn.Write(b)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
 func (c *hijackedConn) AttachWS(handler WSHandler) (*VirtualConn, error) {
 	if c.w != nil {
 		return c.w.AttachWS(handler)

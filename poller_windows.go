@@ -117,6 +117,11 @@ func (p *windowsPoller) Wait(timeout time.Duration) ([]Event, error) {
 	return winCollectReady(interest), nil
 }
 
+func (p *windowsPoller) Wake() error {
+	p.signal()
+	return nil
+}
+
 func (p *windowsPoller) Close() error {
 	p.mu.Lock()
 	p.closing = true
