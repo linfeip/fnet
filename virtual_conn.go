@@ -27,6 +27,9 @@ type VirtualConn struct {
 	local  net.Addr
 	remote net.Addr
 
+	fd int
+	c  *conn
+
 	mu           sync.Mutex
 	inCond       *sync.Cond
 	inBuf        []byte
@@ -51,12 +54,70 @@ const vcReleaseThreshold = 64 * 1024
 
 // NewVirtualConn creates a VirtualConn with the given addresses.
 func NewVirtualConn(local, remote net.Addr) *VirtualConn {
-	vc := &VirtualConn{
+	return &VirtualConn{
 		local:  local,
 		remote: remote,
 	}
-	vc.inCond = sync.NewCond(&vc.mu)
-	return vc
+}
+
+func (vc *VirtualConn) attachConn(fd int, c *conn) {
+	vc.fd = fd
+	vc.c = c
+}
+
+func (vc *VirtualConn) condLocked() *sync.Cond {
+	if vc.inCond == nil {
+		vc.inCond = sync.NewCond(&vc.mu)
+	}
+	return vc.inCond
+}
+
+func (vc *VirtualConn) doDirectWrite(b []byte) (int, error) {
+	if vc.fd > 0 {
+		return writeFD(vc.fd, b)
+	}
+	if vc.directWrite != nil {
+		return vc.directWrite(b)
+	}
+	return 0, nil
+}
+
+func (vc *VirtualConn) canDirectWrite() bool {
+	return vc.fd > 0 || vc.directWrite != nil
+}
+
+func (vc *VirtualConn) doDirectWritev(iovs [][]byte) (int, error) {
+	if vc.fd > 0 {
+		return writevFD(vc.fd, iovs)
+	}
+	if vc.directWritev != nil {
+		return vc.directWritev(iovs)
+	}
+	return 0, nil
+}
+
+func (vc *VirtualConn) canDirectWritev() bool {
+	return vc.fd > 0 || vc.directWritev != nil
+}
+
+func (vc *VirtualConn) notifyWritable() {
+	if vc.c != nil && vc.c.reactor != nil {
+		vc.c.reactor.armWrite(vc.c)
+		return
+	}
+	if vc.onWritable != nil {
+		vc.onWritable()
+	}
+}
+
+func (vc *VirtualConn) notifyClose() {
+	if vc.c != nil && vc.c.server != nil {
+		vc.c.server.closeConnGraceful(vc.c, nil)
+		return
+	}
+	if vc.onClose != nil {
+		vc.onClose()
+	}
 }
 
 // SetWritableCallback registers a callback invoked (unlocked) when Write
@@ -118,11 +179,7 @@ func (vc *VirtualConn) consumeLocked(n int) {
 	vc.inReadOff += n
 	unread := len(vc.inBuf) - vc.inReadOff
 	if unread <= 0 {
-		if cap(vc.inBuf) > vcReleaseThreshold {
-			vc.inBuf = nil
-		} else {
-			vc.inBuf = vc.inBuf[:0]
-		}
+		vc.inBuf = nil
 		vc.inReadOff = 0
 		return
 	}
@@ -131,6 +188,21 @@ func (vc *VirtualConn) consumeLocked(n int) {
 		vc.inBuf = vc.inBuf[:unread]
 		vc.inReadOff = 0
 	}
+}
+
+// CompactOrRelease releases the input buffer if fully consumed or compacts it.
+func (vc *VirtualConn) CompactOrRelease() {
+	vc.mu.Lock()
+	unread := len(vc.inBuf) - vc.inReadOff
+	if unread <= 0 {
+		vc.inBuf = nil
+		vc.inReadOff = 0
+	} else if vc.inReadOff > 0 {
+		copy(vc.inBuf, vc.inBuf[vc.inReadOff:])
+		vc.inBuf = vc.inBuf[:unread]
+		vc.inReadOff = 0
+	}
+	vc.mu.Unlock()
 }
 
 // FeedInput appends network data for subsequent Read calls.
@@ -144,7 +216,9 @@ func (vc *VirtualConn) FeedInput(b []byte) {
 		return
 	}
 	vc.appendInputLocked(b)
-	vc.inCond.Signal()
+	if vc.inCond != nil {
+		vc.inCond.Signal()
+	}
 	vc.mu.Unlock()
 }
 
@@ -255,7 +329,9 @@ func (vc *VirtualConn) UnshiftInput(b []byte) {
 func (vc *VirtualConn) FeedEOF() {
 	vc.mu.Lock()
 	vc.readEOF = true
-	vc.inCond.Broadcast()
+	if vc.inCond != nil {
+		vc.inCond.Broadcast()
+	}
 	vc.mu.Unlock()
 }
 
@@ -265,7 +341,9 @@ func (vc *VirtualConn) FeedError(err error) {
 	if vc.readErr == nil {
 		vc.readErr = err
 	}
-	vc.inCond.Broadcast()
+	if vc.inCond != nil {
+		vc.inCond.Broadcast()
+	}
 	vc.mu.Unlock()
 
 	vc.wmu.Lock()
@@ -299,17 +377,19 @@ func (vc *VirtualConn) Read(b []byte) (int, error) {
 			}
 			timer := time.AfterFunc(remain, func() {
 				vc.mu.Lock()
-				vc.inCond.Broadcast()
+				if vc.inCond != nil {
+					vc.inCond.Broadcast()
+				}
 				vc.mu.Unlock()
 			})
-			vc.inCond.Wait()
+			vc.condLocked().Wait()
 			timer.Stop()
 			if !vc.readDeadline.IsZero() && time.Now().After(vc.readDeadline) && len(vc.inBuf) == vc.inReadOff {
 				return 0, syscall.ETIMEDOUT
 			}
 			continue
 		}
-		vc.inCond.Wait()
+		vc.condLocked().Wait()
 	}
 }
 
@@ -336,10 +416,8 @@ func isWouldBlock(err error) bool {
 }
 
 func (vc *VirtualConn) releaseOutLocked() {
-	if cap(vc.outBuf) > vcReleaseThreshold {
+	if cap(vc.outBuf) > 0 {
 		vc.outBuf = nil
-	} else {
-		vc.outBuf = vc.outBuf[:0]
 	}
 }
 
@@ -356,8 +434,8 @@ func (vc *VirtualConn) Write(b []byte) (int, error) {
 	}
 
 	origLen := len(b)
-	if len(vc.outBuf) == 0 && vc.directWrite != nil {
-		n, err := vc.directWrite(b)
+	if len(vc.outBuf) == 0 && vc.canDirectWrite() {
+		n, err := vc.doDirectWrite(b)
 		if n == len(b) {
 			vc.wmu.Unlock()
 			return n, nil
@@ -373,11 +451,8 @@ func (vc *VirtualConn) Write(b []byte) (int, error) {
 	}
 
 	vc.outBuf = append(vc.outBuf, b...)
-	cb := vc.onWritable
 	vc.wmu.Unlock()
-	if cb != nil {
-		cb()
-	}
+	vc.notifyWritable()
 	return origLen, nil
 }
 
@@ -399,8 +474,8 @@ func (vc *VirtualConn) WriteVector(iovs [][]byte) (int, error) {
 	}
 
 	written := 0
-	if len(vc.outBuf) == 0 && vc.directWritev != nil {
-		n, err := vc.directWritev(iovs)
+	if len(vc.outBuf) == 0 && vc.canDirectWritev() {
+		n, err := vc.doDirectWritev(iovs)
 		if n > 0 {
 			written = n
 		}
@@ -424,11 +499,8 @@ func (vc *VirtualConn) WriteVector(iovs [][]byte) (int, error) {
 		vc.outBuf = append(vc.outBuf, b[skip:]...)
 		skip = 0
 	}
-	cb := vc.onWritable
 	vc.wmu.Unlock()
-	if cb != nil {
-		cb()
-	}
+	vc.notifyWritable()
 	return totalLen, nil
 }
 
@@ -438,10 +510,10 @@ func (vc *VirtualConn) flushOut() (pending bool, err error) {
 	vc.wmu.Lock()
 	defer vc.wmu.Unlock()
 	for len(vc.outBuf) > 0 {
-		if vc.directWrite == nil {
+		if !vc.canDirectWrite() {
 			return true, nil
 		}
-		n, werr := vc.directWrite(vc.outBuf)
+		n, werr := vc.doDirectWrite(vc.outBuf)
 		if n > 0 {
 			vc.outBuf = vc.outBuf[n:]
 		}
@@ -507,15 +579,12 @@ func (vc *VirtualConn) Close() error {
 	}
 	vc.mu.Lock()
 	vc.readEOF = true
-	vc.inCond.Broadcast()
+	if vc.inCond != nil {
+		vc.inCond.Broadcast()
+	}
 	vc.mu.Unlock()
 
-	vc.wmu.Lock()
-	cb := vc.onClose
-	vc.wmu.Unlock()
-	if cb != nil {
-		cb()
-	}
+	vc.notifyClose()
 	return nil
 }
 
@@ -547,7 +616,9 @@ func (vc *VirtualConn) SetDeadline(t time.Time) error {
 func (vc *VirtualConn) SetReadDeadline(t time.Time) error {
 	vc.mu.Lock()
 	vc.readDeadline = t
-	vc.inCond.Broadcast()
+	if vc.inCond != nil {
+		vc.inCond.Broadcast()
+	}
 	vc.mu.Unlock()
 	return nil
 }

@@ -59,8 +59,8 @@ type subReactor struct {
 	id     int
 	server *Server
 	poller Poller
-	conns  sync.Map // fd -> *conn
-	rbuf   []byte   // per-reactor read buffer
+	conns  connTable
+	rbuf   []byte // per-reactor read buffer
 
 	// Work handed to the reactor goroutine from other goroutines.
 	pendMu    sync.Mutex
@@ -68,6 +68,114 @@ type subReactor struct {
 	pendClose []int   // fds whose close must happen on the reactor
 	pendCount atomic.Int32
 	waiting   atomic.Bool // reactor is (about to be) blocked in Wait
+}
+
+const (
+	connChunkShift = 11 // 2048 entries per chunk
+	connChunkSize  = 1 << connChunkShift
+	connChunkMask  = connChunkSize - 1
+)
+
+type connChunk [connChunkSize]atomic.Pointer[conn]
+
+type connTable struct {
+	mu     sync.Mutex
+	chunks atomic.Pointer[[]*connChunk]
+}
+
+func (t *connTable) get(fd int) *conn {
+	if fd < 0 {
+		return nil
+	}
+	cp := t.chunks.Load()
+	if cp == nil {
+		return nil
+	}
+	chunks := *cp
+	cIdx := fd >> connChunkShift
+	if cIdx >= len(chunks) {
+		return nil
+	}
+	ch := chunks[cIdx]
+	if ch == nil {
+		return nil
+	}
+	return ch[fd&connChunkMask].Load()
+}
+
+func (t *connTable) store(fd int, c *conn) {
+	if fd < 0 {
+		return
+	}
+	cIdx := fd >> connChunkShift
+	sIdx := fd & connChunkMask
+
+	cp := t.chunks.Load()
+	if cp != nil {
+		chunks := *cp
+		if cIdx < len(chunks) && chunks[cIdx] != nil {
+			chunks[cIdx][sIdx].Store(c)
+			return
+		}
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var oldChunks []*connChunk
+	if p := t.chunks.Load(); p != nil {
+		oldChunks = *p
+	}
+	newLen := len(oldChunks)
+	if cIdx >= newLen {
+		newLen = cIdx + 1
+	}
+	newChunks := make([]*connChunk, newLen)
+	copy(newChunks, oldChunks)
+	if newChunks[cIdx] == nil {
+		newChunks[cIdx] = new(connChunk)
+	}
+	newChunks[cIdx][sIdx].Store(c)
+	t.chunks.Store(&newChunks)
+}
+
+func (t *connTable) delete(fd int) {
+	if fd < 0 {
+		return
+	}
+	cp := t.chunks.Load()
+	if cp == nil {
+		return
+	}
+	chunks := *cp
+	cIdx := fd >> connChunkShift
+	if cIdx >= len(chunks) {
+		return
+	}
+	ch := chunks[cIdx]
+	if ch != nil {
+		ch[fd&connChunkMask].Store(nil)
+	}
+}
+
+func (t *connTable) forEach(fn func(*conn) bool) {
+	cp := t.chunks.Load()
+	if cp == nil {
+		return
+	}
+	for _, ch := range *cp {
+		if ch == nil {
+			continue
+		}
+		for i := 0; i < connChunkSize; i++ {
+			c := ch[i].Load()
+			if c != nil {
+				if !fn(c) {
+					return
+				}
+			}
+		}
+	}
 }
 
 const (
@@ -252,8 +360,8 @@ func (s *Server) Close() error {
 	}
 
 	for _, r := range reactors {
-		r.conns.Range(func(_, value any) bool {
-			s.closeConn(value.(*conn))
+		r.conns.forEach(func(c *conn) bool {
+			s.closeConn(c)
 			return true
 		})
 		_ = r.poller.Wake()
@@ -306,13 +414,9 @@ func (s *Server) handleAccept(lnFD int, laddr net.Addr) {
 			server:  s,
 			reactor: r,
 		}
-		fd := nfd
-		vc.SetWritableCallback(func() { r.armWrite(c) })
-		vc.SetCloseCallback(func() { s.closeConnGraceful(c, nil) })
-		vc.SetDirectWrite(func(b []byte) (int, error) { return writeFD(fd, b) })
-		vc.SetDirectWritev(func(iovs [][]byte) (int, error) { return writevFD(fd, iovs) })
+		vc.attachConn(nfd, c)
 
-		r.conns.Store(nfd, c)
+		r.conns.store(nfd, c)
 		if err := r.poller.AddRead(nfd); err != nil {
 			s.closeConn(c)
 			continue
@@ -349,11 +453,10 @@ func (r *subReactor) loop() {
 			continue
 		}
 		for _, ev := range events {
-			v, ok := r.conns.Load(ev.Fd)
-			if !ok {
+			c := r.conns.get(ev.Fd)
+			if c == nil {
 				continue
 			}
-			c := v.(*conn)
 			if ev.Error || ev.Hangup {
 				if ev.Readable {
 					r.handleRead(c)
@@ -709,7 +812,7 @@ func (s *Server) closeConnWithErr(c *conn, err error) {
 	c.wsHandler = nil
 	c.mu.Unlock()
 
-	c.reactor.conns.Delete(c.fd)
+	c.reactor.conns.delete(c.fd)
 	_ = c.vc.Close()
 
 	if handler != nil {
@@ -792,6 +895,8 @@ func (s *Server) serveConn(c *conn) {
 				reader.Reset(nil)
 				readerPool.Put(reader)
 				pooled = false
+				w.releaseBuffers()
+				c.vc.CompactOrRelease()
 				if c.vc.InputLen() > 0 {
 					c.reactor.scheduleWS(c)
 				}

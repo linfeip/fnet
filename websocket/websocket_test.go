@@ -533,3 +533,111 @@ func BenchmarkWebSocketEcho(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkWebSocketEventDrivenEcho(b *testing.B) {
+	port := getFreePort(&testing.T{})
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	upgrader := &websocket.Upgrader{
+		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+			_ = c.WriteMessage(op, msg)
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = upgrader.Upgrade(w, r)
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	clientConn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		b.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	payload := make([]byte, 1024)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.SetBytes(1024)
+
+	for i := 0; i < b.N; i++ {
+		if err := wsutil.WriteClientBinary(clientConn, payload); err != nil {
+			b.Fatalf("write: %v", err)
+		}
+		resp, err := wsutil.ReadServerBinary(clientConn)
+		if err != nil {
+			b.Fatalf("read: %v", err)
+		}
+		if len(resp) != 1024 {
+			b.Fatalf("bad resp len: %d", len(resp))
+		}
+	}
+}
+
+func TestWebSocketIdleMemoryFootprint(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	upgrader := &websocket.Upgrader{
+		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+			_ = c.WriteMessage(op, msg)
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = upgrader.Upgrade(w, r)
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	runtime.GC()
+	var msBefore runtime.MemStats
+	runtime.ReadMemStats(&msBefore)
+
+	const count = 200
+	conns := make([]net.Conn, count)
+	for i := 0; i < count; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		c, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+		cancel()
+		if err != nil {
+			t.Fatalf("dial %d failed: %v", i, err)
+		}
+		conns[i] = c
+		defer c.Close()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	runtime.GC()
+	var msAfter runtime.MemStats
+	runtime.ReadMemStats(&msAfter)
+
+	heapGrowth := int64(msAfter.HeapAlloc) - int64(msBefore.HeapAlloc)
+	bytesPerConn := heapGrowth / count
+	t.Logf("Heap growth for %d conns: %d bytes (~%d bytes/conn)", count, heapGrowth, bytesPerConn)
+
+	// Note that in this test both client dialer and server live in the same process.
+	// Previously, each connection held a 4096-byte bufio.Writer + responseWriter + headers,
+	// leading to >5KB per connection. Now server + client combined should be well below 3500 bytes/conn.
+	if bytesPerConn > 3500 {
+		t.Errorf("expected < 3500 bytes/conn, got %d bytes/conn", bytesPerConn)
+	}
+}

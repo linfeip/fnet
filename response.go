@@ -19,6 +19,7 @@ type responseWriter struct {
 	conn          net.Conn
 	bufr          *bufio.Reader
 	bufw          *bufio.Writer
+	bufwPooled    bool
 	header        http.Header
 	status        int
 	wroteHeader   bool
@@ -29,6 +30,10 @@ type responseWriter struct {
 	closeConn     bool
 	bodyBuf       bytes.Buffer
 	mu            sync.Mutex
+}
+
+var writerPool = sync.Pool{
+	New: func() any { return bufio.NewWriterSize(nil, 4096) },
 }
 
 // WSHandler receives WebSocket events on an event-driven connection.
@@ -220,6 +225,22 @@ func (w *responseWriter) finish() error {
 	return nil
 }
 
+func (w *responseWriter) releaseBuffers() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.bufw != nil {
+		if w.bufwPooled {
+			w.bufw.Reset(nil)
+			writerPool.Put(w.bufw)
+		}
+		w.bufw = nil
+		w.bufwPooled = false
+	}
+	w.bufr = nil
+	w.header = nil
+	w.c = nil
+}
+
 // AttachWS marks the connection for event-driven WebSocket processing and attaches
 // the event handler. Any read-ahead bytes buffered by the HTTP reader are restored
 // to the VirtualConn input buffer so no frame bytes are lost. Frame dispatch starts
@@ -247,12 +268,24 @@ func (w *responseWriter) AttachWS(handler WSHandler) (*VirtualConn, error) {
 		w.c.vc.UnshiftInput(rem)
 	}
 
-	w.c.mu.Lock()
-	w.c.wsHandler = handler
-	w.c.state.Store(connStateWSAttached)
-	w.c.mu.Unlock()
+	c := w.c
+	c.mu.Lock()
+	c.wsHandler = handler
+	c.state.Store(connStateWSAttached)
+	c.mu.Unlock()
 
-	return w.c.vc, nil
+	if w.bufw != nil {
+		if w.bufwPooled {
+			w.bufw.Reset(nil)
+			writerPool.Put(w.bufw)
+		}
+		w.bufw = nil
+		w.bufwPooled = false
+	}
+	w.bufr = nil
+	w.header = nil
+
+	return c.vc, nil
 }
 
 // hijackedConn wraps the underlying net.Conn so that any bytes buffered in
@@ -264,7 +297,10 @@ type hijackedConn struct {
 }
 
 func (c *hijackedConn) Read(b []byte) (int, error) {
-	return c.r.Read(b)
+	if c.r != nil {
+		return c.r.Read(b)
+	}
+	return c.Conn.Read(b)
 }
 
 func (c *hijackedConn) WriteVector(iovs [][]byte) (int, error) {
@@ -284,7 +320,10 @@ func (c *hijackedConn) WriteVector(iovs [][]byte) (int, error) {
 
 func (c *hijackedConn) AttachWS(handler WSHandler) (*VirtualConn, error) {
 	if c.w != nil {
-		return c.w.AttachWS(handler)
+		w := c.w
+		c.w = nil
+		c.r = nil
+		return w.AttachWS(handler)
 	}
 	if attacher, ok := c.Conn.(WSAttacher); ok {
 		return attacher.AttachWS(handler)
@@ -301,7 +340,10 @@ func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	}
 	w.hijacked = true
 	if w.bufw == nil {
-		w.bufw = bufio.NewWriter(w.conn)
+		bw := writerPool.Get().(*bufio.Writer)
+		bw.Reset(w.conn)
+		w.bufw = bw
+		w.bufwPooled = true
 	}
 	conn := &hijackedConn{
 		Conn: w.conn,

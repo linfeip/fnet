@@ -41,12 +41,8 @@ func writevFD(fd int, iovs [][]byte) (int, error) {
 }
 
 func acceptFD(fd int) (int, net.Addr, error) {
-	nfd, sa, err := unix.Accept(fd)
+	nfd, sa, err := sysAccept(fd)
 	if err != nil {
-		return -1, nil, err
-	}
-	if err := setNonblock(nfd); err != nil {
-		_ = unix.Close(nfd)
 		return -1, nil, err
 	}
 	_ = unix.SetsockoptInt(nfd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
