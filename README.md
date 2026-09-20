@@ -112,7 +112,7 @@ HTTP example listens on `127.0.0.1:8080` and `127.0.0.1:8443` (override with `FN
 
 ### License
 
-See the repository for license details.
+MIT. See [LICENSE](LICENSE).
 
 ---
 
@@ -224,4 +224,4 @@ HTTP 示例默认监听 `127.0.0.1:8080` 与 `127.0.0.1:8443`，可用环境变�
 
 ### 许可证
 
-以仓库内许可证文件为准。
+MIT，详见 [LICENSE](LICENSE)。
