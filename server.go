@@ -20,9 +20,15 @@ import (
 
 // Server is a high-performance HTTP/HTTPS server driven by native multi-reactor pollers
 // (epoll / kqueue / WSAPoll). TLS and HTTP parsing reuse the Go standard library.
+//
+// One Server owns a single accept loop and NumPollers sub-reactors regardless of how
+// many addresses it listens on, so listening on many ports does not multiply pollers.
 type Server struct {
 	// Addr is the TCP address to listen on (e.g. ":8080").
 	Addr string
+	// Addrs is an optional list of additional TCP addresses to listen on.
+	// All listeners share the same accept loop and reactor pool.
+	Addrs []string
 	// Handler is invoked for each HTTP request. Defaults to http.DefaultServeMux.
 	Handler http.Handler
 	// TLSConfig enables HTTPS when non-nil (or when ListenAndServeTLS is used).
@@ -36,9 +42,12 @@ type Server struct {
 	// NumPollers specifies the number of I/O sub-reactors. Defaults to runtime.GOMAXPROCS(0).
 	NumPollers int
 
+	// Listen is an optional listener constructor (e.g. frameworks.Listen / reuseport.Listen).
+	// When nil, net.ListenConfig with SO_REUSEADDR and SO_REUSEPORT is used.
+	Listen func(network, addr string) (net.Listener, error)
+
 	lnMu        sync.Mutex
-	lnFD        int
-	lnAddr      net.Addr
+	listeners   map[int]net.Addr // listener fd -> local address
 	mainPoller  Poller
 	reactors    []*subReactor
 	nextReactor atomic.Uint64
@@ -47,35 +56,58 @@ type Server struct {
 }
 
 type subReactor struct {
-	id       int
-	server   *Server
-	poller   Poller
-	conns    sync.Map // fd -> *conn
-	notifyMu sync.Mutex
-	wakeFDs  map[int]struct{} // fds needing write interest
+	id     int
+	server *Server
+	poller Poller
+	conns  sync.Map // fd -> *conn
+	rbuf   []byte   // per-reactor read buffer
+
+	// Work handed to the reactor goroutine from other goroutines.
+	pendMu    sync.Mutex
+	pendWS    []*conn // connections that just switched to event-driven WebSocket
+	pendClose []int   // fds whose close must happen on the reactor
+	pendCount atomic.Int32
+	waiting   atomic.Bool // reactor is (about to be) blocked in Wait
 }
 
 const (
 	connStateIdle = iota
 	connStateWorking
 	connStateHijacked
-	connStateWSEventDriven
+	connStateWSAttached    // AttachWS called; reactor buffers frames until the HTTP handler returns
+	connStateWSEventDriven // reactor parses frames and invokes the WSHandler inline
 	connStateClosed
 )
 
-const maxHeaderBuffer = 64 * 1024 // 64KB max buffered header to prevent memory exhaustion
+const (
+	maxHeaderBuffer = 64 * 1024 // max buffered header bytes before a slow-loris connection is dropped
+	reactorBufSize  = 64 * 1024
+	pollTimeout     = time.Second
+)
 
 type conn struct {
 	fd      int
 	vc      *VirtualConn
 	server  *Server
 	reactor *subReactor
-	once    sync.Once
+
+	state           atomic.Int32
+	closed          atomic.Bool
+	writeArmed      atomic.Bool // write interest registered with the poller
+	closeAfterFlush atomic.Bool // close once the outbound queue drains
 
 	mu        sync.Mutex
-	state     int
-	wsWorking bool
 	wsHandler WSHandler
+	closeErr  error
+}
+
+// ErrWSAttachUnsupported is returned by WSAttacher.AttachWS when the connection
+// cannot be driven by the reactor (currently: TLS connections, whose records are
+// decrypted by a worker goroutine).
+var ErrWSAttachUnsupported = errors.New("fnet: event-driven websocket attach not supported on this connection")
+
+var readerPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, 4096) },
 }
 
 // ListenAndServe starts a plain HTTP server.
@@ -99,6 +131,15 @@ func (s *Server) ListenAndServeTLS(certFile, keyFile string) error {
 	return s.serve(cfg)
 }
 
+func (s *Server) listenAddrs() []string {
+	if s.Addr == "" && len(s.Addrs) > 0 {
+		return s.Addrs
+	}
+	addrs := make([]string, 0, 1+len(s.Addrs))
+	addrs = append(addrs, s.Addr)
+	return append(addrs, s.Addrs...)
+}
+
 func (s *Server) serve(tlsCfg *tls.Config) error {
 	if s.Handler == nil {
 		s.Handler = http.DefaultServeMux
@@ -107,9 +148,34 @@ func (s *Server) serve(tlsCfg *tls.Config) error {
 		s.TLSConfig = tlsCfg
 	}
 
-	fd, addr, err := listenNonblock("tcp", s.Addr)
-	if err != nil {
-		return err
+	listeners := make(map[int]net.Addr)
+	closeListeners := func() {
+		for fd := range listeners {
+			_ = closeFD(fd)
+		}
+	}
+	for _, addr := range s.listenAddrs() {
+		var (
+			fd    int
+			laddr net.Addr
+			err   error
+		)
+		if s.Listen != nil {
+			var ln net.Listener
+			ln, err = s.Listen("tcp", addr)
+			if err == nil {
+				laddr = ln.Addr()
+				fd, err = dupListenerFD(ln)
+				_ = ln.Close()
+			}
+		} else {
+			fd, laddr, err = listenNonblock("tcp", addr)
+		}
+		if err != nil {
+			closeListeners()
+			return err
+		}
+		listeners[fd] = laddr
 	}
 
 	num := s.NumPollers
@@ -125,7 +191,7 @@ func (s *Server) serve(tlsCfg *tls.Config) error {
 
 	mainP, err := NewPoller()
 	if err != nil {
-		_ = closeFD(fd)
+		closeListeners()
 		return err
 	}
 
@@ -137,74 +203,76 @@ func (s *Server) serve(tlsCfg *tls.Config) error {
 			for j := 0; j < i; j++ {
 				_ = reactors[j].poller.Close()
 			}
-			_ = closeFD(fd)
+			closeListeners()
 			return err
 		}
-		r := &subReactor{
-			id:      i,
-			server:  s,
-			poller:  p,
-			wakeFDs: make(map[int]struct{}),
-		}
-		reactors[i] = r
-		s.wg.Add(1)
-		go r.loop()
+		reactors[i] = &subReactor{id: i, server: s, poller: p}
 	}
 
 	s.lnMu.Lock()
-	s.lnFD = fd
-	s.lnAddr = addr
+	s.listeners = listeners
 	s.mainPoller = mainP
 	s.reactors = reactors
 	s.lnMu.Unlock()
 
-	if err := mainP.AddRead(fd); err != nil {
-		_ = s.Close()
-		return err
+	for _, r := range reactors {
+		s.wg.Add(1)
+		go r.loop()
+	}
+
+	for fd := range listeners {
+		if err := mainP.AddRead(fd); err != nil {
+			_ = s.Close()
+			return err
+		}
 	}
 
 	return s.acceptLoop()
 }
 
-// Close stops the server and closes the listening socket.
+// Close stops the server, closes the listening sockets and all connections.
 func (s *Server) Close() error {
 	if !s.closing.CompareAndSwap(false, true) {
 		return nil
 	}
 	s.lnMu.Lock()
 	mp := s.mainPoller
-	lnFD := s.lnFD
+	listeners := s.listeners
 	reactors := s.reactors
 	s.lnMu.Unlock()
 
-	if mp != nil && lnFD > 0 {
-		_ = mp.Delete(lnFD)
-	}
-	if lnFD > 0 {
-		_ = closeFD(lnFD)
+	for fd := range listeners {
+		if mp != nil {
+			_ = mp.Delete(fd)
+		}
+		_ = closeFD(fd)
 	}
 	if mp != nil {
 		_ = mp.Wake()
-		_ = mp.Close()
 	}
 
 	for _, r := range reactors {
-		r.conns.Range(func(key, value any) bool {
-			c := value.(*conn)
-			s.closeConn(c)
+		r.conns.Range(func(_, value any) bool {
+			s.closeConn(value.(*conn))
 			return true
 		})
 		_ = r.poller.Wake()
-		_ = r.poller.Close()
 	}
 
 	s.wg.Wait()
+
+	for _, r := range reactors {
+		_ = r.poller.Close()
+	}
+	if mp != nil {
+		_ = mp.Close()
+	}
 	return nil
 }
 
 func (s *Server) acceptLoop() error {
 	for !s.closing.Load() {
-		events, err := s.mainPoller.Wait(100 * time.Millisecond)
+		events, err := s.mainPoller.Wait(pollTimeout)
 		if err != nil {
 			if s.closing.Load() {
 				return nil
@@ -212,63 +280,68 @@ func (s *Server) acceptLoop() error {
 			return err
 		}
 		for _, ev := range events {
-			if ev.Fd == s.lnFD {
-				s.handleAccept()
+			if laddr, ok := s.listeners[ev.Fd]; ok {
+				s.handleAccept(ev.Fd, laddr)
 			}
 		}
 	}
 	return nil
 }
 
-func (s *Server) handleAccept() {
+func (s *Server) handleAccept(lnFD int, laddr net.Addr) {
 	for {
-		nfd, raddr, err := acceptFD(s.lnFD)
+		nfd, raddr, err := acceptFD(lnFD)
 		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-				return
-			}
+			// EAGAIN / EWOULDBLOCK: backlog drained. Anything else: give up for now.
 			return
 		}
 
 		idx := s.nextReactor.Add(1) % uint64(len(s.reactors))
 		r := s.reactors[idx]
 
-		vc := NewVirtualConn(s.lnAddr, raddr)
+		vc := NewVirtualConn(laddr, raddr)
 		c := &conn{
 			fd:      nfd,
 			vc:      vc,
 			server:  s,
 			reactor: r,
-			state:   connStateIdle,
 		}
 		fd := nfd
-		vc.SetWritableCallback(func() {
-			r.armWrite(fd)
-		})
-		vc.SetDirectWrite(func(b []byte) (int, error) {
-			return writeFD(fd, b)
-		})
-		vc.SetDirectWritev(func(iovs [][]byte) (int, error) {
-			return writevFD(fd, iovs)
-		})
+		vc.SetWritableCallback(func() { r.armWrite(c) })
+		vc.SetCloseCallback(func() { s.closeConnGraceful(c, nil) })
+		vc.SetDirectWrite(func(b []byte) (int, error) { return writeFD(fd, b) })
+		vc.SetDirectWritev(func(iovs [][]byte) (int, error) { return writevFD(fd, iovs) })
 
 		r.conns.Store(nfd, c)
 		if err := r.poller.AddRead(nfd); err != nil {
 			s.closeConn(c)
 			continue
 		}
-		// Newly accepted connection remains in connStateIdle.
-		// Poller will dispatch a worker goroutine on-demand only when a complete HTTP header arrives.
+		// The connection stays idle under poller custody; a worker goroutine is
+		// only dispatched once a complete HTTP header has arrived.
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Reactor loop
+// ---------------------------------------------------------------------------
+
 func (r *subReactor) loop() {
 	defer r.server.wg.Done()
-	buf := make([]byte, 64*1024)
-	for !r.server.closing.Load() {
-		r.flushWriteInterest()
+	defer r.runPending(true)
+	r.rbuf = make([]byte, reactorBufSize)
 
-		events, err := r.poller.Wait(50 * time.Millisecond)
+	for !r.server.closing.Load() {
+		r.runPending(false)
+
+		r.waiting.Store(true)
+		if r.pendCount.Load() > 0 {
+			// Work arrived between runPending and Wait; don't block.
+			r.waiting.Store(false)
+			continue
+		}
+		events, err := r.poller.Wait(pollTimeout)
+		r.waiting.Store(false)
 		if err != nil {
 			if r.server.closing.Load() {
 				return
@@ -283,34 +356,109 @@ func (r *subReactor) loop() {
 			c := v.(*conn)
 			if ev.Error || ev.Hangup {
 				if ev.Readable {
-					r.handleRead(c, buf)
+					r.handleRead(c)
 				}
 				r.server.closeConn(c)
 				continue
 			}
 			if ev.Readable {
-				r.handleRead(c, buf)
+				r.handleRead(c)
 			}
 			if ev.Writable {
-				r.handleWrite(c, buf)
+				r.handleWrite(c)
 			}
 		}
 	}
 }
 
-func (r *subReactor) handleRead(c *conn, buf []byte) {
+// runPending executes work queued for this reactor by other goroutines:
+// deferred fd closes and WebSocket hand-offs. In final mode (shutdown) only
+// closes are processed.
+func (r *subReactor) runPending(final bool) {
+	if r.pendCount.Load() == 0 {
+		return
+	}
+	r.pendMu.Lock()
+	wsq := r.pendWS
+	clq := r.pendClose
+	r.pendWS = nil
+	r.pendClose = nil
+	r.pendCount.Store(0)
+	r.pendMu.Unlock()
+
+	for _, fd := range clq {
+		_ = r.poller.Delete(fd)
+		_ = closeFD(fd)
+	}
+	if final {
+		return
+	}
+	for _, c := range wsq {
+		if c.state.Load() == connStateWSEventDriven {
+			r.server.drainWS(c)
+		}
+	}
+}
+
+func (r *subReactor) enqueue(fn func()) {
+	r.pendMu.Lock()
+	fn()
+	r.pendCount.Add(1)
+	r.pendMu.Unlock()
+	if r.waiting.Load() {
+		_ = r.poller.Wake()
+	}
+}
+
+// scheduleWS asks the reactor to drain already-buffered frames of a connection
+// that just became event-driven.
+func (r *subReactor) scheduleWS(c *conn) {
+	r.enqueue(func() { r.pendWS = append(r.pendWS, c) })
+}
+
+// scheduleClose defers the actual close(2) to the reactor goroutine so that an
+// fd number is never reused while an event batch referencing it is in flight.
+func (r *subReactor) scheduleClose(fd int) {
+	r.enqueue(func() { r.pendClose = append(r.pendClose, fd) })
+}
+
+// armWrite registers write interest for c exactly once until the reactor
+// drains the outbound queue.
+func (r *subReactor) armWrite(c *conn) {
+	if c.closed.Load() {
+		return
+	}
+	if c.writeArmed.CompareAndSwap(false, true) {
+		_ = r.poller.ModReadWrite(c.fd)
+	}
+}
+
+func (r *subReactor) handleRead(c *conn) {
+	if c.closeAfterFlush.Load() {
+		r.discardRead(c)
+		return
+	}
+	buf := r.rbuf
 	for {
 		n, err := readFD(c.fd, buf)
 		if n > 0 {
-			c.vc.FeedInput(buf[:n])
+			if c.state.Load() == connStateWSEventDriven {
+				if !r.server.feedWS(c, buf[:n]) {
+					return
+				}
+			} else {
+				c.vc.FeedInput(buf[:n])
+			}
 		}
 		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-				r.server.checkAndDispatch(c)
-				return
+			if isWouldBlock(err) {
+				break
+			}
+			if errors.Is(err, syscall.EINTR) {
+				continue
 			}
 			c.vc.FeedError(err)
-			r.server.closeConn(c)
+			r.server.closeConnWithErr(c, err)
 			return
 		}
 		if n == 0 {
@@ -318,185 +466,272 @@ func (r *subReactor) handleRead(c *conn, buf []byte) {
 			r.server.closeConn(c)
 			return
 		}
+		if n < len(buf) {
+			// Edge-triggered: a short read means the socket buffer is empty; any
+			// later data raises a new event, so skip the extra EAGAIN syscall.
+			break
+		}
 	}
+	if c.state.Load() == connStateWSEventDriven {
+		if c.vc.InputLen() > 0 {
+			r.server.drainWS(c)
+		}
+		return
+	}
+	r.server.checkAndDispatch(c)
 }
 
-func (r *subReactor) handleWrite(c *conn, buf []byte) {
+// discardRead drains and drops inbound bytes on a connection that is closing
+// after its outbound queue flushes.
+func (r *subReactor) discardRead(c *conn) {
 	for {
-		n, remaining := c.vc.DrainWrite(buf)
-		if n == 0 {
-			_ = r.poller.ModRead(c.fd)
-			return
-		}
-		written := 0
-		for written < n {
-			wn, err := writeFD(c.fd, buf[written:n])
-			if wn > 0 {
-				written += wn
-			}
-			if err != nil {
-				if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-					if written < n {
-						c.vc.UnshiftWrite(append([]byte(nil), buf[written:n]...))
-					}
-					_ = r.poller.ModReadWrite(c.fd)
-					return
-				}
-				c.vc.FeedError(err)
-				r.server.closeConn(c)
+		n, err := readFD(c.fd, r.rbuf)
+		if err != nil {
+			if isWouldBlock(err) || errors.Is(err, syscall.EINTR) {
 				return
 			}
+			r.server.finishClose(c)
+			return
 		}
-		if !remaining && !c.vc.PendingWrite() {
-			_ = r.poller.ModRead(c.fd)
+		if n == 0 {
+			r.server.finishClose(c)
+			return
+		}
+		if n < len(r.rbuf) {
 			return
 		}
 	}
 }
 
-func (r *subReactor) armWrite(fd int) {
-	r.notifyMu.Lock()
-	r.wakeFDs[fd] = struct{}{}
-	r.notifyMu.Unlock()
-	_ = r.poller.Wake()
-}
-
-func (r *subReactor) flushWriteInterest() {
-	r.notifyMu.Lock()
-	if len(r.wakeFDs) == 0 {
-		r.notifyMu.Unlock()
+func (r *subReactor) handleWrite(c *conn) {
+	pending, err := c.vc.flushOut()
+	if err != nil {
+		r.server.closeConnWithErr(c, err)
 		return
 	}
-	fds := make([]int, 0, len(r.wakeFDs))
-	for fd := range r.wakeFDs {
-		fds = append(fds, fd)
+	if pending {
+		return // interest stays armed; kernel will notify when writable again
 	}
-	r.wakeFDs = make(map[int]struct{})
-	r.notifyMu.Unlock()
-
-	for _, fd := range fds {
-		if _, ok := r.conns.Load(fd); !ok {
-			continue
-		}
-		_ = r.poller.ModReadWrite(fd)
+	_ = r.poller.ModRead(c.fd)
+	c.writeArmed.Store(false)
+	if c.closeAfterFlush.Load() {
+		r.server.finishClose(c)
+		return
+	}
+	// A writer may have queued data between flushOut and the reset above.
+	if c.vc.PendingWrite() {
+		r.armWrite(c)
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+// checkAndDispatch is called on the reactor after inbound bytes were buffered.
 func (s *Server) checkAndDispatch(c *conn) {
+	switch c.state.Load() {
+	case connStateWSEventDriven:
+		s.drainWS(c)
+		return
+	case connStateIdle:
+	default:
+		return
+	}
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.state == connStateClosed {
-		return
-	}
-
-	if c.state == connStateWSEventDriven {
-		if !c.wsWorking && c.vc.HasCompleteWSFrame() {
-			c.wsWorking = true
-			s.wg.Add(1)
-			go s.serveWSConn(c)
-		}
-		return
-	}
-
-	if c.state != connStateIdle {
+	if c.state.Load() != connStateIdle {
+		c.mu.Unlock()
 		return
 	}
 
 	if s.TLSConfig != nil {
 		if c.vc.HasBufferedInput() {
-			c.state = connStateWorking
+			c.state.Store(connStateWorking)
 			s.wg.Add(1)
 			go s.serveConn(c)
 		}
-		return
-	}
-
-	// Defend against slow/malicious connections buffering large data without \r\n\r\n
-	if c.vc.InputLen() > maxHeaderBuffer && !c.vc.HasCompleteHeader() {
-		go s.closeConn(c)
+		c.mu.Unlock()
 		return
 	}
 
 	if c.vc.HasCompleteHeader() {
-		c.state = connStateWorking
+		c.state.Store(connStateWorking)
 		s.wg.Add(1)
+		c.mu.Unlock()
 		go s.serveConn(c)
+		return
+	}
+	// Defend against slow/malicious connections buffering large data without \r\n\r\n.
+	tooLarge := c.vc.InputLen() > maxHeaderBuffer
+	c.mu.Unlock()
+	if tooLarge {
+		s.closeConn(c)
 	}
 }
 
-func (s *Server) serveWSConn(c *conn) {
-	defer s.wg.Done()
-
-	for {
-		c.mu.Lock()
-		if c.state != connStateWSEventDriven {
-			c.wsWorking = false
-			c.mu.Unlock()
-			return
-		}
-
-		h, payload, ok, err := c.vc.PopWSFrame()
+// feedWS handles bytes just read from the socket for an event-driven WebSocket
+// connection. When no partial frame is pending, frames are parsed and dispatched
+// straight out of the reactor read buffer (zero copy); only an incomplete tail is
+// retained. Returns false if the connection was closed.
+func (s *Server) feedWS(c *conn, data []byte) bool {
+	vc := c.vc
+	if vc.InputLen() == 0 {
+		n, err := s.dispatchWSFrames(c, data)
 		if err != nil {
-			c.wsWorking = false
-			c.mu.Unlock()
 			s.closeConnWithErr(c, err)
-			return
+			return false
+		}
+		if c.closed.Load() {
+			return false
+		}
+		if n < len(data) {
+			vc.FeedInput(data[n:])
+		}
+		return true
+	}
+	vc.FeedInput(data)
+	return s.drainWS(c)
+}
+
+// drainWS dispatches complete frames buffered in the VirtualConn. Only the
+// reactor goroutine calls it. Returns false if the connection was closed.
+func (s *Server) drainWS(c *conn) bool {
+	if c.closeAfterFlush.Load() {
+		return false
+	}
+	vc := c.vc
+	buf := vc.inputView()
+	if len(buf) == 0 {
+		return true
+	}
+	n, err := s.dispatchWSFrames(c, buf)
+	if err != nil {
+		s.closeConnWithErr(c, err)
+		return false
+	}
+	vc.consumeInput(n)
+	return !c.closed.Load()
+}
+
+// dispatchWSFrames parses complete frames from data and invokes the handler for
+// each. It returns the number of bytes consumed. Payloads are unmasked in place
+// and passed as sub-slices of data: they are only valid during the callback.
+func (s *Server) dispatchWSFrames(c *conn, data []byte) (int, error) {
+	off := 0
+	for off < len(data) {
+		h, hlen, ok, err := parseWSHeader(data[off:])
+		if err != nil {
+			return off, err
 		}
 		if !ok {
-			c.wsWorking = false
-			c.mu.Unlock()
-			return
+			break
 		}
-		handler := c.wsHandler
-		c.mu.Unlock()
-
-		if h.OpCode == ws.OpClose {
-			_ = ws.WriteFrame(c.vc, ws.NewCloseFrame(ws.NewCloseFrameBody(ws.StatusNormalClosure, "")))
-			s.flushConnSync(c)
-			s.closeConnWithErr(c, nil)
-			return
+		total := hlen + int(h.Length)
+		if len(data)-off < total {
+			break
 		}
-
-		if h.OpCode == ws.OpPing {
-			_ = ws.WriteFrame(c.vc, ws.NewPongFrame(payload))
-			continue
+		start, end := off+hlen, off+total
+		payload := data[start:end:end] // capped so a handler append cannot clobber the next frame
+		if h.Masked {
+			ws.Cipher(payload, h.Mask, 0)
 		}
-
-		if h.OpCode == ws.OpPong {
-			continue
-		}
-
-		if handler != nil {
-			handler.OnMessage(byte(h.OpCode), payload)
+		off = end
+		if !s.handleWSFrame(c, h, payload) {
+			return off, nil
 		}
 	}
+	return off, nil
+}
+
+// handleWSFrame processes one frame on the reactor. Returns false if the
+// connection is closed or closing.
+func (s *Server) handleWSFrame(c *conn, h ws.Header, payload []byte) bool {
+	switch h.OpCode {
+	case ws.OpClose:
+		body := closeNormalBody[:]
+		if len(payload) >= 2 {
+			body = payload[:2] // echo the peer's status code
+		}
+		_ = writeWSFrame(c.vc, ws.OpClose, body)
+		s.closeConnGraceful(c, nil)
+		return false
+	case ws.OpPing:
+		_ = writeWSFrame(c.vc, ws.OpPong, payload)
+		return !c.closed.Load()
+	case ws.OpPong:
+		return true
+	}
+
+	handler := c.wsHandler
+	if handler != nil {
+		handler.OnMessage(byte(h.OpCode), payload)
+	}
+	return !c.closed.Load() && !c.closeAfterFlush.Load()
+}
+
+// ---------------------------------------------------------------------------
+// Close paths
+// ---------------------------------------------------------------------------
+
+// closeConnGraceful closes c after its outbound queue has been flushed by the
+// reactor; if nothing is queued it closes immediately.
+func (s *Server) closeConnGraceful(c *conn, err error) {
+	if c.closed.Load() {
+		return
+	}
+	if !c.vc.PendingWrite() {
+		s.closeConnWithErr(c, err)
+		return
+	}
+	c.mu.Lock()
+	c.closeErr = err
+	c.mu.Unlock()
+	c.closeAfterFlush.Store(true)
+	c.reactor.armWrite(c)
+}
+
+// finishClose completes a graceful close with the error recorded earlier.
+func (s *Server) finishClose(c *conn) {
+	c.mu.Lock()
+	err := c.closeErr
+	c.mu.Unlock()
+	s.closeConnWithErr(c, err)
 }
 
 func (s *Server) closeConnWithErr(c *conn, err error) {
-	c.once.Do(func() {
-		c.mu.Lock()
-		c.state = connStateClosed
-		handler := c.wsHandler
-		c.wsHandler = nil
-		c.mu.Unlock()
+	if !c.closed.CompareAndSwap(false, true) {
+		return
+	}
+	c.mu.Lock()
+	c.state.Store(connStateClosed)
+	handler := c.wsHandler
+	c.wsHandler = nil
+	c.mu.Unlock()
 
-		if handler != nil {
-			handler.OnClose(err)
-		}
+	c.reactor.conns.Delete(c.fd)
+	_ = c.vc.Close()
 
-		if c.reactor != nil {
-			c.reactor.conns.Delete(c.fd)
-			_ = c.reactor.poller.Delete(c.fd)
-		}
-		_ = c.vc.Close()
+	if handler != nil {
+		handler.OnClose(err)
+	}
+
+	if s.closing.Load() {
+		// Reactor may already be gone; close inline.
+		_ = c.reactor.poller.Delete(c.fd)
 		_ = closeFD(c.fd)
-	})
+		return
+	}
+	c.reactor.scheduleClose(c.fd)
 }
 
 func (s *Server) closeConn(c *conn) {
 	s.closeConnWithErr(c, io.EOF)
 }
+
+// ---------------------------------------------------------------------------
+// HTTP worker
+// ---------------------------------------------------------------------------
 
 func (s *Server) serveConn(c *conn) {
 	defer s.wg.Done()
@@ -514,15 +749,23 @@ func (s *Server) serveConn(c *conn) {
 		rw = tlsConn
 	}
 
-	reader := bufio.NewReader(rw)
+	reader := readerPool.Get().(*bufio.Reader)
+	reader.Reset(rw)
+	pooled := true
+	defer func() {
+		if pooled {
+			reader.Reset(nil)
+			readerPool.Put(reader)
+		}
+	}()
+
 	for {
 		if s.ReadTimeout > 0 {
 			_ = rw.SetReadDeadline(time.Now().Add(s.ReadTimeout))
 		}
 		req, err := http.ReadRequest(reader)
 		if err != nil {
-			s.flushConnSync(c)
-			s.closeConn(c)
+			s.closeConnGraceful(c, io.EOF)
 			return
 		}
 		req.RemoteAddr = c.vc.RemoteAddr().String()
@@ -538,17 +781,24 @@ func (s *Server) serveConn(c *conn) {
 		}
 		s.Handler.ServeHTTP(w, req)
 		if w.Hijacked() {
-			// Connection was hijacked (e.g. WebSocket).
+			// The hijacker (or event-driven WebSocket) now owns the reader.
+			pooled = false
 			c.mu.Lock()
-			if c.state == connStateWSEventDriven {
+			if c.state.Load() == connStateWSAttached {
+				// Hand the connection to the reactor: from here on frames are
+				// parsed and dispatched inline on the event loop.
+				c.state.Store(connStateWSEventDriven)
 				c.mu.Unlock()
-				s.flushConnSync(c)
-				s.checkAndDispatch(c)
+				reader.Reset(nil)
+				readerPool.Put(reader)
+				pooled = false
+				if c.vc.InputLen() > 0 {
+					c.reactor.scheduleWS(c)
+				}
 				return
 			}
-			c.state = connStateHijacked
+			c.state.Store(connStateHijacked)
 			c.mu.Unlock()
-			// Caller took over connection lifecycle; do not close here.
 			return
 		}
 		_ = w.finish()
@@ -556,28 +806,25 @@ func (s *Server) serveConn(c *conn) {
 		_ = req.Body.Close()
 
 		if req.Close || strings.EqualFold(w.header.Get("Connection"), "close") {
-			s.flushConnSync(c)
-			s.closeConn(c)
+			s.closeConnGraceful(c, io.EOF)
 			return
 		}
 
-		s.flushConnSync(c)
-
-		// Unshift any excess buffered bytes read by bufio.Reader back to c.vc
+		// Return any read-ahead bytes held by the bufio.Reader to the VirtualConn.
 		if reader.Buffered() > 0 {
 			rem := make([]byte, reader.Buffered())
 			_, _ = io.ReadFull(reader, rem)
 			c.vc.UnshiftInput(rem)
 		}
 
-		// Check if there is an immediately pipelined complete HTTP request
 		c.mu.Lock()
-		if c.state == connStateClosed {
+		if c.state.Load() == connStateClosed {
 			c.mu.Unlock()
 			return
 		}
 
 		if s.TLSConfig == nil && c.vc.HasCompleteHeader() {
+			// Pipelined request already buffered: keep this worker.
 			c.mu.Unlock()
 			reader.Reset(rw)
 			continue
@@ -589,48 +836,16 @@ func (s *Server) serveConn(c *conn) {
 				_ = rw.SetReadDeadline(time.Now().Add(s.IdleTimeout))
 				continue
 			}
-			s.closeConn(c)
+			s.closeConnGraceful(c, io.EOF)
 			return
 		}
 
-		// No complete request pending. Revert connection to Idle state under Poller custody,
-		// and terminate this worker goroutine to avoid idle goroutine holding.
-		c.state = connStateIdle
+		// Nothing pending: return the connection to poller custody and release
+		// this goroutine. Any partially written response is flushed by the
+		// reactor on write readiness.
+		c.state.Store(connStateIdle)
 		c.mu.Unlock()
 		return
-	}
-}
-
-// flushConnSync writes any remaining VirtualConn outbound bytes directly to
-// the socket so responses are not lost when the worker finishes.
-func (s *Server) flushConnSync(c *conn) {
-	buf := make([]byte, 32*1024)
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		n, remaining := c.vc.DrainWrite(buf)
-		if n == 0 {
-			return
-		}
-		off := 0
-		for off < n {
-			wn, err := writeFD(c.fd, buf[off:n])
-			if wn > 0 {
-				off += wn
-			}
-			if err != nil {
-				if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-					time.Sleep(time.Millisecond)
-					continue
-				}
-				if off < n {
-					c.vc.UnshiftWrite(append([]byte(nil), buf[off:n]...))
-				}
-				return
-			}
-		}
-		if !remaining && !c.vc.PendingWrite() {
-			return
-		}
 	}
 }
 

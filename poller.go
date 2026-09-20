@@ -12,6 +12,9 @@ type Event struct {
 }
 
 // Poller is the cross-platform I/O multiplexing abstraction.
+//
+// All registration methods are safe to call from any goroutine and take effect
+// immediately, including while another goroutine is blocked in Wait.
 type Poller interface {
 	// AddRead registers fd for read readiness notifications.
 	AddRead(fd int) error
@@ -19,7 +22,8 @@ type Poller interface {
 	AddWrite(fd int) error
 	// ModRead switches fd to read-only interest.
 	ModRead(fd int) error
-	// ModReadWrite switches fd to read+write interest.
+	// ModReadWrite switches fd to read+write interest. fd must already have
+	// been registered with AddRead.
 	ModReadWrite(fd int) error
 	// Delete removes fd from the poller.
 	Delete(fd int) error

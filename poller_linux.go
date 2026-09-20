@@ -5,17 +5,18 @@ package fnet
 import (
 	"encoding/binary"
 	"fmt"
-	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
+// epollPoller: epoll_ctl is thread-safe and takes effect immediately, so no
+// registration batching or locking is needed.
 type epollPoller struct {
-	mu     sync.Mutex
 	fd     int
 	wakeFD int
 	events []unix.EpollEvent
+	out    []Event
 }
 
 func newPoller() (Poller, error) {
@@ -41,12 +42,11 @@ func newPoller() (Poller, error) {
 		fd:     fd,
 		wakeFD: wakeFD,
 		events: make([]unix.EpollEvent, 1024),
+		out:    make([]Event, 0, 1024),
 	}, nil
 }
 
 func (p *epollPoller) ctl(op int, fd int, events uint32) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	ev := &unix.EpollEvent{
 		Events: events,
 		Fd:     int32(fd),
@@ -71,7 +71,11 @@ func (p *epollPoller) ModReadWrite(fd int) error {
 }
 
 func (p *epollPoller) Delete(fd int) error {
-	return p.ctl(unix.EPOLL_CTL_DEL, fd, 0)
+	err := p.ctl(unix.EPOLL_CTL_DEL, fd, 0)
+	if err == unix.ENOENT || err == unix.EBADF {
+		return nil
+	}
+	return err
 }
 
 func (p *epollPoller) Wait(timeout time.Duration) ([]Event, error) {
@@ -86,7 +90,7 @@ func (p *epollPoller) Wait(timeout time.Duration) ([]Event, error) {
 		}
 		return nil, err
 	}
-	out := make([]Event, 0, n)
+	out := p.out[:0]
 	for i := 0; i < n; i++ {
 		ev := p.events[i]
 		if int(ev.Fd) == p.wakeFD {
@@ -109,6 +113,7 @@ func (p *epollPoller) Wait(timeout time.Duration) ([]Event, error) {
 		}
 		out = append(out, e)
 	}
+	p.out = out
 	return out, nil
 }
 

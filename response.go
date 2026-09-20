@@ -222,13 +222,20 @@ func (w *responseWriter) finish() error {
 
 // AttachWS marks the connection for event-driven WebSocket processing and attaches
 // the event handler. Any read-ahead bytes buffered by the HTTP reader are restored
-// to the VirtualConn input buffer so no frame bytes are lost.
+// to the VirtualConn input buffer so no frame bytes are lost. Frame dispatch starts
+// once the HTTP handler returns, so OnOpen-style setup always precedes OnMessage.
+//
+// The reactor parses raw socket bytes, so this is unavailable on TLS connections
+// and returns ErrWSAttachUnsupported; callers should fall back to a goroutine loop.
 func (w *responseWriter) AttachWS(handler WSHandler) (*VirtualConn, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.c == nil {
 		return nil, errors.New("fnet: no underlying fnet conn")
+	}
+	if w.c.server != nil && w.c.server.TLSConfig != nil {
+		return nil, ErrWSAttachUnsupported
 	}
 
 	w.hijacked = true
@@ -241,8 +248,8 @@ func (w *responseWriter) AttachWS(handler WSHandler) (*VirtualConn, error) {
 	}
 
 	w.c.mu.Lock()
-	w.c.state = connStateWSEventDriven
 	w.c.wsHandler = handler
+	w.c.state.Store(connStateWSAttached)
 	w.c.mu.Unlock()
 
 	return w.c.vc, nil

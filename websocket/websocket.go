@@ -45,14 +45,23 @@ type Upgrader struct {
 
 	// Optional event-driven callbacks. When OnMessage is set, Upgrade will
 	// automatically operate in event-driven mode (zero goroutines while idle).
+	// See EventHandler for the callback contract.
 	OnOpen    func(c *Conn)
 	OnMessage func(c *Conn, op OpCode, payload []byte)
 	OnClose   func(c *Conn, err error)
 }
 
 // EventHandler defines the callbacks for event-driven WebSocket connections.
-// In event-driven mode, fnet parses WebSocket frames in its reactor and calls
-// OnMessage on-demand, holding 0 goroutines when the connection is idle.
+//
+// In event-driven mode fnet parses frames on its reactor goroutine and invokes
+// OnMessage inline, so idle connections hold no goroutines. Consequently:
+//
+//   - OnMessage must not block; blocking stalls every connection on that reactor.
+//     Offload long work to your own goroutine/worker pool.
+//   - payload is a view into the reactor's read buffer and is only valid for the
+//     duration of the callback. Copy it if it must outlive the call.
+//   - Writes from inside OnMessage (e.g. echo) are cheap: they go directly to the
+//     socket and only queue when the kernel send buffer is full.
 type EventHandler struct {
 	OnOpen    func(c *Conn)
 	OnMessage func(c *Conn, op OpCode, payload []byte)
@@ -127,15 +136,30 @@ func (u *Upgrader) UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventH
 		attacher = a
 	}
 
+	bridge := &wsHandlerBridge{conn: conn, handler: h}
 	if attacher != nil {
-		bridge := &wsHandlerBridge{conn: conn, handler: h}
-		if _, err := attacher.AttachWS(bridge); err != nil {
+		_, err := attacher.AttachWS(bridge)
+		if err == nil {
+			bridge.OnOpen()
+			return conn, nil
+		}
+		if !errors.Is(err, fnet.ErrWSAttachUnsupported) {
 			_ = conn.Close()
 			return nil, err
 		}
-		bridge.OnOpen()
 	}
 
+	// The reactor cannot drive this connection (TLS, or a non-fnet ResponseWriter):
+	// deliver the same callbacks from a dedicated goroutine instead.
+	go func() {
+		bridge.OnOpen()
+		err := conn.Handle(func(op OpCode, msg []byte) error {
+			bridge.OnMessage(byte(op), msg)
+			return nil
+		})
+		_ = conn.Close()
+		bridge.OnClose(err)
+	}()
 	return conn, nil
 }
 
@@ -221,21 +245,31 @@ type Conn struct {
 	writeMu  sync.Mutex
 }
 
+var writeBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64*1024)
+		return &b
+	},
+}
+
 func (c *Conn) writeFrameLocked(op OpCode, payload []byte) error {
+	total := 10 + len(payload)
+	if total <= 64*1024 {
+		bp := writeBufPool.Get().(*[]byte)
+		buf := *bp
+		hLen := formatServerHeader(buf[:10], op, len(payload))
+		copy(buf[hLen:], payload)
+		_, err := c.conn.Write(buf[:hLen+len(payload)])
+		writeBufPool.Put(bp)
+		return err
+	}
+
 	var hBuf [10]byte
 	hLen := formatServerHeader(hBuf[:], op, len(payload))
 	iovs := [][]byte{hBuf[:hLen], payload}
 
 	if vw, ok := c.conn.(VectorWriter); ok {
 		_, err := vw.WriteVector(iovs)
-		return err
-	}
-
-	if len(payload) <= 4096 {
-		buf := make([]byte, hLen+len(payload))
-		copy(buf, hBuf[:hLen])
-		copy(buf[hLen:], payload)
-		_, err := c.conn.Write(buf)
 		return err
 	}
 

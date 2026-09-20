@@ -3,23 +3,23 @@
 package fnet
 
 import (
+	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
+// kqueuePoller applies every registration change immediately with its own
+// kevent(2) call. kqueue is thread-safe, so any goroutine may arm/disarm
+// interest while the reactor is blocked in Wait and the change takes effect at
+// once instead of at the next wake-up.
 type kqueuePoller struct {
-	mu      sync.Mutex
-	fd      int
-	wakeR   int
-	wakeW   int
-	changes []unix.Kevent_t
-	events  []unix.Kevent_t
-	// Track which filters are registered to avoid EV_DELETE errors.
-	readRegs  map[int]bool
-	writeRegs map[int]bool
+	fd     int
+	wakeR  int
+	wakeW  int
+	events []unix.Kevent_t
+	out    []Event
 }
 
 func newPoller() (Poller, error) {
@@ -40,107 +40,81 @@ func newPoller() (Poller, error) {
 	_ = unix.SetNonblock(pfd[1], true)
 
 	p := &kqueuePoller{
-		fd:        fd,
-		wakeR:     pfd[0],
-		wakeW:     pfd[1],
-		events:    make([]unix.Kevent_t, 1024),
-		readRegs:  make(map[int]bool),
-		writeRegs: make(map[int]bool),
+		fd:     fd,
+		wakeR:  pfd[0],
+		wakeW:  pfd[1],
+		events: make([]unix.Kevent_t, 1024),
+		out:    make([]Event, 0, 1024),
 	}
-	p.control(p.wakeR, unix.EVFILT_READ, unix.EV_ADD|unix.EV_CLEAR)
+	if err := p.change(p.wakeR, unix.EVFILT_READ, unix.EV_ADD|unix.EV_CLEAR); err != nil {
+		_ = p.Close()
+		return nil, fmt.Errorf("kqueue wake pipe: %w", err)
+	}
 	return p, nil
 }
 
-func (p *kqueuePoller) control(fd int, filter int16, flags uint16) {
-	p.changes = append(p.changes, unix.Kevent_t{
+func (p *kqueuePoller) change(fd int, filter int16, flags uint16) error {
+	ch := [1]unix.Kevent_t{{
 		Ident:  uint64(fd),
 		Filter: filter,
 		Flags:  flags,
-	})
+	}}
+	_, err := unix.Kevent(p.fd, ch[:], nil, nil)
+	return err
+}
+
+// ignoreMissing hides ENOENT/EBADF from delete operations: the filter was never
+// registered or the fd is already closed (kqueue drops knotes on close).
+func ignoreMissing(err error) error {
+	if err == nil || errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EBADF) {
+		return nil
+	}
+	return err
 }
 
 func (p *kqueuePoller) AddRead(fd int) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.control(fd, unix.EVFILT_READ, unix.EV_ADD|unix.EV_CLEAR)
-	p.readRegs[fd] = true
-	return nil
+	return p.change(fd, unix.EVFILT_READ, unix.EV_ADD|unix.EV_CLEAR)
 }
 
 func (p *kqueuePoller) AddWrite(fd int) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.control(fd, unix.EVFILT_WRITE, unix.EV_ADD|unix.EV_CLEAR)
-	p.writeRegs[fd] = true
-	return nil
+	return p.change(fd, unix.EVFILT_WRITE, unix.EV_ADD|unix.EV_CLEAR)
 }
 
+// ModRead drops write interest; read interest (registered by AddRead) is kept.
 func (p *kqueuePoller) ModRead(fd int) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.writeRegs[fd] {
-		p.control(fd, unix.EVFILT_WRITE, unix.EV_DELETE)
-		delete(p.writeRegs, fd)
-	}
-	if !p.readRegs[fd] {
-		p.control(fd, unix.EVFILT_READ, unix.EV_ADD|unix.EV_CLEAR)
-		p.readRegs[fd] = true
-	}
-	return nil
+	return ignoreMissing(p.change(fd, unix.EVFILT_WRITE, unix.EV_DELETE))
 }
 
+// ModReadWrite adds write interest on top of the existing read interest.
 func (p *kqueuePoller) ModReadWrite(fd int) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if !p.readRegs[fd] {
-		p.control(fd, unix.EVFILT_READ, unix.EV_ADD|unix.EV_CLEAR)
-		p.readRegs[fd] = true
-	}
-	if !p.writeRegs[fd] {
-		p.control(fd, unix.EVFILT_WRITE, unix.EV_ADD|unix.EV_CLEAR)
-		p.writeRegs[fd] = true
-	}
-	return nil
+	return p.change(fd, unix.EVFILT_WRITE, unix.EV_ADD|unix.EV_CLEAR)
 }
 
 func (p *kqueuePoller) Delete(fd int) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.readRegs[fd] {
-		p.control(fd, unix.EVFILT_READ, unix.EV_DELETE)
-		delete(p.readRegs, fd)
+	err1 := ignoreMissing(p.change(fd, unix.EVFILT_READ, unix.EV_DELETE))
+	err2 := ignoreMissing(p.change(fd, unix.EVFILT_WRITE, unix.EV_DELETE))
+	if err1 != nil {
+		return err1
 	}
-	if p.writeRegs[fd] {
-		p.control(fd, unix.EVFILT_WRITE, unix.EV_DELETE)
-		delete(p.writeRegs, fd)
-	}
-	return nil
+	return err2
 }
 
 func (p *kqueuePoller) Wait(timeout time.Duration) ([]Event, error) {
-	p.mu.Lock()
-	changes := p.changes
-	p.changes = nil
-	p.mu.Unlock()
-
 	var tsp *unix.Timespec
 	if timeout >= 0 {
 		ts := unix.NsecToTimespec(timeout.Nanoseconds())
 		tsp = &ts
 	}
 
-	n, err := unix.Kevent(p.fd, changes, p.events, tsp)
+	n, err := unix.Kevent(p.fd, nil, p.events, tsp)
 	if err != nil {
-		p.mu.Lock()
-		p.changes = append(changes[:0], p.changes...)
-		p.mu.Unlock()
 		if err == unix.EINTR {
 			return nil, nil
 		}
 		return nil, err
 	}
 
-	out := make([]Event, 0, n)
+	out := p.out[:0]
 	for i := 0; i < n; i++ {
 		ev := p.events[i]
 		if int(ev.Ident) == p.wakeR {
@@ -174,6 +148,7 @@ func (p *kqueuePoller) Wait(timeout time.Duration) ([]Event, error) {
 		}
 		out = append(out, e)
 	}
+	p.out = out
 	return out, nil
 }
 
