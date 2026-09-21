@@ -15,7 +15,5 @@
 *.out
 
 # Benchmark binaries & logs
-go-websocket-benchmark/output/bin/
-go-websocket-benchmark/output/log/
 report/
 *.log
