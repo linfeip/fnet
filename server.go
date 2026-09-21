@@ -296,9 +296,6 @@ func (s *Server) serve(tlsCfg *tls.Config) error {
 	if num < 1 {
 		num = 1
 	}
-	if num > 64 {
-		num = 64
-	}
 
 	mainP, err := NewPoller()
 	if err != nil {
