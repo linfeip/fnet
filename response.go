@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+
+	"github.com/gobwas/ws"
 )
 
 // responseWriter implements http.ResponseWriter and http.Hijacker backed by a
@@ -41,6 +43,13 @@ type WSHandler interface {
 	OnOpen()
 	OnMessage(opcode byte, payload []byte)
 	OnClose(err error)
+}
+
+// WSFrameHandler is an optional interface extending WSHandler to deliver
+// full frame headers (e.g. RSV bits for compression extensions).
+type WSFrameHandler interface {
+	WSHandler
+	OnFrame(h ws.Header, payload []byte)
 }
 
 // WSAttacher is implemented by http.ResponseWriter (and hijacked net.Conn) in fnet

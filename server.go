@@ -3,6 +3,7 @@ package fnet
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -745,28 +746,90 @@ func (s *Server) dispatchWSFrames(c *conn, data []byte) (int, error) {
 	return off, nil
 }
 
+func checkClosePayload(payload []byte) (ws.StatusCode, bool) {
+	if len(payload) == 1 {
+		return ws.StatusProtocolError, false
+	}
+	if len(payload) >= 2 {
+		code := ws.StatusCode(binary.BigEndian.Uint16(payload[:2]))
+		reason := string(payload[2:])
+		if code >= 5000 {
+			return ws.StatusProtocolError, false
+		}
+		if err := ws.CheckCloseFrameData(code, reason); err != nil {
+			if errors.Is(err, ws.ErrProtocolInvalidUTF8) {
+				return ws.StatusInvalidFramePayloadData, false
+			}
+			return ws.StatusProtocolError, false
+		}
+		return code, true
+	}
+	return ws.StatusNormalClosure, true
+}
+
 // handleWSFrame processes one frame on the reactor. Returns false if the
 // connection is closed or closing.
 func (s *Server) handleWSFrame(c *conn, h ws.Header, payload []byte) bool {
-	switch h.OpCode {
-	case ws.OpClose:
-		body := closeNormalBody[:]
-		if len(payload) >= 2 {
-			body = payload[:2] // echo the peer's status code
-		}
-		_ = writeWSFrame(c.vc, ws.OpClose, body)
+	if c.closed.Load() || c.closeAfterFlush.Load() {
+		return false
+	}
+
+	// 1. Client frames MUST be masked (RFC 6455 Section 5.1).
+	if !h.Masked {
+		_ = writeWSFrame(c.vc, ws.OpClose, ws.NewCloseFrameBody(ws.StatusProtocolError, "unmasked client frame"))
 		s.closeConnGraceful(c, nil)
 		return false
+	}
+
+	// 2. Reserved opcodes (RFC 6455 Section 5.2).
+	if h.OpCode.IsReserved() {
+		_ = writeWSFrame(c.vc, ws.OpClose, ws.NewCloseFrameBody(ws.StatusProtocolError, "reserved opcode"))
+		s.closeConnGraceful(c, nil)
+		return false
+	}
+
+	// 3. Control frame rules (RFC 6455 Section 5.5).
+	if h.OpCode.IsControl() {
+		if !h.Fin || h.Length > 125 || h.Rsv != 0 {
+			_ = writeWSFrame(c.vc, ws.OpClose, ws.NewCloseFrameBody(ws.StatusProtocolError, "invalid control frame"))
+			s.closeConnGraceful(c, nil)
+			return false
+		}
+	}
+
+	switch h.OpCode {
+	case ws.OpClose:
+		code, ok := checkClosePayload(payload)
+		if !ok {
+			_ = writeWSFrame(c.vc, ws.OpClose, ws.NewCloseFrameBody(code, ""))
+			s.closeConnGraceful(c, nil)
+			return false
+		}
+		if len(payload) >= 2 {
+			_ = writeWSFrame(c.vc, ws.OpClose, payload[:2])
+		} else {
+			_ = writeWSFrame(c.vc, ws.OpClose, closeNormalBody[:])
+		}
+		s.closeConnGraceful(c, nil)
+		return false
+
 	case ws.OpPing:
 		_ = writeWSFrame(c.vc, ws.OpPong, payload)
 		return !c.closed.Load()
+
 	case ws.OpPong:
 		return true
 	}
 
+	c.mu.Lock()
 	handler := c.wsHandler
+	c.mu.Unlock()
 	if handler != nil {
-		handler.OnMessage(byte(h.OpCode), payload)
+		if fh, ok := handler.(WSFrameHandler); ok {
+			fh.OnFrame(h, payload)
+		} else {
+			handler.OnMessage(byte(h.OpCode), payload)
+		}
 	}
 	return !c.closed.Load() && !c.closeAfterFlush.Load()
 }

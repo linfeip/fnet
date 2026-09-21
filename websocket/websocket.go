@@ -1,6 +1,8 @@
 package websocket
 
 import (
+	"bytes"
+	"compress/flate"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,11 +12,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/linfeip/fnet"
 
+	"github.com/gobwas/httphead"
 	"github.com/gobwas/ws"
-	"github.com/gobwas/ws/wsutil"
+	"github.com/gobwas/ws/wsflate"
 )
 
 // Re-export common WebSocket opcodes from gobwas/ws for convenience.
@@ -26,6 +30,16 @@ const (
 	OpPing         = ws.OpPing
 	OpPong         = ws.OpPong
 )
+
+// DefaultMaxDecompressedMessageSize is the default limit (16MB) on decompressed payload size
+// to protect against decompression bombs (zip bombs).
+const DefaultMaxDecompressedMessageSize int64 = 16 * 1024 * 1024
+
+// DefaultCompressionThreshold is the minimum payload size in bytes to trigger compression.
+const DefaultCompressionThreshold = 128
+
+// ErrMessageTooBig is returned when a decompressed message exceeds the configured limit.
+var ErrMessageTooBig = errors.New("fnet/websocket: decompressed message exceeds maximum allowed size (possible compression bomb)")
 
 // OpCode represents WebSocket frame opcode.
 type OpCode = ws.OpCode
@@ -42,6 +56,38 @@ type Upgrader struct {
 
 	// Header contains optional headers to include in the 101 response.
 	Header http.Header
+
+	// EnableCompression enables RFC 7692 permessage-deflate compression extension.
+	// When true, the server negotiates compression with clients requesting it.
+	EnableCompression bool
+
+	// MaxDecompressedMessageSize limits the maximum allowable decompressed message size
+	// in bytes to prevent decompression bombs (zip bombs).
+	// If 0, DefaultMaxDecompressedMessageSize (16MB) is used.
+	// If negative, size limit is disabled (not recommended in production).
+	MaxDecompressedMessageSize int64
+
+	// CompressionLevel specifies the flate compression level (-1 to 9).
+	// If 0, flate.DefaultCompression (-1) is used.
+	CompressionLevel int
+
+	// CompressionThreshold specifies the minimum message size in bytes to trigger compression.
+	// Defaults to 128 bytes if 0.
+	CompressionThreshold int
+
+	// AsyncDecompress offloads frame decompression and message dispatching out of
+	// the reactor IO thread in event-driven mode.
+	//
+	// When true (or when WorkerPool is configured), decompression and OnMessage calls
+	// are executed on worker goroutines rather than the reactor goroutine, preventing
+	// CPU-intensive decompression or compression bombs from stalling other connections.
+	// Message ordering (FIFO) per connection is strictly preserved.
+	AsyncDecompress bool
+
+	// WorkerPool is an optional worker pool function (e.g. ants.Submit, panex, or custom pool)
+	// used to execute async tasks. If nil and AsyncDecompress is true, tasks run on dynamic
+	// goroutines.
+	WorkerPool func(task func())
 
 	// Optional event-driven callbacks. When OnMessage is set, Upgrade will
 	// automatically operate in event-driven mode (zero goroutines while idle).
@@ -68,10 +114,29 @@ type EventHandler struct {
 	OnClose   func(c *Conn, err error)
 }
 
-type wsHandlerBridge struct {
-	conn    *Conn
-	handler EventHandler
+type wsTask struct {
+	op           OpCode
+	payload      []byte
+	isCompressed bool
 }
+
+type wsHandlerBridge struct {
+	conn       *Conn
+	handler    EventHandler
+	fragOp     OpCode
+	fragBuf    []byte
+	fragComp   bool
+
+	async      bool
+	workerPool func(task func())
+	queueMu    sync.Mutex
+	queue      []wsTask
+	running    bool
+	closed     bool
+	closeOnce  sync.Once
+}
+
+var _ fnet.WSFrameHandler = (*wsHandlerBridge)(nil)
 
 func (b *wsHandlerBridge) OnOpen() {
 	if b.handler.OnOpen != nil {
@@ -85,10 +150,225 @@ func (b *wsHandlerBridge) OnMessage(opcode byte, payload []byte) {
 	}
 }
 
-func (b *wsHandlerBridge) OnClose(err error) {
-	if b.handler.OnClose != nil {
-		b.handler.OnClose(b.conn, err)
+func (b *wsHandlerBridge) enqueueTask(op OpCode, payload []byte, isCompressed bool) {
+	copied := make([]byte, len(payload))
+	copy(copied, payload)
+
+	b.queueMu.Lock()
+	if b.closed {
+		b.queueMu.Unlock()
+		return
 	}
+	b.queue = append(b.queue, wsTask{
+		op:           op,
+		payload:      copied,
+		isCompressed: isCompressed,
+	})
+	if !b.running {
+		b.running = true
+		b.queueMu.Unlock()
+		b.schedule(b.processQueue)
+		return
+	}
+	b.queueMu.Unlock()
+}
+
+func (b *wsHandlerBridge) schedule(task func()) {
+	if b.workerPool != nil {
+		b.workerPool(task)
+	} else {
+		go task()
+	}
+}
+
+func (b *wsHandlerBridge) processQueue() {
+	for {
+		b.queueMu.Lock()
+		if len(b.queue) == 0 || b.closed {
+			b.running = false
+			b.queueMu.Unlock()
+			return
+		}
+		task := b.queue[0]
+		b.queue = b.queue[1:]
+		b.queueMu.Unlock()
+
+		msgPayload := task.payload
+		if task.isCompressed {
+			decompressed, err := decompressMessage(task.payload, b.conn.maxDecompressSize)
+			if err != nil {
+				if errors.Is(err, ErrMessageTooBig) {
+					_ = b.conn.CloseWithStatus(ws.StatusMessageTooBig, "decompressed message too large")
+				} else {
+					_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "decompression error")
+				}
+				b.queueMu.Lock()
+				b.closed = true
+				b.queue = nil
+				b.running = false
+				b.queueMu.Unlock()
+				b.OnClose(err)
+				return
+			}
+			msgPayload = decompressed
+		}
+
+		if task.op == OpText && !utf8.Valid(msgPayload) {
+			_ = b.conn.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8 in text message")
+			b.queueMu.Lock()
+			b.closed = true
+			b.queue = nil
+			b.running = false
+			b.queueMu.Unlock()
+			return
+		}
+
+		if b.handler.OnMessage != nil {
+			b.handler.OnMessage(b.conn, task.op, msgPayload)
+		}
+	}
+}
+
+func checkClosePayload(payload []byte) (ws.StatusCode, bool) {
+	if len(payload) == 1 {
+		return ws.StatusProtocolError, false
+	}
+	if len(payload) >= 2 {
+		code := ws.StatusCode(binary.BigEndian.Uint16(payload[:2]))
+		reason := string(payload[2:])
+		if code >= 5000 {
+			return ws.StatusProtocolError, false
+		}
+		if err := ws.CheckCloseFrameData(code, reason); err != nil {
+			if errors.Is(err, ws.ErrProtocolInvalidUTF8) {
+				return ws.StatusInvalidFramePayloadData, false
+			}
+			return ws.StatusProtocolError, false
+		}
+		return code, true
+	}
+	return ws.StatusNormalClosure, true
+}
+
+func (b *wsHandlerBridge) OnFrame(h ws.Header, payload []byte) {
+	// 1. RSV validation (RFC 6455 5.2 & RFC 7692 5.1)
+	if !b.conn.compressed {
+		if h.Rsv != 0 {
+			_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "non-zero RSV without compression")
+			return
+		}
+	} else {
+		if h.Rsv2() || h.Rsv3() {
+			_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "non-zero RSV2/RSV3")
+			return
+		}
+		if h.OpCode == ws.OpContinuation && h.Rsv1() {
+			_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "RSV1 set on continuation frame")
+			return
+		}
+	}
+
+	// 2. Unfragmented frame
+	if b.fragOp == 0 {
+		if h.OpCode == ws.OpContinuation {
+			_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "unexpected continuation frame")
+			return
+		}
+
+		if !h.Fin {
+			// First fragment of fragmented message
+			b.fragOp = OpCode(h.OpCode)
+			b.fragComp = b.conn.compressed && h.Rsv1()
+			b.fragBuf = append(b.fragBuf[:0], payload...)
+			return
+		}
+
+		// Single complete frame
+		isComp := b.conn.compressed && h.Rsv1()
+		if b.async {
+			b.enqueueTask(OpCode(h.OpCode), payload, isComp)
+			return
+		}
+
+		msgPayload := payload
+		if isComp {
+			decompressed, err := decompressMessage(payload, b.conn.maxDecompressSize)
+			if err != nil {
+				if errors.Is(err, ErrMessageTooBig) {
+					_ = b.conn.CloseWithStatus(ws.StatusMessageTooBig, "decompressed message too large")
+				} else {
+					_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "decompression error")
+				}
+				return
+			}
+			msgPayload = decompressed
+		}
+
+		if OpCode(h.OpCode) == OpText && !utf8.Valid(msgPayload) {
+			_ = b.conn.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8 in text frame")
+			return
+		}
+
+		if b.handler.OnMessage != nil {
+			b.handler.OnMessage(b.conn, OpCode(h.OpCode), msgPayload)
+		}
+		return
+	}
+
+	// 3. In the middle of a fragmented message (b.fragOp != 0)
+	if h.OpCode != ws.OpContinuation {
+		_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "expected continuation frame")
+		return
+	}
+
+	b.fragBuf = append(b.fragBuf, payload...)
+	if h.Fin {
+		op := b.fragOp
+		fullPayload := append([]byte(nil), b.fragBuf...)
+		isComp := b.fragComp
+		b.fragOp = 0
+		b.fragBuf = b.fragBuf[:0]
+		b.fragComp = false
+
+		if b.async {
+			b.enqueueTask(op, fullPayload, isComp)
+			return
+		}
+
+		if isComp {
+			decompressed, err := decompressMessage(fullPayload, b.conn.maxDecompressSize)
+			if err != nil {
+				if errors.Is(err, ErrMessageTooBig) {
+					_ = b.conn.CloseWithStatus(ws.StatusMessageTooBig, "decompressed message too large")
+				} else {
+					_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "decompression error")
+				}
+				return
+			}
+			fullPayload = decompressed
+		}
+
+		if op == OpText && !utf8.Valid(fullPayload) {
+			_ = b.conn.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8 in text message")
+			return
+		}
+
+		if b.handler.OnMessage != nil {
+			b.handler.OnMessage(b.conn, op, fullPayload)
+		}
+	}
+}
+
+func (b *wsHandlerBridge) OnClose(err error) {
+	b.queueMu.Lock()
+	b.closed = true
+	b.queueMu.Unlock()
+
+	b.closeOnce.Do(func() {
+		if b.handler.OnClose != nil {
+			b.handler.OnClose(b.conn, err)
+		}
+	})
 }
 
 // DefaultUpgrader is a ready-to-use Upgrader with sensible defaults.
@@ -136,7 +416,12 @@ func (u *Upgrader) UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventH
 		attacher = a
 	}
 
-	bridge := &wsHandlerBridge{conn: conn, handler: h}
+	bridge := &wsHandlerBridge{
+		conn:       conn,
+		handler:    h,
+		async:      u.AsyncDecompress || u.WorkerPool != nil,
+		workerPool: u.WorkerPool,
+	}
 	if attacher != nil {
 		vc, err := attacher.AttachWS(bridge)
 		if err == nil {
@@ -188,9 +473,29 @@ func (u *Upgrader) upgradeInternal(w http.ResponseWriter, r *http.Request) (*Con
 		}
 	}
 
+	var (
+		ext              wsflate.Extension
+		compressAccepted bool
+	)
+	if u.EnableCompression {
+		ext = wsflate.Extension{
+			Parameters: wsflate.DefaultParameters,
+		}
+		httpUpgrader.Negotiate = func(opt httphead.Option) (httphead.Option, error) {
+			if bytes.Equal(opt.Name, wsflate.ExtensionNameBytes) {
+				return ext.Negotiate(opt)
+			}
+			return httphead.Option{}, nil
+		}
+	}
+
 	netConn, brw, hs, err := httpUpgrader.Upgrade(r, w)
 	if err != nil {
 		return nil, err
+	}
+
+	if u.EnableCompression {
+		_, compressAccepted = ext.Accepted()
 	}
 
 	// Determine read source: prefer brw.Reader (which has any read-ahead bytes),
@@ -200,11 +505,28 @@ func (u *Upgrader) upgradeInternal(w http.ResponseWriter, r *http.Request) (*Con
 		reader = brw.Reader
 	}
 
+	maxDecompress := u.MaxDecompressedMessageSize
+	if maxDecompress == 0 {
+		maxDecompress = DefaultMaxDecompressedMessageSize
+	}
+	compLevel := u.CompressionLevel
+	if compLevel == 0 {
+		compLevel = flate.DefaultCompression
+	}
+	compThreshold := u.CompressionThreshold
+	if compThreshold == 0 {
+		compThreshold = DefaultCompressionThreshold
+	}
+
 	return &Conn{
-		conn:     netConn,
-		reader:   reader,
-		rw:       readWriter{Reader: reader, Writer: netConn},
-		protocol: hs.Protocol,
+		conn:              netConn,
+		reader:            reader,
+		rw:                readWriter{Reader: reader, Writer: netConn},
+		protocol:          hs.Protocol,
+		compressed:        compressAccepted,
+		maxDecompressSize: maxDecompress,
+		compressLevel:     compLevel,
+		compressThreshold: compThreshold,
 	}, nil
 }
 
@@ -219,10 +541,76 @@ type VectorWriter interface {
 	WriteVector(iovs [][]byte) (int, error)
 }
 
+var (
+	flateTail     = []byte{0x00, 0x00, 0xff, 0xff}
+	flateReadTail = []byte{0x00, 0x00, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff}
+)
+
+// decompressMessage decompresses a permessage-deflate payload while enforcing
+// maxLimit bytes to prevent decompression bombs.
+func decompressMessage(payload []byte, maxLimit int64) ([]byte, error) {
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	// Append RFC 7692 tail + empty final block so Go's flate.Reader finishes cleanly
+	r := flate.NewReader(io.MultiReader(bytes.NewReader(payload), bytes.NewReader(flateReadTail)))
+	defer r.Close()
+
+	var limit int64
+	if maxLimit > 0 {
+		limit = maxLimit
+	} else if maxLimit == 0 {
+		limit = DefaultMaxDecompressedMessageSize
+	}
+
+	var buf bytes.Buffer
+	if limit > 0 {
+		limited := io.LimitReader(r, limit+1)
+		n, err := buf.ReadFrom(limited)
+		if err != nil {
+			return nil, err
+		}
+		if n > limit {
+			return nil, ErrMessageTooBig
+		}
+	} else {
+		if _, err := buf.ReadFrom(r); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+func compressMessage(payload []byte, level int) ([]byte, error) {
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	var buf bytes.Buffer
+	w, err := flate.NewWriter(&buf, level)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := w.Write(payload); err != nil {
+		return nil, err
+	}
+	if err := w.Flush(); err != nil {
+		return nil, err
+	}
+	b := buf.Bytes()
+	if len(b) >= 4 && bytes.Equal(b[len(b)-4:], flateTail) {
+		b = b[:len(b)-4]
+	}
+	return b, nil
+}
+
 // formatServerHeader encodes an unmasked server WebSocket frame header into bts.
 // It returns the number of bytes written (2, 4, or 10).
-func formatServerHeader(bts []byte, op OpCode, length int) int {
-	bts[0] = 0x80 | byte(op)
+func formatServerHeader(bts []byte, op OpCode, length int, compressed bool) int {
+	b0 := 0x80 | byte(op)
+	if compressed {
+		b0 |= 0x40 // RSV1: permessage-deflate
+	}
+	bts[0] = b0
 	switch {
 	case length <= 125:
 		bts[1] = byte(length)
@@ -242,23 +630,58 @@ func formatServerHeader(bts []byte, op OpCode, length int) int {
 // It uses github.com/gobwas/ws and wsutil under the hood for high performance,
 // RFC-compliant framing, and fast SIMD/SWAR unmasking.
 type Conn struct {
-	conn     net.Conn
-	reader   io.Reader
-	rw       readWriter
-	protocol string
-	closed   atomic.Bool
-	writeMu  sync.Mutex
+	conn              net.Conn
+	reader            io.Reader
+	rw                readWriter
+	protocol          string
+	closed            atomic.Bool
+	writeMu           sync.Mutex
+	compressed        bool
+	maxDecompressSize int64
+	compressLevel     int
+	compressThreshold int
+}
+
+// IsCompressed reports whether permessage-deflate compression is active on this connection.
+func (c *Conn) IsCompressed() bool {
+	return c.compressed
+}
+
+// SetMaxDecompressedMessageSize updates the limit on decompressed message size for this connection.
+func (c *Conn) SetMaxDecompressedMessageSize(limit int64) {
+	c.maxDecompressSize = limit
+}
+
+// CloseWithStatus closes the connection with a specific WebSocket close status and reason.
+func (c *Conn) CloseWithStatus(status ws.StatusCode, reason string) error {
+	if c.closed.CompareAndSwap(false, true) {
+		c.writeMu.Lock()
+		_ = c.writeFrameLocked(OpClose, ws.NewCloseFrameBody(status, reason))
+		c.writeMu.Unlock()
+		return c.conn.Close()
+	}
+	return nil
 }
 
 func (c *Conn) writeFrameLocked(op OpCode, payload []byte) error {
+	compressed := false
+	toWrite := payload
+
+	if c.compressed && (op == OpText || op == OpBinary) && len(payload) >= c.compressThreshold {
+		if comp, err := compressMessage(payload, c.compressLevel); err == nil && len(comp) < len(payload) {
+			toWrite = comp
+			compressed = true
+		}
+	}
+
 	var hBuf [10]byte
-	hLen := formatServerHeader(hBuf[:], op, len(payload))
+	hLen := formatServerHeader(hBuf[:], op, len(toWrite), compressed)
 
 	if vw, ok := c.conn.(VectorWriter); ok {
 		var iovs [2][]byte
 		iovs[0] = hBuf[:hLen]
-		if len(payload) > 0 {
-			iovs[1] = payload
+		if len(toWrite) > 0 {
+			iovs[1] = toWrite
 			_, err := vw.WriteVector(iovs[:2])
 			return err
 		}
@@ -266,12 +689,16 @@ func (c *Conn) writeFrameLocked(op OpCode, payload []byte) error {
 		return err
 	}
 
-	if len(payload) == 0 {
+	if len(toWrite) == 0 {
 		_, err := c.conn.Write(hBuf[:hLen])
 		return err
 	}
 
-	return wsutil.WriteServerMessage(c.conn, op, payload)
+	if _, err := c.conn.Write(hBuf[:hLen]); err != nil {
+		return err
+	}
+	_, err := c.conn.Write(toWrite)
+	return err
 }
 
 // ReadMessage reads the next data message from the peer.
@@ -284,7 +711,22 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 			return 0, nil, err
 		}
 
+		if !header.Masked {
+			_ = c.CloseWithStatus(ws.StatusProtocolError, "unmasked client frame")
+			return 0, nil, ws.ErrProtocolMaskRequired
+		}
+
+		if header.OpCode.IsReserved() {
+			_ = c.CloseWithStatus(ws.StatusProtocolError, "reserved opcode")
+			return 0, nil, ws.ErrProtocolOpCodeReserved
+		}
+
 		if header.OpCode.IsControl() {
+			if !header.Fin || header.Length > 125 || header.Rsv != 0 {
+				_ = c.CloseWithStatus(ws.StatusProtocolError, "invalid control frame")
+				return 0, nil, ws.ErrProtocolControlPayloadOverflow
+			}
+
 			var ctrlPayload []byte
 			if header.Length > 0 {
 				ctrlPayload = make([]byte, header.Length)
@@ -297,9 +739,12 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 			}
 
 			if header.OpCode == OpClose {
-				c.writeMu.Lock()
-				_ = c.writeFrameLocked(OpClose, ws.NewCloseFrameBody(ws.StatusNormalClosure, ""))
-				c.writeMu.Unlock()
+				code, ok := checkClosePayload(ctrlPayload)
+				if !ok {
+					_ = c.CloseWithStatus(code, "")
+					return 0, nil, io.EOF
+				}
+				_ = c.CloseWithStatus(code, "")
 				return 0, nil, io.EOF
 			}
 			if header.OpCode == OpPing {
@@ -314,7 +759,25 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 			continue
 		}
 
-		// Data frame (Text, Binary, Continuation)
+		// Non-control frame
+		if header.OpCode == OpContinuation {
+			_ = c.CloseWithStatus(ws.StatusProtocolError, "unexpected continuation frame")
+			return 0, nil, ws.ErrProtocolContinuationUnexpected
+		}
+
+		if !c.compressed {
+			if header.Rsv != 0 {
+				_ = c.CloseWithStatus(ws.StatusProtocolError, "non-zero RSV")
+				return 0, nil, ws.ErrProtocolNonZeroRsv
+			}
+		} else {
+			if header.Rsv2() || header.Rsv3() {
+				_ = c.CloseWithStatus(ws.StatusProtocolError, "non-zero RSV2/RSV3")
+				return 0, nil, ws.ErrProtocolNonZeroRsv
+			}
+		}
+
+		// Data frame (Text, Binary)
 		payload := make([]byte, header.Length)
 		if header.Length > 0 {
 			if _, err := io.ReadFull(c.reader, payload); err != nil {
@@ -326,17 +789,46 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 		}
 
 		if header.Fin {
+			if c.compressed && header.Rsv1() {
+				decompressed, err := decompressMessage(payload, c.maxDecompressSize)
+				if err != nil {
+					if errors.Is(err, ErrMessageTooBig) {
+						_ = c.CloseWithStatus(ws.StatusMessageTooBig, "decompressed message too large")
+					} else {
+						_ = c.CloseWithStatus(ws.StatusProtocolError, "decompression error")
+					}
+					return 0, nil, err
+				}
+				if header.OpCode == OpText && !utf8.Valid(decompressed) {
+					_ = c.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8")
+					return 0, nil, ws.ErrProtocolInvalidUTF8
+				}
+				return header.OpCode, decompressed, nil
+			}
+			if header.OpCode == OpText && !utf8.Valid(payload) {
+				_ = c.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8")
+				return 0, nil, ws.ErrProtocolInvalidUTF8
+			}
 			return header.OpCode, payload, nil
 		}
 
 		// Handle fragmented messages: read subsequent continuation frames
 		msgOp := header.OpCode
+		isCompressed := c.compressed && header.Rsv1()
 		for {
 			nextHdr, err := ws.ReadHeader(c.reader)
 			if err != nil {
 				return 0, nil, err
 			}
+			if !nextHdr.Masked {
+				_ = c.CloseWithStatus(ws.StatusProtocolError, "unmasked client frame")
+				return 0, nil, ws.ErrProtocolMaskRequired
+			}
 			if nextHdr.OpCode.IsControl() {
+				if !nextHdr.Fin || nextHdr.Length > 125 || nextHdr.Rsv != 0 {
+					_ = c.CloseWithStatus(ws.StatusProtocolError, "invalid control frame")
+					return 0, nil, ws.ErrProtocolControlPayloadOverflow
+				}
 				var ctrlPayload []byte
 				if nextHdr.Length > 0 {
 					ctrlPayload = make([]byte, nextHdr.Length)
@@ -347,6 +839,15 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 						ws.Cipher(ctrlPayload, nextHdr.Mask, 0)
 					}
 				}
+				if nextHdr.OpCode == OpClose {
+					code, ok := checkClosePayload(ctrlPayload)
+					if !ok {
+						_ = c.CloseWithStatus(code, "")
+						return 0, nil, io.EOF
+					}
+					_ = c.CloseWithStatus(code, "")
+					return 0, nil, io.EOF
+				}
 				if nextHdr.OpCode == OpPing {
 					c.writeMu.Lock()
 					_ = c.writeFrameLocked(OpPong, ctrlPayload)
@@ -354,6 +855,16 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 				}
 				continue
 			}
+
+			if nextHdr.OpCode != OpContinuation {
+				_ = c.CloseWithStatus(ws.StatusProtocolError, "expected continuation frame")
+				return 0, nil, ws.ErrProtocolContinuationExpected
+			}
+			if nextHdr.Rsv != 0 {
+				_ = c.CloseWithStatus(ws.StatusProtocolError, "non-zero RSV on continuation frame")
+				return 0, nil, ws.ErrProtocolNonZeroRsv
+			}
+
 			if nextHdr.Length > 0 {
 				part := make([]byte, nextHdr.Length)
 				if _, err := io.ReadFull(c.reader, part); err != nil {
@@ -367,6 +878,28 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 			if nextHdr.Fin {
 				break
 			}
+		}
+
+		if isCompressed {
+			decompressed, err := decompressMessage(payload, c.maxDecompressSize)
+			if err != nil {
+				if errors.Is(err, ErrMessageTooBig) {
+					_ = c.CloseWithStatus(ws.StatusMessageTooBig, "decompressed message too large")
+				} else {
+					_ = c.CloseWithStatus(ws.StatusProtocolError, "decompression error")
+				}
+				return 0, nil, err
+			}
+			if msgOp == OpText && !utf8.Valid(decompressed) {
+				_ = c.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8")
+				return 0, nil, ws.ErrProtocolInvalidUTF8
+			}
+			return msgOp, decompressed, nil
+		}
+
+		if msgOp == OpText && !utf8.Valid(payload) {
+			_ = c.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8")
+			return 0, nil, ws.ErrProtocolInvalidUTF8
 		}
 
 		return msgOp, payload, nil

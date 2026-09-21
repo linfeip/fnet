@@ -1,12 +1,17 @@
 package websocket_test
 
 import (
+	"bytes"
+	"compress/flate"
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"runtime"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,7 +19,9 @@ import (
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/websocket"
 
+	"github.com/gobwas/httphead"
 	"github.com/gobwas/ws"
+	"github.com/gobwas/ws/wsflate"
 	"github.com/gobwas/ws/wsutil"
 )
 
@@ -460,9 +467,9 @@ func TestWebSocketEventDrivenPingPong(t *testing.T) {
 	}
 	defer clientConn.Close()
 
-	// Client sends Ping frame
+	// Client sends Ping frame (RFC 6455 requires client frames to be masked)
 	pingPayload := []byte("ping-data-12345")
-	if err := ws.WriteFrame(clientConn, ws.NewPingFrame(pingPayload)); err != nil {
+	if err := ws.WriteFrame(clientConn, ws.MaskFrame(ws.NewPingFrame(pingPayload))); err != nil {
 		t.Fatalf("write ping failed: %v", err)
 	}
 
@@ -639,5 +646,1007 @@ func TestWebSocketIdleMemoryFootprint(t *testing.T) {
 	// leading to >5KB per connection. Now server + client combined should be well below 3500 bytes/conn.
 	if bytesPerConn > 3500 {
 		t.Errorf("expected < 3500 bytes/conn, got %d bytes/conn", bytesPerConn)
+	}
+}
+
+func createDeflateBomb(t *testing.T, uncompressedSize int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := flate.NewWriter(&buf, flate.BestCompression)
+	if err != nil {
+		t.Fatalf("flate.NewWriter: %v", err)
+	}
+	chunk := make([]byte, 32*1024)
+	remaining := uncompressedSize
+	for remaining > 0 {
+		toWrite := len(chunk)
+		if toWrite > remaining {
+			toWrite = remaining
+		}
+		if _, err := w.Write(chunk[:toWrite]); err != nil {
+			t.Fatalf("flate write: %v", err)
+		}
+		remaining -= toWrite
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("flate close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestWebSocketCompressionBomb(t *testing.T) {
+	// 1. Create a compression bomb: 10MB of zeros compressed into a tiny payload (~10KB)
+	const uncompressedBytes = 10 * 1024 * 1024 // 10 MB
+	bombPayload := createDeflateBomb(t, uncompressedBytes)
+	t.Logf("Compression bomb: uncompressed %d bytes -> compressed %d bytes (ratio: ~%.1fx)",
+		uncompressedBytes, len(bombPayload), float64(uncompressedBytes)/float64(len(bombPayload)))
+
+	// Subtest 1: Verify handshake does not negotiate permessage-deflate extension
+	t.Run("HandshakeRejectsCompressionExtension", func(t *testing.T) {
+		port := getFreePort(t)
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+			conn, err := websocket.Upgrade(w, r)
+			if err != nil {
+				t.Errorf("Upgrade failed: %v", err)
+				return
+			}
+			defer conn.Close()
+		})
+
+		srv := &fnet.Server{Addr: addr, Handler: mux}
+		go func() { _ = srv.ListenAndServe() }()
+		defer srv.Close()
+
+		time.Sleep(50 * time.Millisecond)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		dialer := ws.Dialer{
+			Header: ws.HandshakeHeaderHTTP(http.Header{
+				"Sec-WebSocket-Extensions": []string{"permessage-deflate; client_max_window_bits"},
+			}),
+		}
+		clientConn, _, hs, err := dialer.Dial(ctx, "ws://"+addr+"/ws")
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer clientConn.Close()
+
+		// Server must not return Sec-WebSocket-Extensions header
+		if len(hs.Extensions) > 0 {
+			t.Fatalf("server unexpectedly negotiated extensions: %v", hs.Extensions)
+		}
+	})
+
+	// Subtest 2: Event-driven mode receives raw wire bytes without decompressing or OOMing
+	t.Run("EventDrivenModeSafeFromDecompressionBomb", func(t *testing.T) {
+		port := getFreePort(t)
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+		var receivedLen atomic.Int64
+		doneCh := make(chan struct{})
+
+		upgrader := &websocket.Upgrader{
+			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+				receivedLen.Store(int64(len(msg)))
+				close(doneCh)
+			},
+		}
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+			_, err := upgrader.Upgrade(w, r)
+			if err != nil {
+				t.Errorf("Upgrade failed: %v", err)
+			}
+		})
+
+		srv := &fnet.Server{Addr: addr, Handler: mux}
+		go func() { _ = srv.ListenAndServe() }()
+		defer srv.Close()
+
+		time.Sleep(50 * time.Millisecond)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		clientConn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer clientConn.Close()
+
+		// Send raw wire bytes without compression
+		frame := ws.MaskFrame(ws.Frame{
+			Header: ws.Header{
+				Fin:    true,
+				OpCode: ws.OpBinary,
+				Masked: true,
+				Length: int64(len(bombPayload)),
+			},
+			Payload: bombPayload,
+		})
+
+		if err := ws.WriteFrame(clientConn, frame); err != nil {
+			t.Fatalf("WriteFrame failed: %v", err)
+		}
+
+		select {
+		case <-doneCh:
+			rec := receivedLen.Load()
+			// Must receive raw wire payload length (~10KB), NOT 10MB
+			if rec != int64(len(bombPayload)) {
+				t.Fatalf("expected received size %d, got %d", len(bombPayload), rec)
+			}
+			t.Logf("Event-driven OnMessage received wire size %d bytes (server did not decompress)", rec)
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for OnMessage")
+		}
+	})
+
+	// Subtest 3: Traditional goroutine mode receives raw wire bytes without decompressing
+	t.Run("GoroutineModeSafeFromDecompressionBomb", func(t *testing.T) {
+		port := getFreePort(t)
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+		var receivedLen atomic.Int64
+		doneCh := make(chan struct{})
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+			conn, err := websocket.Upgrade(w, r)
+			if err != nil {
+				t.Errorf("Upgrade failed: %v", err)
+				return
+			}
+			defer conn.Close()
+
+			op, msg, err := conn.ReadMessage()
+			if err != nil {
+				t.Errorf("ReadMessage error: %v", err)
+				return
+			}
+			if op != websocket.OpBinary {
+				t.Errorf("expected OpBinary, got %v", op)
+			}
+			receivedLen.Store(int64(len(msg)))
+			close(doneCh)
+		})
+
+		srv := &fnet.Server{Addr: addr, Handler: mux}
+		go func() { _ = srv.ListenAndServe() }()
+		defer srv.Close()
+
+		time.Sleep(50 * time.Millisecond)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		clientConn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer clientConn.Close()
+
+		frame := ws.MaskFrame(ws.Frame{
+			Header: ws.Header{
+				Fin:    true,
+				OpCode: ws.OpBinary,
+				Masked: true,
+				Length: int64(len(bombPayload)),
+			},
+			Payload: bombPayload,
+		})
+
+		if err := ws.WriteFrame(clientConn, frame); err != nil {
+			t.Fatalf("WriteFrame failed: %v", err)
+		}
+
+		select {
+		case <-doneCh:
+			rec := receivedLen.Load()
+			if rec != int64(len(bombPayload)) {
+				t.Fatalf("expected received size %d, got %d", len(bombPayload), rec)
+			}
+			t.Logf("Goroutine ReadMessage received wire size %d bytes", rec)
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for ReadMessage")
+		}
+	})
+
+	// Subtest 4: Safe application-level decompression pattern with io.LimitReader
+	t.Run("ApplicationLevelDecompressionDefense", func(t *testing.T) {
+		// If application business logic specifically decodes deflate messages,
+		// it must protect against decompression bombs using io.LimitReader.
+		const maxAllowedDecompressed = 100 * 1024 // 100 KB limit
+
+		flateReader := flate.NewReader(bytes.NewReader(bombPayload))
+		defer flateReader.Close()
+
+		// Read with limit + 1 to detect if payload exceeds limit
+		limited := io.LimitReader(flateReader, maxAllowedDecompressed+1)
+		var decompressedBuf bytes.Buffer
+		n, err := io.Copy(&decompressedBuf, limited)
+
+		if n > maxAllowedDecompressed {
+			t.Logf("Successfully caught compression bomb at application layer: exceeded %d bytes limit", maxAllowedDecompressed)
+		} else if err != nil {
+			t.Logf("Decompression encountered error: %v", err)
+		} else {
+			t.Fatalf("expected decompression bomb to be caught by limit reader, but got %d bytes", n)
+		}
+	})
+}
+
+func compressClientFrame(f ws.Frame) (ws.Frame, error) {
+	var buf bytes.Buffer
+	w, err := flate.NewWriter(&buf, flate.BestCompression)
+	if err != nil {
+		return f, err
+	}
+	if _, err := w.Write(f.Payload); err != nil {
+		return f, err
+	}
+	if err := w.Flush(); err != nil {
+		return f, err
+	}
+	b := buf.Bytes()
+	if len(b) >= 4 && bytes.Equal(b[len(b)-4:], []byte{0x00, 0x00, 0xff, 0xff}) {
+		b = b[:len(b)-4]
+	}
+	f.Payload = b
+	f.Header.Length = int64(len(b))
+	f.Header.Rsv = ws.Rsv(true, false, false) // set RSV1
+	return f, nil
+}
+
+func decompressServerFrame(f ws.Frame) (ws.Frame, error) {
+	r := flate.NewReader(io.MultiReader(bytes.NewReader(f.Payload), bytes.NewReader([]byte{0x00, 0x00, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff})))
+	defer r.Close()
+	decomp, err := io.ReadAll(r)
+	if err != nil {
+		return f, err
+	}
+	f.Payload = decomp
+	f.Header.Length = int64(len(decomp))
+	return f, nil
+}
+
+func TestFlateRoundtrip(t *testing.T) {
+	original := []byte("Hello, compressed fnet websocket! " + strings.Repeat("ABCDEFG ", 50))
+	f := ws.NewTextFrame(original)
+	comp, err := compressClientFrame(f)
+	if err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+	t.Logf("original len=%d, compressed len=%d", len(original), len(comp.Payload))
+
+	decomp, err := decompressServerFrame(comp)
+	if err != nil {
+		t.Fatalf("decompress: %v", err)
+	}
+	if !bytes.Equal(decomp.Payload, original) {
+		t.Fatalf("mismatch")
+	}
+}
+
+func TestWebSocketCompressionEcho(t *testing.T) {
+	// Test normal compression echo for both goroutine mode and event-driven mode
+	t.Run("EventDrivenMode", func(t *testing.T) {
+		port := getFreePort(t)
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+		upgrader := &websocket.Upgrader{
+			EnableCompression: true,
+			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+				_ = c.WriteMessage(op, msg)
+			},
+		}
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+			_, err := upgrader.Upgrade(w, r)
+			if err != nil {
+				t.Errorf("Upgrade failed: %v", err)
+			}
+		})
+
+		srv := &fnet.Server{Addr: addr, Handler: mux}
+		go func() { _ = srv.ListenAndServe() }()
+		defer srv.Close()
+
+		time.Sleep(50 * time.Millisecond)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		dialer := ws.Dialer{
+			Extensions: []httphead.Option{
+				wsflate.DefaultParameters.Option(),
+			},
+		}
+		clientConn, _, hs, err := dialer.Dial(ctx, "ws://"+addr+"/ws")
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer clientConn.Close()
+
+		if len(hs.Extensions) == 0 {
+			t.Fatalf("expected compression extension negotiated, got %v", hs.Extensions)
+		}
+
+		// Prepare a compressible message > 128 bytes
+		originalMsg := []byte("Hello, compressed fnet websocket! " + strings.Repeat("ABCDEFG ", 50))
+		f := ws.NewTextFrame(originalMsg)
+		compFrame, err := compressClientFrame(f)
+		if err != nil {
+			t.Fatalf("compressClientFrame: %v", err)
+		}
+		compFrame = ws.MaskFrameInPlace(compFrame)
+		if err := ws.WriteFrame(clientConn, compFrame); err != nil {
+			t.Fatalf("WriteFrame: %v", err)
+		}
+
+		// Read echo from server
+		respFrame, err := ws.ReadFrame(clientConn)
+		if err != nil {
+			t.Fatalf("ReadFrame: %v", err)
+		}
+
+		if !respFrame.Header.Rsv1() {
+			t.Fatalf("expected server response to have RSV1 compression bit set")
+		}
+
+		decompFrame, err := decompressServerFrame(respFrame)
+		if err != nil {
+			t.Fatalf("decompressServerFrame: %v", err)
+		}
+
+		if !bytes.Equal(decompFrame.Payload, originalMsg) {
+			t.Fatalf("echoed payload mismatch: expected %q, got %q", string(originalMsg), string(decompFrame.Payload))
+		}
+		t.Logf("Successfully verified event-driven compression echo (orig: %d bytes, compressed: %d bytes)",
+			len(originalMsg), len(respFrame.Payload))
+	})
+
+	t.Run("GoroutineMode", func(t *testing.T) {
+		port := getFreePort(t)
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+		upgrader := &websocket.Upgrader{
+			EnableCompression: true,
+		}
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r)
+			if err != nil {
+				t.Errorf("Upgrade failed: %v", err)
+				return
+			}
+			defer conn.Close()
+
+			if !conn.IsCompressed() {
+				t.Errorf("expected conn.IsCompressed() == true")
+			}
+
+			op, msg, err := conn.ReadMessage()
+			if err != nil {
+				t.Errorf("ReadMessage: %v", err)
+				return
+			}
+			_ = conn.WriteMessage(op, msg)
+		})
+
+		srv := &fnet.Server{Addr: addr, Handler: mux}
+		go func() { _ = srv.ListenAndServe() }()
+		defer srv.Close()
+
+		time.Sleep(50 * time.Millisecond)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		dialer := ws.Dialer{
+			Extensions: []httphead.Option{
+				wsflate.DefaultParameters.Option(),
+			},
+		}
+		clientConn, _, hs, err := dialer.Dial(ctx, "ws://"+addr+"/ws")
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer clientConn.Close()
+
+		if len(hs.Extensions) == 0 {
+			t.Fatalf("expected compression extension negotiated, got %v", hs.Extensions)
+		}
+
+		originalMsg := []byte("Goroutine mode compressed test: " + strings.Repeat("XYZ123 ", 40))
+		f := ws.NewTextFrame(originalMsg)
+		compFrame, err := compressClientFrame(f)
+		if err != nil {
+			t.Fatalf("compressClientFrame: %v", err)
+		}
+		compFrame = ws.MaskFrameInPlace(compFrame)
+		if err := ws.WriteFrame(clientConn, compFrame); err != nil {
+			t.Fatalf("WriteFrame: %v", err)
+		}
+
+		respFrame, err := ws.ReadFrame(clientConn)
+		if err != nil {
+			t.Fatalf("ReadFrame: %v", err)
+		}
+
+		if !respFrame.Header.Rsv1() {
+			t.Fatalf("expected server response to have RSV1 compression bit set")
+		}
+
+		decompFrame, err := decompressServerFrame(respFrame)
+		if err != nil {
+			t.Fatalf("decompressServerFrame: %v", err)
+		}
+
+		if !bytes.Equal(decompFrame.Payload, originalMsg) {
+			t.Fatalf("echoed payload mismatch")
+		}
+		t.Logf("Successfully verified goroutine mode compression echo")
+	})
+}
+
+func TestWebSocketCompressionBombDefenseWhenCompressionEnabled(t *testing.T) {
+	// Create a 10MB uncompressed compression bomb packed into ~10KB
+	const bombUncompressedSize = 10 * 1024 * 1024 // 10 MB
+	bombPayload := createDeflateBomb(t, bombUncompressedSize)
+	t.Logf("Created compression bomb: uncompressed %d bytes -> wire %d bytes", bombUncompressedSize, len(bombPayload))
+
+	const maxAllowed = 128 * 1024 // 128 KB max limit
+
+	t.Run("EventDrivenModeBlocksBomb", func(t *testing.T) {
+		port := getFreePort(t)
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+		var (
+			messageReceived atomic.Bool
+			closeErr        atomic.Pointer[error]
+			closeCh         = make(chan struct{})
+			closeOnce       sync.Once
+		)
+
+		upgrader := &websocket.Upgrader{
+			EnableCompression:          true,
+			MaxDecompressedMessageSize: maxAllowed,
+			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+				// Must NEVER be called with the bomb!
+				messageReceived.Store(true)
+			},
+			OnClose: func(c *websocket.Conn, err error) {
+				closeErr.Store(&err)
+				closeOnce.Do(func() { close(closeCh) })
+			},
+		}
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+			_, err := upgrader.Upgrade(w, r)
+			if err != nil {
+				t.Errorf("Upgrade: %v", err)
+			}
+		})
+
+		srv := &fnet.Server{Addr: addr, Handler: mux}
+		go func() { _ = srv.ListenAndServe() }()
+		defer srv.Close()
+
+		time.Sleep(50 * time.Millisecond)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		dialer := ws.Dialer{
+			Extensions: []httphead.Option{
+				wsflate.DefaultParameters.Option(),
+			},
+		}
+		clientConn, _, hs, err := dialer.Dial(ctx, "ws://"+addr+"/ws")
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer clientConn.Close()
+
+		if len(hs.Extensions) == 0 {
+			t.Fatalf("expected compression negotiated")
+		}
+
+		// Send compression bomb with RSV1 set
+		frame := ws.MaskFrame(ws.Frame{
+			Header: ws.Header{
+				Fin:    true,
+				Rsv:    ws.Rsv(true, false, false), // RSV1 = 1
+				OpCode: ws.OpBinary,
+				Masked: true,
+				Length: int64(len(bombPayload)),
+			},
+			Payload: bombPayload,
+		})
+
+		if err := ws.WriteFrame(clientConn, frame); err != nil {
+			t.Fatalf("WriteFrame failed: %v", err)
+		}
+
+		// Read frame from server - should be a Close frame with status 1009 (StatusMessageTooBig)
+		replyFrame, err := ws.ReadFrame(clientConn)
+		if err == nil {
+			if replyFrame.Header.OpCode == ws.OpClose {
+				code, reason := ws.ParseCloseFrameData(replyFrame.Payload)
+				t.Logf("Client received expected Close frame from server: code=%v (%d), reason=%q", code, code, reason)
+				if code != ws.StatusMessageTooBig {
+					t.Errorf("expected close code %d (StatusMessageTooBig), got %d", ws.StatusMessageTooBig, code)
+				}
+			}
+		}
+
+		select {
+		case <-closeCh:
+			if messageReceived.Load() {
+				t.Fatal("SECURITY ERROR: OnMessage was invoked with a decompression bomb!")
+			}
+			errPtr := closeErr.Load()
+			t.Logf("Connection successfully closed on server with error: %v", *errPtr)
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for connection close")
+		}
+	})
+
+	t.Run("GoroutineModeBlocksBomb", func(t *testing.T) {
+		port := getFreePort(t)
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+		upgrader := &websocket.Upgrader{
+			EnableCompression:          true,
+			MaxDecompressedMessageSize: maxAllowed,
+		}
+
+		serverErrCh := make(chan error, 1)
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r)
+			if err != nil {
+				t.Errorf("Upgrade: %v", err)
+				return
+			}
+			defer conn.Close()
+
+			_, _, readErr := conn.ReadMessage()
+			serverErrCh <- readErr
+		})
+
+		srv := &fnet.Server{Addr: addr, Handler: mux}
+		go func() { _ = srv.ListenAndServe() }()
+		defer srv.Close()
+
+		time.Sleep(50 * time.Millisecond)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		dialer := ws.Dialer{
+			Extensions: []httphead.Option{
+				wsflate.DefaultParameters.Option(),
+			},
+		}
+		clientConn, _, _, err := dialer.Dial(ctx, "ws://"+addr+"/ws")
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer clientConn.Close()
+
+		frame := ws.MaskFrame(ws.Frame{
+			Header: ws.Header{
+				Fin:    true,
+				Rsv:    ws.Rsv(true, false, false),
+				OpCode: ws.OpBinary,
+				Masked: true,
+				Length: int64(len(bombPayload)),
+			},
+			Payload: bombPayload,
+		})
+
+		if err := ws.WriteFrame(clientConn, frame); err != nil {
+			t.Fatalf("WriteFrame failed: %v", err)
+		}
+
+		select {
+		case sErr := <-serverErrCh:
+			if sErr == nil {
+				t.Fatal("SECURITY ERROR: ReadMessage did not report error on compression bomb!")
+			}
+			t.Logf("Goroutine mode successfully caught bomb: %v", sErr)
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for server error")
+		}
+
+		replyFrame, err := ws.ReadFrame(clientConn)
+		if err == nil && replyFrame.Header.OpCode == ws.OpClose {
+			code, reason := ws.ParseCloseFrameData(replyFrame.Payload)
+			t.Logf("Client received Close frame: code=%v, reason=%q", code, reason)
+			if code != ws.StatusMessageTooBig {
+				t.Errorf("expected close code %d, got %d", ws.StatusMessageTooBig, code)
+			}
+		}
+	})
+
+	t.Run("FragmentedBombBlocked", func(t *testing.T) {
+		port := getFreePort(t)
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+		var messageReceived atomic.Bool
+		var closeErr atomic.Pointer[error]
+		closeCh := make(chan struct{})
+		var closeOnce sync.Once
+
+		upgrader := &websocket.Upgrader{
+			EnableCompression:          true,
+			MaxDecompressedMessageSize: maxAllowed,
+			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+				messageReceived.Store(true)
+			},
+			OnClose: func(c *websocket.Conn, err error) {
+				closeErr.Store(&err)
+				closeOnce.Do(func() { close(closeCh) })
+			},
+		}
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+			_, err := upgrader.Upgrade(w, r)
+			if err != nil {
+				t.Errorf("Upgrade: %v", err)
+			}
+		})
+
+		srv := &fnet.Server{Addr: addr, Handler: mux}
+		go func() { _ = srv.ListenAndServe() }()
+		defer srv.Close()
+
+		time.Sleep(50 * time.Millisecond)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		dialer := ws.Dialer{
+			Extensions: []httphead.Option{
+				wsflate.DefaultParameters.Option(),
+			},
+		}
+		clientConn, _, _, err := dialer.Dial(ctx, "ws://"+addr+"/ws")
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer clientConn.Close()
+
+		// Split bombPayload into 2 fragments:
+		// Frame 1: OpBinary, Fin=false, RSV1=1
+		// Frame 2: OpContinuation, Fin=true, RSV1=0
+		mid := len(bombPayload) / 2
+		f1 := ws.MaskFrame(ws.Frame{
+			Header: ws.Header{
+				Fin:    false,
+				Rsv:    ws.Rsv(true, false, false), // RSV1 = 1 on first fragment
+				OpCode: ws.OpBinary,
+				Masked: true,
+				Length: int64(mid),
+			},
+			Payload: bombPayload[:mid],
+		})
+		if err := ws.WriteFrame(clientConn, f1); err != nil {
+			t.Fatalf("WriteFrame f1: %v", err)
+		}
+
+		f2 := ws.MaskFrame(ws.Frame{
+			Header: ws.Header{
+				Fin:    true,
+				Rsv:    0,
+				OpCode: ws.OpContinuation,
+				Masked: true,
+				Length: int64(len(bombPayload) - mid),
+			},
+			Payload: bombPayload[mid:],
+		})
+		if err := ws.WriteFrame(clientConn, f2); err != nil {
+			t.Fatalf("WriteFrame f2: %v", err)
+		}
+
+		select {
+		case <-closeCh:
+			if messageReceived.Load() {
+				t.Fatal("SECURITY ERROR: OnMessage was invoked with a fragmented decompression bomb!")
+			}
+			t.Logf("Fragmented compression bomb was successfully blocked")
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for connection close")
+		}
+
+		replyFrame, err := ws.ReadFrame(clientConn)
+		if err == nil && replyFrame.Header.OpCode == ws.OpClose {
+			code, _ := ws.ParseCloseFrameData(replyFrame.Payload)
+			if code != ws.StatusMessageTooBig {
+				t.Errorf("expected 1009, got %v", code)
+			}
+		}
+	})
+}
+
+func TestWebSocketAsyncDecompressionWorkerPool(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	var workerPoolTaskCount atomic.Int64
+	customPool := func(task func()) {
+		workerPoolTaskCount.Add(1)
+		go task()
+	}
+
+	var receivedCount atomic.Int64
+	doneCh := make(chan struct{})
+
+	upgrader := &websocket.Upgrader{
+		EnableCompression: true,
+		WorkerPool:        customPool,
+		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+			if receivedCount.Add(1) == 5 {
+				close(doneCh)
+			}
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		_, err := upgrader.Upgrade(w, r)
+		if err != nil {
+			t.Errorf("Upgrade: %v", err)
+		}
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	dialer := ws.Dialer{
+		Extensions: []httphead.Option{
+			wsflate.DefaultParameters.Option(),
+		},
+	}
+	clientConn, _, _, err := dialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	for i := 0; i < 5; i++ {
+		text := fmt.Sprintf("Message %d with repeated payload %s", i, strings.Repeat("DATA ", 30))
+		f := ws.NewTextFrame([]byte(text))
+		comp, err := compressClientFrame(f)
+		if err != nil {
+			t.Fatalf("compressClientFrame: %v", err)
+		}
+		comp = ws.MaskFrameInPlace(comp)
+		if err := ws.WriteFrame(clientConn, comp); err != nil {
+			t.Fatalf("WriteFrame: %v", err)
+		}
+	}
+
+	select {
+	case <-doneCh:
+		t.Logf("Received all 5 messages. WorkerPool tasks dispatched: %d", workerPoolTaskCount.Load())
+		if workerPoolTaskCount.Load() == 0 {
+			t.Fatal("WorkerPool was never invoked!")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for 5 messages, got %d", receivedCount.Load())
+	}
+}
+
+func TestWebSocketAsyncMessageOrderingFIFO(t *testing.T) {
+	// Verify that when AsyncDecompress is enabled, messages on the same connection
+	// are delivered to OnMessage in strict FIFO order, even when compressed (slow)
+	// and uncompressed (fast) messages are interleaved.
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	const totalMsgs = 30
+	receivedIDs := make([]int, 0, totalMsgs)
+	var mu sync.Mutex
+	doneCh := make(chan struct{})
+
+	upgrader := &websocket.Upgrader{
+		EnableCompression: true,
+		AsyncDecompress:   true,
+		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+			var id int
+			_, err := fmt.Sscanf(string(msg), "MSG_%d_", &id)
+			if err != nil {
+				t.Errorf("failed to parse message ID from %q: %v", string(msg), err)
+				return
+			}
+			mu.Lock()
+			receivedIDs = append(receivedIDs, id)
+			if len(receivedIDs) == totalMsgs {
+				close(doneCh)
+			}
+			mu.Unlock()
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		_, err := upgrader.Upgrade(w, r)
+		if err != nil {
+			t.Errorf("Upgrade: %v", err)
+		}
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	dialer := ws.Dialer{
+		Extensions: []httphead.Option{
+			wsflate.DefaultParameters.Option(),
+		},
+	}
+	clientConn, _, _, err := dialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	for i := 0; i < totalMsgs; i++ {
+		text := fmt.Sprintf("MSG_%d_ payload %s", i, strings.Repeat("X", 200))
+		f := ws.NewTextFrame([]byte(text))
+		// Alternating: even is compressed, odd is uncompressed
+		if i%2 == 0 {
+			var err error
+			f, err = compressClientFrame(f)
+			if err != nil {
+				t.Fatalf("compress: %v", err)
+			}
+		}
+		f = ws.MaskFrameInPlace(f)
+		if err := ws.WriteFrame(clientConn, f); err != nil {
+			t.Fatalf("WriteFrame msg %d: %v", i, err)
+		}
+	}
+
+	select {
+	case <-doneCh:
+		mu.Lock()
+		defer mu.Unlock()
+		for i, id := range receivedIDs {
+			if id != i {
+				t.Fatalf("FIFO violation at index %d: expected message ID %d, but got %d (full: %v)",
+					i, i, id, receivedIDs)
+			}
+		}
+		t.Logf("Successfully verified strict FIFO order for %d interleaved compressed/uncompressed messages", totalMsgs)
+	case <-time.After(3 * time.Second):
+		mu.Lock()
+		got := len(receivedIDs)
+		mu.Unlock()
+		t.Fatalf("timed out waiting for messages, got %d/%d", got, totalMsgs)
+	}
+}
+
+func TestWebSocketAsyncDecompressionBombDoesNotBlockReactor(t *testing.T) {
+	// Verify that a malicious client sending a 10MB compression bomb does NOT
+	// block or stall other connections handled by the server.
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	upgrader := &websocket.Upgrader{
+		EnableCompression:          true,
+		AsyncDecompress:            true,
+		MaxDecompressedMessageSize: 64 * 1024, // 64KB limit
+		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+			_ = c.WriteMessage(op, msg)
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = upgrader.Upgrade(w, r)
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	dialer := ws.Dialer{
+		Extensions: []httphead.Option{
+			wsflate.DefaultParameters.Option(),
+		},
+	}
+
+	// 1. Establish benign client connection
+	benignConn, _, _, err := dialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatalf("benign dial: %v", err)
+	}
+	defer benignConn.Close()
+
+	// 2. Establish attacker client connection
+	attackerConn, _, _, err := dialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatalf("attacker dial: %v", err)
+	}
+	defer attackerConn.Close()
+
+	// Attacker sends a 10MB compression bomb
+	bomb := createDeflateBomb(t, 10*1024*1024)
+	fBomb := ws.MaskFrame(ws.Frame{
+		Header: ws.Header{
+			Fin:    true,
+			Rsv:    ws.Rsv(true, false, false),
+			OpCode: ws.OpBinary,
+			Masked: true,
+			Length: int64(len(bomb)),
+		},
+		Payload: bomb,
+	})
+	if err := ws.WriteFrame(attackerConn, fBomb); err != nil {
+		t.Fatalf("attacker write bomb: %v", err)
+	}
+
+	// Meanwhile, benign client immediately sends echo requests.
+	// Because decompression is offloaded asynchronously, the benign client should
+	// get instantaneous echo responses without being blocked by attacker's bomb.
+	for i := 0; i < 5; i++ {
+		pingText := fmt.Sprintf("instant echo %d", i)
+		f := ws.MaskFrame(ws.NewTextFrame([]byte(pingText)))
+		start := time.Now()
+		if err := ws.WriteFrame(benignConn, f); err != nil {
+			t.Fatalf("benign write: %v", err)
+		}
+		resp, err := ws.ReadFrame(benignConn)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("benign read: %v", err)
+		}
+		if string(resp.Payload) != pingText {
+			t.Fatalf("benign mismatch: %q vs %q", string(resp.Payload), pingText)
+		}
+		t.Logf("Benign client roundtrip while bomb is processed: %v", elapsed)
+		if elapsed > 100*time.Millisecond {
+			t.Errorf("Reactor was stalled! Benign client took %v to echo", elapsed)
+		}
+	}
+
+	// Verify attacker was closed with 1009
+	replyFrame, err := ws.ReadFrame(attackerConn)
+	if err == nil && replyFrame.Header.OpCode == ws.OpClose {
+		code, _ := ws.ParseCloseFrameData(replyFrame.Payload)
+		if code != ws.StatusMessageTooBig {
+			t.Errorf("expected attacker close 1009, got %v", code)
+		}
 	}
 }
