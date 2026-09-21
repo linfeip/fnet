@@ -1,0 +1,8 @@
+services:
+  autobahn:
+    image: crossbario/autobahn-testsuite:latest
+    network_mode: "host"
+    volumes:
+      - ./fuzzingclient.json:/fuzzingclient.json:ro
+      - ./reports:/reports
+    command: wstest -m fuzzingclient -s /fuzzingclient.json

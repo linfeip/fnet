@@ -1,0 +1,16 @@
+{
+  "outdir": "./reports/servers",
+  "servers": [
+    {
+      "agent": "fnet-event-driven",
+      "url": "ws://127.0.0.1:9001"
+    },
+    {
+      "agent": "fnet-goroutine",
+      "url": "ws://127.0.0.1:9002"
+    }
+  ],
+  "cases": ["*"],
+  "exclude-cases": [],
+  "exclude-check-cases": []
+}
