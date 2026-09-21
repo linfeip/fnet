@@ -23,8 +23,9 @@ I/O is driven by native multi-reactor pollers (**epoll** on Linux, **kqueue** on
 - **Standard `net/http` API**: Direct drop-in for `http.Handler` / `http.ServeMux` via `fnet.ListenAndServe` and `fnet.ListenAndServeTLS`.
 - **Multi-Reactor Architecture**: Main poller handles non-blocking accepts (`accept4` on Linux), distributing sockets across worker sub-reactors matching CPU cores.
 - **Dual WebSocket Modes**:
-  - **Event-Driven**: Zero goroutines while idle, parsing frames and dispatching `OnOpen`/`OnMessage`/`OnClose` directly on reactor events.
+  - **Event-Driven**: Zero goroutines while idle; frame parsing happens in the reactor, and business callbacks (`OnMessage`) are automatically offloaded to a high-performance sharded worker pool to keep the I/O event loop unblocked.
   - **Blocking/Goroutine**: Full `net.Conn` stream compatibility for traditional request-response and blocking loops.
+- **Built-in High-Concurrency Worker Pool**: Zero external dependencies, multi-shard lock-free design, per-connection strict FIFO ordering, and automatic idle worker reclamation for 1M+ connections. Both HTTP business requests (`ServeHTTP`) and WebSocket messages (`OnMessage`) are processed by default on the worker pool, completely freeing the I/O Reactor threads.
 - **Vector I/O (`writev`)**: Stack-allocated header framing merged with payload into single syscall writes to eliminate intermediate buffer copies.
 - **Aggressive Memory Optimization**: Chunked lock-free connection tables, pooled response writers, lazy address resolution, and auto-compacting buffers.
 - **Cross-Platform**: Linux (`epoll`), macOS/Darwin (`kqueue`), Windows (`WSAPoll`).

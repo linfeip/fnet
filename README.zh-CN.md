@@ -23,8 +23,9 @@
 - **标准 `net/http` 接口**：直接对接 `http.Handler` / `http.ServeMux`，支持 `fnet.ListenAndServe` 与 `fnet.ListenAndServeTLS`。
 - **Multi-Reactor 多核扩展架构**：主 Poller 采用 `accept4` 高效非阻塞接入，轮询均匀分发至与 CPU 核心匹配的 Sub-Reactor 事件循环。
 - **双模 WebSocket 支持**：
-  - **事件驱动模式（推荐）**：连接空闲时 0 协程常驻，Reactor 读事件触发解析并直调 `OnOpen`/`OnMessage`/`OnClose`。
+  - **事件驱动模式（推荐）**：连接空闲时 0 协程常驻，Reactor 读事件触发解析，业务数据包自动投递到内置工作协程池执行，绝不卡死 IO Reactor 事件循环。
   - **阻塞协程模式**：兼容传统业务模型，保留独立 Goroutine 阻塞 `ReadMessage()` / `WriteMessage()`。
+- **内置高并发工作协程池**：零外部依赖，多分片架构，连接级严格保序（FIFO），空闲协程自动超时回收，完美支撑 100万+（1M）长连接。HTTP 业务请求（`ServeHTTP`）与 WebSocket 业务数据包（`OnMessage`）默认全部在业务协程池中调度执行，IO Reactor 彻底不阻塞。
 - **向量化写入 (writev)**：将帧头部与数据负载通过单次系统调用直达网卡，杜绝内存拼包拷贝。
 - **极致内存剪枝技术**：全局分块无锁连接表（O(1) 访问）、全链路 ResponseWriter 对象池化、紧凑延迟 IP 解析、缓冲区自动收缩。
 - **跨平台支持**：Linux (`epoll`)、macOS (`kqueue`)、Windows (`WSAPoll`)。

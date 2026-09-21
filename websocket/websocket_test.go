@@ -1471,7 +1471,6 @@ func TestWebSocketAsyncMessageOrderingFIFO(t *testing.T) {
 
 	upgrader := &websocket.Upgrader{
 		EnableCompression: true,
-		AsyncDecompress:   true,
 		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
 			var id int
 			_, err := fmt.Sscanf(string(msg), "MSG_%d_", &id)
@@ -1560,7 +1559,6 @@ func TestWebSocketAsyncDecompressionBombDoesNotBlockReactor(t *testing.T) {
 
 	upgrader := &websocket.Upgrader{
 		EnableCompression:          true,
-		AsyncDecompress:            true,
 		MaxDecompressedMessageSize: 64 * 1024, // 64KB limit
 		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
 			_ = c.WriteMessage(op, msg)

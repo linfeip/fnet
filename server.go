@@ -47,6 +47,11 @@ type Server struct {
 	// When nil, net.ListenConfig with SO_REUSEADDR and SO_REUSEPORT is used.
 	Listen func(network, addr string) (net.Listener, error)
 
+	// WorkerPool is an optional worker pool function (e.g. pool.Submit, ants.Submit, or custom scheduler)
+	// used to execute HTTP worker tasks.
+	// If nil, fnet.DefaultWorkerPool is automatically used.
+	WorkerPool func(task func())
+
 	lnMu        sync.Mutex
 	listeners   map[int]net.Addr // listener fd -> local address
 	mainPoller  Poller
@@ -666,9 +671,11 @@ func (s *Server) checkAndDispatch(c *conn) {
 		if c.vc.HasBufferedInput() {
 			c.state.Store(connStateWorking)
 			s.wg.Add(1)
-			go s.serveConn(c)
+			c.mu.Unlock()
+			s.dispatchWorker(c)
+		} else {
+			c.mu.Unlock()
 		}
-		c.mu.Unlock()
 		return
 	}
 
@@ -676,7 +683,7 @@ func (s *Server) checkAndDispatch(c *conn) {
 		c.state.Store(connStateWorking)
 		s.wg.Add(1)
 		c.mu.Unlock()
-		go s.serveConn(c)
+		s.dispatchWorker(c)
 		return
 	}
 	// Defend against slow/malicious connections buffering large data without \r\n\r\n.
@@ -685,6 +692,17 @@ func (s *Server) checkAndDispatch(c *conn) {
 	if tooLarge {
 		s.closeConn(c)
 	}
+}
+
+func (s *Server) dispatchWorker(c *conn) {
+	task := func() {
+		s.serveConn(c)
+	}
+	if s.WorkerPool != nil {
+		s.WorkerPool(task)
+		return
+	}
+	DefaultWorkerPool.SubmitConn(uint64(c.fd), task)
 }
 
 // feedWS handles bytes just read from the socket for an event-driven WebSocket

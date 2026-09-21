@@ -40,15 +40,17 @@ func main() {
 </html>`)
 	})
 
-	// 2. 百万并发事件驱动 WebSocket 接口（百万长连接空闲零协程占用）
+	// 2. 百万并发事件驱动 WebSocket 接口（百万长连接空闲零协程占用，业务解耦至工作协程池）
 	upgrader := &websocket.Upgrader{
 		// 默认允许所有跨域请求，也可自定义 CheckOrigin
 		CheckOrigin: func(r *http.Request) bool { return true },
-		// 注册事件驱动回调：连接空闲时 0 协程常驻，帧到齐按需派发
+		// 注册事件驱动回调：连接空闲时 0 协程常驻；
+		// 业务 OnMessage 自动在工作协程池执行，绝不阻塞 IO Reactor 线程！
 		OnOpen: func(c *websocket.Conn) {
 			log.Printf("[WS] 客户端建立连接: %s", c.RemoteAddr())
 		},
 		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+			// 在工作协程池中处理业务逻辑（支持耗时计算、RPC、DB 查询等，不阻塞 IO 事件循环）
 			// 原样回显（Echo）
 			_ = c.WriteMessage(op, msg)
 		},

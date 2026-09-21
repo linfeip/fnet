@@ -75,18 +75,8 @@ type Upgrader struct {
 	// Defaults to 128 bytes if 0.
 	CompressionThreshold int
 
-	// AsyncDecompress offloads frame decompression and message dispatching out of
-	// the reactor IO thread in event-driven mode.
-	//
-	// When true (or when WorkerPool is configured), decompression and OnMessage calls
-	// are executed on worker goroutines rather than the reactor goroutine, preventing
-	// CPU-intensive decompression or compression bombs from stalling other connections.
-	// Message ordering (FIFO) per connection is strictly preserved.
-	AsyncDecompress bool
-
-	// WorkerPool is an optional worker pool function (e.g. ants.Submit, panex, or custom pool)
-	// used to execute async tasks. If nil and AsyncDecompress is true, tasks run on dynamic
-	// goroutines.
+	// WorkerPool is an optional worker pool function (e.g. pool.Submit, ants.Submit, or custom scheduler)
+	// used to execute async tasks. If nil, the built-in, highly scalable DefaultWorkerPool is automatically used.
 	WorkerPool func(task func())
 
 	// Optional event-driven callbacks. When OnMessage is set, Upgrade will
@@ -120,14 +110,16 @@ type wsTask struct {
 	isCompressed bool
 }
 
+var nextBridgeID atomic.Uint64
+
 type wsHandlerBridge struct {
+	id         uint64
 	conn       *Conn
 	handler    EventHandler
 	fragOp     OpCode
 	fragBuf    []byte
 	fragComp   bool
 
-	async      bool
 	workerPool func(task func())
 	queueMu    sync.Mutex
 	queue      []wsTask
@@ -151,9 +143,15 @@ func (b *wsHandlerBridge) OnMessage(opcode byte, payload []byte) {
 }
 
 func (b *wsHandlerBridge) enqueueTask(op OpCode, payload []byte, isCompressed bool) {
-	copied := make([]byte, len(payload))
-	copy(copied, payload)
+	var copied []byte
+	if len(payload) > 0 {
+		copied = make([]byte, len(payload))
+		copy(copied, payload)
+	}
+	b.enqueueTaskOwned(op, copied, isCompressed)
+}
 
+func (b *wsHandlerBridge) enqueueTaskOwned(op OpCode, payload []byte, isCompressed bool) {
 	b.queueMu.Lock()
 	if b.closed {
 		b.queueMu.Unlock()
@@ -161,7 +159,7 @@ func (b *wsHandlerBridge) enqueueTask(op OpCode, payload []byte, isCompressed bo
 	}
 	b.queue = append(b.queue, wsTask{
 		op:           op,
-		payload:      copied,
+		payload:      payload,
 		isCompressed: isCompressed,
 	})
 	if !b.running {
@@ -177,7 +175,7 @@ func (b *wsHandlerBridge) schedule(task func()) {
 	if b.workerPool != nil {
 		b.workerPool(task)
 	} else {
-		go task()
+		DefaultWorkerPool.SubmitConn(b.id, task)
 	}
 }
 
@@ -186,10 +184,12 @@ func (b *wsHandlerBridge) processQueue() {
 		b.queueMu.Lock()
 		if len(b.queue) == 0 || b.closed {
 			b.running = false
+			b.queue = nil
 			b.queueMu.Unlock()
 			return
 		}
 		task := b.queue[0]
+		b.queue[0] = wsTask{}
 		b.queue = b.queue[1:]
 		b.queueMu.Unlock()
 
@@ -285,33 +285,7 @@ func (b *wsHandlerBridge) OnFrame(h ws.Header, payload []byte) {
 
 		// Single complete frame
 		isComp := b.conn.compressed && h.Rsv1()
-		if b.async {
-			b.enqueueTask(OpCode(h.OpCode), payload, isComp)
-			return
-		}
-
-		msgPayload := payload
-		if isComp {
-			decompressed, err := decompressMessage(payload, b.conn.maxDecompressSize)
-			if err != nil {
-				if errors.Is(err, ErrMessageTooBig) {
-					_ = b.conn.CloseWithStatus(ws.StatusMessageTooBig, "decompressed message too large")
-				} else {
-					_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "decompression error")
-				}
-				return
-			}
-			msgPayload = decompressed
-		}
-
-		if OpCode(h.OpCode) == OpText && !utf8.Valid(msgPayload) {
-			_ = b.conn.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8 in text frame")
-			return
-		}
-
-		if b.handler.OnMessage != nil {
-			b.handler.OnMessage(b.conn, OpCode(h.OpCode), msgPayload)
-		}
+		b.enqueueTask(OpCode(h.OpCode), payload, isComp)
 		return
 	}
 
@@ -330,38 +304,15 @@ func (b *wsHandlerBridge) OnFrame(h ws.Header, payload []byte) {
 		b.fragBuf = b.fragBuf[:0]
 		b.fragComp = false
 
-		if b.async {
-			b.enqueueTask(op, fullPayload, isComp)
-			return
-		}
-
-		if isComp {
-			decompressed, err := decompressMessage(fullPayload, b.conn.maxDecompressSize)
-			if err != nil {
-				if errors.Is(err, ErrMessageTooBig) {
-					_ = b.conn.CloseWithStatus(ws.StatusMessageTooBig, "decompressed message too large")
-				} else {
-					_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "decompression error")
-				}
-				return
-			}
-			fullPayload = decompressed
-		}
-
-		if op == OpText && !utf8.Valid(fullPayload) {
-			_ = b.conn.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8 in text message")
-			return
-		}
-
-		if b.handler.OnMessage != nil {
-			b.handler.OnMessage(b.conn, op, fullPayload)
-		}
+		b.enqueueTaskOwned(op, fullPayload, isComp)
+		return
 	}
 }
 
 func (b *wsHandlerBridge) OnClose(err error) {
 	b.queueMu.Lock()
 	b.closed = true
+	b.queue = nil
 	b.queueMu.Unlock()
 
 	b.closeOnce.Do(func() {
@@ -417,9 +368,9 @@ func (u *Upgrader) UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventH
 	}
 
 	bridge := &wsHandlerBridge{
+		id:         nextBridgeID.Add(1),
 		conn:       conn,
 		handler:    h,
-		async:      u.AsyncDecompress || u.WorkerPool != nil,
 		workerPool: u.WorkerPool,
 	}
 	if attacher != nil {
