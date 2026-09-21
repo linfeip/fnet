@@ -37,7 +37,7 @@ I/O is driven by native multi-reactor pollers (**epoll** on Linux, **kqueue** on
 go get github.com/linfeip/fnet
 ```
 
-Requires Go 1.26+.
+Requires Go 1.21+.
 
 ---
 

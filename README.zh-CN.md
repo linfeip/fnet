@@ -37,7 +37,7 @@
 go get github.com/linfeip/fnet
 ```
 
-需要 Go 1.26 及以上版本。
+需要 Go 1.21 及以上版本。
 
 ---
 

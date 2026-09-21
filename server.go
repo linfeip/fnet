@@ -276,8 +276,7 @@ func (s *Server) serve(tlsCfg *tls.Config) error {
 			ln, err = s.Listen("tcp", addr)
 			if err == nil {
 				laddr = ln.Addr()
-				fd, err = dupListenerFD(ln)
-				_ = ln.Close()
+				fd, err = setupListener(ln)
 			}
 		} else {
 			fd, laddr, err = listenNonblock("tcp", addr)

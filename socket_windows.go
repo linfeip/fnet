@@ -175,6 +175,14 @@ func acceptConn(lnFD int, laddr net.Addr) (int, *VirtualConn, error) {
 	return nfd, vc, nil
 }
 
+func setupListener(ln net.Listener) (int, error) {
+	id := winAllocID()
+	entry := &winNetFD{id: id, ln: ln}
+	winFDs.Store(id, entry)
+	go winAcceptLoop(entry)
+	return id, nil
+}
+
 func listenNonblock(network, address string) (int, net.Addr, error) {
 	ln, err := net.Listen(network, address)
 	if err != nil {

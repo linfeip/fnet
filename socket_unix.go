@@ -36,10 +36,6 @@ func writeFD(fd int, buf []byte) (int, error) {
 	return unix.Write(fd, buf)
 }
 
-func writevFD(fd int, iovs [][]byte) (int, error) {
-	return unix.Writev(fd, iovs)
-}
-
 func isIPv4Mapped(addr [16]byte) bool {
 	return addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && addr[3] == 0 &&
 		addr[4] == 0 && addr[5] == 0 && addr[6] == 0 && addr[7] == 0 &&
@@ -133,6 +129,12 @@ func dupListenerFD(ln net.Listener) (int, error) {
 	}
 	_ = setReuseAddr(dup)
 	return dup, nil
+}
+
+func setupListener(ln net.Listener) (int, error) {
+	fd, err := dupListenerFD(ln)
+	_ = ln.Close()
+	return fd, err
 }
 
 // listenNonblock creates a non-blocking TCP listener with SO_REUSEADDR and
