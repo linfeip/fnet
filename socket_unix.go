@@ -40,6 +40,12 @@ func writevFD(fd int, iovs [][]byte) (int, error) {
 	return unix.Writev(fd, iovs)
 }
 
+func isIPv4Mapped(addr [16]byte) bool {
+	return addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && addr[3] == 0 &&
+		addr[4] == 0 && addr[5] == 0 && addr[6] == 0 && addr[7] == 0 &&
+		addr[8] == 0 && addr[9] == 0 && addr[10] == 0xff && addr[11] == 0xff
+}
+
 func acceptConn(lnFD int, laddr net.Addr) (int, *VirtualConn, error) {
 	nfd, sa, err := sysAccept(lnFD)
 	if err != nil {
@@ -48,8 +54,21 @@ func acceptConn(lnFD int, laddr net.Addr) (int, *VirtualConn, error) {
 	_ = unix.SetsockoptInt(nfd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 	vc := NewVirtualConn(laddr, nil)
 	if sa4, ok := sa.(*unix.SockaddrInet4); ok {
-		vc.raddrIPv4 = sa4.Addr
+		copy(vc.raddrIP[:4], sa4.Addr[:])
 		vc.raddrPort = uint16(sa4.Port)
+		vc.raddrLen = 4
+	} else if sa6, ok := sa.(*unix.SockaddrInet6); ok {
+		if isIPv4Mapped(sa6.Addr) {
+			copy(vc.raddrIP[:4], sa6.Addr[12:16])
+			vc.raddrPort = uint16(sa6.Port)
+			vc.raddrLen = 4
+		} else if sa6.ZoneId == 0 {
+			vc.raddrIP = sa6.Addr
+			vc.raddrPort = uint16(sa6.Port)
+			vc.raddrLen = 16
+		} else {
+			vc.remote = sockaddrToAddr(sa)
+		}
 	} else if sa != nil {
 		vc.remote = sockaddrToAddr(sa)
 	}

@@ -34,8 +34,9 @@ type VirtualConn struct {
 	local  net.Addr
 	remote net.Addr
 
-	raddrIPv4 [4]byte
+	raddrIP   [16]byte
 	raddrPort uint16
+	raddrLen  uint8 // 4 for IPv4, 16 for IPv6, 0 for unset
 
 	fd int
 	c  *conn
@@ -44,6 +45,7 @@ type VirtualConn struct {
 	inCond           *sync.Cond
 	inBuf            []byte
 	inReadOff        int
+	inLen            atomic.Int32
 	readEOF          bool
 	readErr          error
 	readDeadlineNano int64
@@ -186,6 +188,7 @@ func (vc *VirtualConn) appendInputLocked(b []byte) {
 		}
 	}
 	vc.inBuf = append(vc.inBuf, b...)
+	vc.inLen.Store(int32(len(vc.inBuf) - vc.inReadOff))
 }
 
 // consumeLocked advances the read offset by n and releases/compacts the buffer.
@@ -195,6 +198,7 @@ func (vc *VirtualConn) consumeLocked(n int) {
 	if unread <= 0 {
 		vc.inBuf = nil
 		vc.inReadOff = 0
+		vc.inLen.Store(0)
 		return
 	}
 	if vc.inReadOff > 4096 && vc.inReadOff >= unread {
@@ -202,6 +206,7 @@ func (vc *VirtualConn) consumeLocked(n int) {
 		vc.inBuf = vc.inBuf[:unread]
 		vc.inReadOff = 0
 	}
+	vc.inLen.Store(int32(unread))
 }
 
 // CompactOrRelease releases the input buffer if fully consumed or compacts it.
@@ -211,10 +216,12 @@ func (vc *VirtualConn) CompactOrRelease() {
 	if unread <= 0 {
 		vc.inBuf = nil
 		vc.inReadOff = 0
+		vc.inLen.Store(0)
 	} else if vc.inReadOff > 0 {
 		copy(vc.inBuf, vc.inBuf[vc.inReadOff:])
 		vc.inBuf = vc.inBuf[:unread]
 		vc.inReadOff = 0
+		vc.inLen.Store(int32(unread))
 	}
 	vc.mu.Unlock()
 }
@@ -312,16 +319,12 @@ func (vc *VirtualConn) PopWSFrame() (ws.Header, []byte, bool, error) {
 
 // HasBufferedInput reports whether there is any pending input data in the read buffer.
 func (vc *VirtualConn) HasBufferedInput() bool {
-	vc.mu.Lock()
-	defer vc.mu.Unlock()
-	return len(vc.inBuf) > vc.inReadOff
+	return vc.inLen.Load() > 0
 }
 
 // InputLen returns the length of unconsumed input buffer.
 func (vc *VirtualConn) InputLen() int {
-	vc.mu.Lock()
-	defer vc.mu.Unlock()
-	return len(vc.inBuf) - vc.inReadOff
+	return int(vc.inLen.Load())
 }
 
 // UnshiftInput prepends unconsumed bytes back to the front of the inbound buffer.
@@ -336,6 +339,7 @@ func (vc *VirtualConn) UnshiftInput(b []byte) {
 	newBuf = append(newBuf, rem...)
 	vc.inBuf = newBuf
 	vc.inReadOff = 0
+	vc.inLen.Store(int32(len(newBuf)))
 	vc.mu.Unlock()
 }
 
@@ -616,9 +620,17 @@ func (vc *VirtualConn) RemoteAddr() net.Addr {
 	if vc.remote != nil {
 		return vc.remote
 	}
-	if vc.raddrPort != 0 {
+	if vc.raddrLen == 4 {
 		return &net.TCPAddr{
-			IP:   net.IPv4(vc.raddrIPv4[0], vc.raddrIPv4[1], vc.raddrIPv4[2], vc.raddrIPv4[3]),
+			IP:   net.IPv4(vc.raddrIP[0], vc.raddrIP[1], vc.raddrIP[2], vc.raddrIP[3]),
+			Port: int(vc.raddrPort),
+		}
+	}
+	if vc.raddrLen == 16 {
+		ip := make(net.IP, 16)
+		copy(ip, vc.raddrIP[:])
+		return &net.TCPAddr{
+			IP:   ip,
 			Port: int(vc.raddrPort),
 		}
 	}

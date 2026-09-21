@@ -250,31 +250,24 @@ type Conn struct {
 	writeMu  sync.Mutex
 }
 
-var writeBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 64*1024)
-		return &b
-	},
-}
-
 func (c *Conn) writeFrameLocked(op OpCode, payload []byte) error {
-	total := 10 + len(payload)
-	if total <= 64*1024 {
-		bp := writeBufPool.Get().(*[]byte)
-		buf := *bp
-		hLen := formatServerHeader(buf[:10], op, len(payload))
-		copy(buf[hLen:], payload)
-		_, err := c.conn.Write(buf[:hLen+len(payload)])
-		writeBufPool.Put(bp)
+	var hBuf [10]byte
+	hLen := formatServerHeader(hBuf[:], op, len(payload))
+
+	if vw, ok := c.conn.(VectorWriter); ok {
+		var iovs [2][]byte
+		iovs[0] = hBuf[:hLen]
+		if len(payload) > 0 {
+			iovs[1] = payload
+			_, err := vw.WriteVector(iovs[:2])
+			return err
+		}
+		_, err := vw.WriteVector(iovs[:1])
 		return err
 	}
 
-	var hBuf [10]byte
-	hLen := formatServerHeader(hBuf[:], op, len(payload))
-	iovs := [][]byte{hBuf[:hLen], payload}
-
-	if vw, ok := c.conn.(VectorWriter); ok {
-		_, err := vw.WriteVector(iovs)
+	if len(payload) == 0 {
+		_, err := c.conn.Write(hBuf[:hLen])
 		return err
 	}
 
