@@ -317,14 +317,29 @@ func (s *Server) serve(tlsCfg *tls.Config) error {
 		reactors[i] = &subReactor{id: i, server: s, poller: p}
 	}
 
+	// The listening sockets already accept connections at this point, so Close
+	// may have run before this state was published. Close sets `closing` before
+	// taking lnMu, so testing it here decides ownership unambiguously: either we
+	// publish and Close tears everything down, or Close came first and we do.
 	s.lnMu.Lock()
+	if s.closing.Load() {
+		s.lnMu.Unlock()
+		for _, r := range reactors {
+			_ = r.poller.Close()
+		}
+		_ = mainP.Close()
+		closeListeners()
+		return ErrServerClosed
+	}
 	s.listeners = listeners
 	s.mainPoller = mainP
 	s.reactors = reactors
+	// Registered under the lock so a concurrent Close always waits for the
+	// reactors it is about to shut down.
+	s.wg.Add(len(reactors))
 	s.lnMu.Unlock()
 
 	for _, r := range reactors {
-		s.wg.Add(1)
 		go r.loop()
 	}
 
@@ -899,8 +914,14 @@ func (s *Server) closeConn(c *conn) {
 
 func (s *Server) serveConn(c *conn) {
 	defer s.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			s.closeConn(c)
+		}
+	}()
 
 	var rw net.Conn = c.vc
+	var tlsState *tls.ConnectionState
 	if s.TLSConfig != nil {
 		tlsConn := tls.Server(c.vc, s.TLSConfig)
 		if s.ReadTimeout > 0 {
@@ -910,6 +931,8 @@ func (s *Server) serveConn(c *conn) {
 			s.closeConn(c)
 			return
 		}
+		st := tlsConn.ConnectionState()
+		tlsState = &st
 		rw = tlsConn
 	}
 
@@ -932,13 +955,20 @@ func (s *Server) serveConn(c *conn) {
 			s.closeConnGraceful(c, io.EOF)
 			return
 		}
+		// RFC 9112 Section 7.1: A server MUST reject any HTTP/1.1 request message that lacks a Host header field.
+		if req.ProtoAtLeast(1, 1) && (req.Host == "" || len(req.Header["Host"]) > 1) {
+			s.closeConn(c)
+			return
+		}
 		req.RemoteAddr = c.vc.RemoteAddr().String()
+		req.TLS = tlsState
 
 		if s.WriteTimeout > 0 {
 			_ = rw.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
 		}
 
 		w := acquireResponseWriter(c, rw, reader)
+		w.SetHead(req.Method == http.MethodHead)
 		if req.Close || strings.EqualFold(req.Header.Get("Connection"), "close") {
 			w.SetClose(true)
 		}
@@ -978,7 +1008,10 @@ func (s *Server) serveConn(c *conn) {
 		}
 
 		// Return any read-ahead bytes held by the bufio.Reader to the VirtualConn.
-		if reader.Buffered() > 0 {
+		// Only valid without TLS: under TLS the reader holds decrypted plaintext,
+		// and pushing that into the raw socket stream would desynchronise the
+		// record layer. There the same reader is reused across requests instead.
+		if s.TLSConfig == nil && reader.Buffered() > 0 {
 			rem := make([]byte, reader.Buffered())
 			_, _ = io.ReadFull(reader, rem)
 			c.vc.UnshiftInput(rem)

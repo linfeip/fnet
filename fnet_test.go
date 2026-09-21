@@ -345,17 +345,21 @@ func TestPartialHeaderDelayedDispatch(t *testing.T) {
 		t.Fatalf("write failed: %v", err)
 	}
 
-	// 3. We should immediately receive the HTTP response
-	buf := make([]byte, 1024)
+	// 3. We should immediately receive the HTTP response. Parse it rather than
+	// reading one segment: the server writes headers and body separately, so a
+	// single Read is not guaranteed to return both.
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, err := conn.Read(buf)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
 	if err != nil {
 		t.Fatalf("read failed: %v", err)
 	}
-
-	resp := string(buf[:n])
-	if !strings.Contains(resp, "200 OK") || !strings.Contains(resp, "hello from server") {
-		t.Fatalf("unexpected response: %s", resp)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != "hello from server" {
+		t.Fatalf("unexpected response: status=%d body=%q", resp.StatusCode, body)
 	}
 }
 
@@ -384,36 +388,39 @@ func TestKeepAliveGoroutineRecycle(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// First request on connection
-	req1 := "GET /keep HTTP/1.1\r\nHost: localhost\r\n\r\n"
-	if _, err := conn.Write([]byte(req1)); err != nil {
-		t.Fatal(err)
+	// A buffered reader is reused across both requests: the server writes
+	// headers and body as separate syscalls, so a bare Read may see only part
+	// of a response.
+	br := bufio.NewReader(conn)
+	readOne := func(round int) {
+		t.Helper()
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
+		if err != nil {
+			t.Fatalf("read %d failed: %v", round, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read %d body failed: %v", round, err)
+		}
+		if string(body) != "keepalive-ok" {
+			t.Fatalf("bad response %d: %q", round, body)
+		}
 	}
 
-	buf := make([]byte, 1024)
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, err := conn.Read(buf)
-	if err != nil {
-		t.Fatalf("read 1 failed: %v", err)
+	req := "GET /keep HTTP/1.1\r\nHost: localhost\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(string(buf[:n]), "keepalive-ok") {
-		t.Fatalf("bad response 1: %s", string(buf[:n]))
-	}
+	readOne(1)
 
 	// Wait for worker goroutine to exit and return connection to Poller Idle state
 	time.Sleep(50 * time.Millisecond)
 
 	// Second request on the SAME persistent connection
-	req2 := "GET /keep HTTP/1.1\r\nHost: localhost\r\n\r\n"
-	if _, err := conn.Write([]byte(req2)); err != nil {
+	if _, err := conn.Write([]byte(req)); err != nil {
 		t.Fatal(err)
 	}
-
-	n, err = conn.Read(buf)
-	if err != nil {
-		t.Fatalf("read 2 failed: %v", err)
-	}
-	if !strings.Contains(string(buf[:n]), "keepalive-ok") {
-		t.Fatalf("bad response 2: %s", string(buf[:n]))
-	}
+	readOne(2)
 }

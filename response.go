@@ -30,6 +30,8 @@ type responseWriter struct {
 	contentLength int64
 	chunked       bool
 	closeConn     bool
+	isHead        bool  // request method was HEAD: emit headers but no body
+	discardedLen  int64 // bytes a bodyless response swallowed, used for Content-Length
 	bodyBuf       bytes.Buffer
 	mu            sync.Mutex
 }
@@ -90,6 +92,8 @@ func acquireResponseWriter(c *conn, conn net.Conn, bufr ...*bufio.Reader) *respo
 	w.contentLength = -1
 	w.chunked = false
 	w.closeConn = false
+	w.isHead = false
+	w.discardedLen = 0
 	w.bodyBuf.Reset()
 	if w.header == nil {
 		w.header = make(http.Header, 8)
@@ -112,6 +116,28 @@ func (w *responseWriter) SetClose(close bool) {
 	w.mu.Lock()
 	w.closeConn = close
 	w.mu.Unlock()
+}
+
+// SetHead marks the response as answering a HEAD request. Headers are produced
+// exactly as they would be for GET, but no message body is sent (RFC 9110 9.3.2).
+func (w *responseWriter) SetHead(head bool) {
+	w.mu.Lock()
+	w.isHead = head
+	w.mu.Unlock()
+}
+
+// bodylessLocked reports whether this response must not carry a message body:
+// HEAD requests plus 1xx, 204 and 304 statuses (RFC 9110 6.4.1).
+func (w *responseWriter) bodylessLocked() bool {
+	return w.isHead || w.status < 200 ||
+		w.status == http.StatusNoContent || w.status == http.StatusNotModified
+}
+
+// allowsContentLengthLocked reports whether Content-Length may be sent for the
+// current status (RFC 9110 8.6 forbids it on 1xx and 204).
+func (w *responseWriter) allowsContentLengthLocked() bool {
+	return w.status >= 200 &&
+		w.status != http.StatusNoContent && w.status != http.StatusNotModified
 }
 
 func (w *responseWriter) Header() http.Header {
@@ -173,6 +199,13 @@ func (w *responseWriter) Write(b []byte) (int, error) {
 	}
 
 	w.wroteBody = true
+
+	if w.bodylessLocked() {
+		// Swallow the body but keep counting it, so a HEAD response can still
+		// advertise the Content-Length the matching GET would have returned.
+		w.discardedLen += int64(len(b))
+		return len(b), nil
+	}
 
 	if w.wroteHeader {
 		if w.chunked {
@@ -242,13 +275,28 @@ func (w *responseWriter) finish() error {
 	if w.hijacked {
 		return nil
 	}
+	bodyless := w.bodylessLocked()
 	if !w.wroteHeader {
-		if w.status != http.StatusNoContent && w.status != http.StatusNotModified {
-			if w.header.Get("Content-Length") == "" && !w.chunked {
-				w.header.Set("Content-Length", strconv.Itoa(w.bodyBuf.Len()))
+		if w.allowsContentLengthLocked() {
+			// Never emit both framing headers: RFC 9112 6.1 forbids
+			// Content-Length alongside Transfer-Encoding. w.chunked is only
+			// set once headers are flushed, so consult the header too.
+			chunked := w.chunked || w.header.Get("Transfer-Encoding") == "chunked"
+			if w.header.Get("Content-Length") == "" && !chunked {
+				n := int64(w.bodyBuf.Len())
+				if bodyless {
+					n = w.discardedLen
+				}
+				w.header.Set("Content-Length", strconv.FormatInt(n, 10))
 			}
 		}
 		w.writeHeaderLocked()
+	}
+
+	if bodyless {
+		// Headers are on the wire; the body (and any chunked terminator) is not.
+		w.bodyBuf.Reset()
+		return nil
 	}
 
 	if w.bodyBuf.Len() > 0 {
