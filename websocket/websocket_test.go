@@ -1997,3 +1997,75 @@ func TestWebSocketLargeFrameAbortedAssemblyCleanup(t *testing.T) {
 		t.Fatalf("echo mismatch: %q vs %q", string(echo), string(hello))
 	}
 }
+
+func TestWebSocket_BatchCoalescing(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	upgrader := &websocket.Upgrader{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = upgrader.UpgradeEvent(w, r, websocket.EventHandler{
+			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+				if string(msg) == "trigger_manual_batch" {
+					c.BeginBatch()
+					_ = c.WriteText("batch_1")
+					_ = c.WriteText("batch_2")
+					_ = c.WriteText("batch_3")
+					_ = c.EndBatch()
+					return
+				}
+				_ = c.WriteMessage(op, msg)
+			},
+		})
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// 1. Test manual BeginBatch / EndBatch
+	if err := wsutil.WriteClientText(conn, []byte("trigger_manual_batch")); err != nil {
+		t.Fatalf("write trigger failed: %v", err)
+	}
+	for _, expected := range []string{"batch_1", "batch_2", "batch_3"} {
+		msg, err := wsutil.ReadServerText(conn)
+		if err != nil {
+			t.Fatalf("read %s failed: %v", expected, err)
+		}
+		if string(msg) != expected {
+			t.Fatalf("got %q want %q", string(msg), expected)
+		}
+	}
+
+	// 2. Test burst messages to trigger automatic batching in processQueue
+	const burstCount = 10
+	for i := 0; i < burstCount; i++ {
+		text := fmt.Sprintf("burst_msg_%d", i)
+		if err := wsutil.WriteClientText(conn, []byte(text)); err != nil {
+			t.Fatalf("write burst %d failed: %v", i, err)
+		}
+	}
+
+	for i := 0; i < burstCount; i++ {
+		msg, err := wsutil.ReadServerText(conn)
+		if err != nil {
+			t.Fatalf("read burst %d failed: %v", i, err)
+		}
+		expected := fmt.Sprintf("burst_msg_%d", i)
+		if string(msg) != expected {
+			t.Fatalf("burst %d: got %q want %q", i, string(msg), expected)
+		}
+	}
+}

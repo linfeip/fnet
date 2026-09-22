@@ -508,3 +508,49 @@ func TestServerCustomWorkerPoolPanicRecoveryAndGracefulClose(t *testing.T) {
 	}
 }
 
+func TestVirtualConn_OutboundSlabPool(t *testing.T) {
+	vc := NewVirtualConn(nil, nil)
+
+	// Direct write is not configured, so writes buffer into outBuf with pooled outBlock
+	msg1 := []byte("hello world 1")
+	msg2 := []byte("hello world 2")
+
+	n1, err1 := vc.Write(msg1)
+	if err1 != nil || n1 != len(msg1) {
+		t.Fatalf("Write 1: n=%d err=%v", n1, err1)
+	}
+	n2, err2 := vc.Write(msg2)
+	if err2 != nil || n2 != len(msg2) {
+		t.Fatalf("Write 2: n=%d err=%v", n2, err2)
+	}
+
+	if !vc.PendingWrite() {
+		t.Fatal("expected PendingWrite to be true")
+	}
+
+	buf := make([]byte, len(msg1)+len(msg2))
+	n, rem := vc.DrainWrite(buf)
+	if n != len(buf) || rem {
+		t.Fatalf("DrainWrite: n=%d rem=%v want %d", n, rem, len(buf))
+	}
+	expected := append(msg1, msg2...)
+	if !bytes.Equal(buf, expected) {
+		t.Fatalf("got %q want %q", buf, expected)
+	}
+
+	if vc.PendingWrite() {
+		t.Fatal("expected PendingWrite to be false after full drain")
+	}
+
+	// Verify unshift functionality with pooled buffer
+	unshiftData := []byte("unshifted prefix")
+	vc.UnshiftWrite(unshiftData)
+	if !vc.PendingWrite() {
+		t.Fatal("expected PendingWrite after UnshiftWrite")
+	}
+	buf2 := make([]byte, len(unshiftData))
+	n, rem = vc.DrainWrite(buf2)
+	if n != len(unshiftData) || rem || !bytes.Equal(buf2, unshiftData) {
+		t.Fatalf("DrainWrite after unshift: n=%d rem=%v got %q", n, rem, buf2)
+	}
+}

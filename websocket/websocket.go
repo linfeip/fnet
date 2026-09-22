@@ -329,6 +329,11 @@ func (b *wsHandlerBridge) processQueue() {
 		b.batch, b.queue = b.queue, b.batch[:0]
 		b.queueMu.Unlock()
 
+		batchSize := len(b.batch)
+		if batchSize > 1 && b.conn != nil {
+			b.conn.beginWriteBatch()
+		}
+
 		for i := range b.batch {
 			task := b.batch[i]
 			b.batch[i] = wsTask{} // Clear pointer for GC
@@ -353,6 +358,10 @@ func (b *wsHandlerBridge) processQueue() {
 					b.resumeRead()
 				}
 			}
+		}
+
+		if batchSize > 1 && b.conn != nil {
+			_ = b.conn.endWriteBatch()
 		}
 		b.batch = b.batch[:0]
 	}
@@ -810,6 +819,10 @@ type Conn struct {
 	maxMessageSize    int64
 	compressLevel     int
 	compressThreshold int
+
+	batching   bool
+	batchBuf   []byte
+	batchBlock *pooledBuffer
 }
 
 // IsCompressed reports whether permessage-deflate compression is active on this connection.
@@ -827,15 +840,74 @@ func (c *Conn) SetMaxMessageSize(limit int64) {
 	c.maxMessageSize = limit
 }
 
+func (c *Conn) beginWriteBatch() {
+	c.writeMu.Lock()
+	c.batching = true
+	c.writeMu.Unlock()
+}
+
+func (c *Conn) endWriteBatch() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.batching = false
+	block := c.batchBlock
+	buf := c.batchBuf
+	c.batchBlock = nil
+	c.batchBuf = nil
+	if block != nil {
+		defer putPayloadBuffer(block)
+	}
+	if len(buf) == 0 || c.closed.Load() {
+		return nil
+	}
+	_, err := c.conn.Write(buf)
+	return err
+}
+
+// BeginBatch begins batching outbound WebSocket frames into a pooled buffer.
+// Subsequent WriteMessage calls on this connection will coalesce frames until EndBatch is called.
+func (c *Conn) BeginBatch() {
+	c.beginWriteBatch()
+}
+
+// EndBatch flushes all batched WebSocket frames in a single write operation.
+func (c *Conn) EndBatch() error {
+	return c.endWriteBatch()
+}
+
 // CloseWithStatus closes the connection with a specific WebSocket close status and reason.
 func (c *Conn) CloseWithStatus(status ws.StatusCode, reason string) error {
 	if c.closed.CompareAndSwap(false, true) {
 		c.writeMu.Lock()
 		_ = c.writeFrameLocked(OpClose, ws.NewCloseFrameBody(status, reason))
+		if c.batchBlock != nil {
+			buf := c.batchBuf
+			block := c.batchBlock
+			c.batchBlock = nil
+			c.batchBuf = nil
+			if len(buf) > 0 {
+				_, _ = c.conn.Write(buf)
+			}
+			putPayloadBuffer(block)
+		}
 		c.writeMu.Unlock()
 		return c.conn.Close()
 	}
 	return nil
+}
+
+func writeVectorDirect(vw VectorWriter, header, payload []byte) error {
+	if len(payload) > 0 {
+		var iovs [2][]byte
+		iovs[0] = header
+		iovs[1] = payload
+		_, err := vw.WriteVector(iovs[:2])
+		return err
+	}
+	var iovs [1][]byte
+	iovs[0] = header
+	_, err := vw.WriteVector(iovs[:1])
+	return err
 }
 
 func (c *Conn) writeFrameLocked(op OpCode, payload []byte) error {
@@ -852,16 +924,44 @@ func (c *Conn) writeFrameLocked(op OpCode, payload []byte) error {
 	var hBuf [10]byte
 	hLen := formatServerHeader(hBuf[:], op, len(toWrite), compressed)
 
-	if vw, ok := c.conn.(VectorWriter); ok {
-		var iovs [2][]byte
-		iovs[0] = hBuf[:hLen]
-		if len(toWrite) > 0 {
-			iovs[1] = toWrite
-			_, err := vw.WriteVector(iovs[:2])
-			return err
+	if c.batching {
+		frameLen := hLen + len(toWrite)
+		if frameLen > 64*1024 {
+			if len(c.batchBuf) > 0 {
+				if _, err := c.conn.Write(c.batchBuf); err != nil {
+					return err
+				}
+				c.batchBuf = c.batchBuf[:0]
+			}
+			if vw, ok := c.conn.(VectorWriter); ok {
+				return writeVectorDirect(vw, hBuf[:hLen], toWrite)
+			}
+			if _, err := c.conn.Write(hBuf[:hLen]); err != nil {
+				return err
+			}
+			if len(toWrite) > 0 {
+				_, err := c.conn.Write(toWrite)
+				return err
+			}
+			return nil
 		}
-		_, err := vw.WriteVector(iovs[:1])
-		return err
+		if len(c.batchBuf)+frameLen > 64*1024 {
+			if _, err := c.conn.Write(c.batchBuf); err != nil {
+				return err
+			}
+			c.batchBuf = c.batchBuf[:0]
+		}
+		if c.batchBlock == nil {
+			c.batchBuf, c.batchBlock = getPayloadBuffer(64 * 1024)
+			c.batchBuf = c.batchBuf[:0]
+		}
+		c.batchBuf = append(c.batchBuf, hBuf[:hLen]...)
+		c.batchBuf = append(c.batchBuf, toWrite...)
+		return nil
+	}
+
+	if vw, ok := c.conn.(VectorWriter); ok {
+		return writeVectorDirect(vw, hBuf[:hLen], toWrite)
 	}
 
 	if len(toWrite) == 0 {
@@ -1149,6 +1249,16 @@ func (c *Conn) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
 		c.writeMu.Lock()
 		_ = c.writeFrameLocked(OpClose, ws.NewCloseFrameBody(ws.StatusNormalClosure, ""))
+		if c.batchBlock != nil {
+			buf := c.batchBuf
+			block := c.batchBlock
+			c.batchBlock = nil
+			c.batchBuf = nil
+			if len(buf) > 0 {
+				_, _ = c.conn.Write(buf)
+			}
+			putPayloadBuffer(block)
+		}
 		c.writeMu.Unlock()
 		return c.conn.Close()
 	}

@@ -64,6 +64,8 @@ type VirtualConn struct {
 
 	wmu               sync.Mutex
 	outBuf            []byte
+	outReadOff        int
+	outBlock          *outBlock
 	writeErr          error
 	writeDeadlineNano int64
 	cb                *vcCallbacks
@@ -486,10 +488,100 @@ func isWouldBlock(err error) bool {
 	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)
 }
 
-func (vc *VirtualConn) releaseOutLocked() {
-	if cap(vc.outBuf) > 0 {
-		vc.outBuf = nil
+type outBlock struct {
+	buf  []byte
+	pool *sync.Pool
+}
+
+var (
+	outPool4k = sync.Pool{
+		New: func() any { return &outBlock{buf: make([]byte, 4096)} },
 	}
+	outPool16k = sync.Pool{
+		New: func() any { return &outBlock{buf: make([]byte, 16384)} },
+	}
+	outPool64k = sync.Pool{
+		New: func() any { return &outBlock{buf: make([]byte, 65536)} },
+	}
+	outPool256k = sync.Pool{
+		New: func() any { return &outBlock{buf: make([]byte, 262144)} },
+	}
+	outPool1m = sync.Pool{
+		New: func() any { return &outBlock{buf: make([]byte, 1048576)} },
+	}
+)
+
+func getOutBlock(size int) *outBlock {
+	var ob *outBlock
+	switch {
+	case size <= 4096:
+		ob = outPool4k.Get().(*outBlock)
+		ob.pool = &outPool4k
+	case size <= 16384:
+		ob = outPool16k.Get().(*outBlock)
+		ob.pool = &outPool16k
+	case size <= 65536:
+		ob = outPool64k.Get().(*outBlock)
+		ob.pool = &outPool64k
+	case size <= 262144:
+		ob = outPool256k.Get().(*outBlock)
+		ob.pool = &outPool256k
+	case size <= 1048576:
+		ob = outPool1m.Get().(*outBlock)
+		ob.pool = &outPool1m
+	default:
+		return &outBlock{buf: make([]byte, size)}
+	}
+	return ob
+}
+
+func putOutBlock(ob *outBlock) {
+	if ob != nil && ob.pool != nil {
+		ob.pool.Put(ob)
+	}
+}
+
+func (vc *VirtualConn) releaseOutLocked() {
+	if vc.outBlock != nil {
+		putOutBlock(vc.outBlock)
+		vc.outBlock = nil
+	}
+	vc.outBuf = nil
+	vc.outReadOff = 0
+}
+
+func (vc *VirtualConn) ensureOutCapLocked(needed int) {
+	if vc.outBlock == nil {
+		vc.outBlock = getOutBlock(needed)
+		vc.outBuf = vc.outBlock.buf[:0]
+		vc.outReadOff = 0
+		return
+	}
+	unread := len(vc.outBuf) - vc.outReadOff
+	if unread == 0 {
+		vc.outBuf = vc.outBlock.buf[:0]
+		vc.outReadOff = 0
+		if cap(vc.outBlock.buf) >= needed {
+			return
+		}
+	}
+	if cap(vc.outBlock.buf) >= unread+needed {
+		if vc.outReadOff > 0 {
+			copy(vc.outBlock.buf, vc.outBuf[vc.outReadOff:])
+			vc.outBuf = vc.outBlock.buf[:unread]
+			vc.outReadOff = 0
+		}
+		return
+	}
+	newBlock := getOutBlock(unread + needed)
+	newBuf := newBlock.buf[:0]
+	if unread > 0 {
+		newBuf = append(newBuf, vc.outBuf[vc.outReadOff:]...)
+	}
+	putOutBlock(vc.outBlock)
+	vc.outBlock = newBlock
+	vc.outBuf = newBuf
+	vc.outReadOff = 0
 }
 
 // Write implements net.Conn. Data is written directly to the socket when no
@@ -505,7 +597,8 @@ func (vc *VirtualConn) Write(b []byte) (int, error) {
 	}
 
 	origLen := len(b)
-	if len(vc.outBuf) == 0 && vc.canDirectWrite() {
+	unread := len(vc.outBuf) - vc.outReadOff
+	if unread == 0 && vc.canDirectWrite() {
 		n, err := vc.doDirectWrite(b)
 		if n == len(b) {
 			vc.wmu.Unlock()
@@ -521,10 +614,12 @@ func (vc *VirtualConn) Write(b []byte) (int, error) {
 		}
 	}
 
-	if len(vc.outBuf)+len(b) > maxOutboundBufferSize {
+	unread = len(vc.outBuf) - vc.outReadOff
+	if unread+len(b) > maxOutboundBufferSize {
 		vc.wmu.Unlock()
 		return 0, ErrWriteBufferFull
 	}
+	vc.ensureOutCapLocked(len(b))
 	vc.outBuf = append(vc.outBuf, b...)
 	vc.wmu.Unlock()
 	vc.notifyWritable()
@@ -549,7 +644,8 @@ func (vc *VirtualConn) WriteVector(iovs [][]byte) (int, error) {
 	}
 
 	written := 0
-	if len(vc.outBuf) == 0 && vc.canDirectWritev() {
+	unread := len(vc.outBuf) - vc.outReadOff
+	if unread == 0 && vc.canDirectWritev() {
 		n, err := vc.doDirectWritev(iovs)
 		if n > 0 {
 			written = n
@@ -566,22 +662,13 @@ func (vc *VirtualConn) WriteVector(iovs [][]byte) (int, error) {
 	}
 
 	remLen := totalLen - written
-	if len(vc.outBuf)+remLen > maxOutboundBufferSize {
+	unread = len(vc.outBuf) - vc.outReadOff
+	if unread+remLen > maxOutboundBufferSize {
 		vc.wmu.Unlock()
 		return written, ErrWriteBufferFull
 	}
 
-	needed := len(vc.outBuf) + remLen
-	if cap(vc.outBuf) < needed {
-		newCap := 2 * cap(vc.outBuf)
-		if newCap < needed {
-			newCap = needed
-		}
-		newBuf := make([]byte, len(vc.outBuf), newCap)
-		copy(newBuf, vc.outBuf)
-		vc.outBuf = newBuf
-	}
-
+	vc.ensureOutCapLocked(remLen)
 	skip := written
 	for _, b := range iovs {
 		if skip >= len(b) {
@@ -601,17 +688,17 @@ func (vc *VirtualConn) WriteVector(iovs [][]byte) (int, error) {
 func (vc *VirtualConn) flushOut() (pending bool, err error) {
 	vc.wmu.Lock()
 	defer vc.wmu.Unlock()
-	for len(vc.outBuf) > 0 {
+	for vc.outReadOff < len(vc.outBuf) {
 		if !vc.canDirectWrite() {
 			return true, nil
 		}
-		n, werr := vc.doDirectWrite(vc.outBuf)
+		n, werr := vc.doDirectWrite(vc.outBuf[vc.outReadOff:])
 		if n > 0 {
-			vc.outBuf = vc.outBuf[n:]
+			vc.outReadOff += n
 		}
 		if werr != nil {
 			if isWouldBlock(werr) {
-				return len(vc.outBuf) > 0, nil
+				return vc.outReadOff < len(vc.outBuf), nil
 			}
 			vc.writeErr = werr
 			return false, werr
@@ -630,22 +717,24 @@ func (vc *VirtualConn) flushOut() (pending bool, err error) {
 func (vc *VirtualConn) DrainWrite(dst []byte) (n int, remaining bool) {
 	vc.wmu.Lock()
 	defer vc.wmu.Unlock()
-	if len(vc.outBuf) == 0 {
+	unread := len(vc.outBuf) - vc.outReadOff
+	if unread <= 0 {
 		return 0, false
 	}
-	n = copy(dst, vc.outBuf)
-	vc.outBuf = vc.outBuf[n:]
-	if len(vc.outBuf) == 0 {
+	n = copy(dst, vc.outBuf[vc.outReadOff:])
+	vc.outReadOff += n
+	if vc.outReadOff >= len(vc.outBuf) {
 		vc.releaseOutLocked()
+		return n, false
 	}
-	return n, len(vc.outBuf) > 0
+	return n, true
 }
 
 // PendingWrite reports whether outbound data is queued.
 func (vc *VirtualConn) PendingWrite() bool {
 	vc.wmu.Lock()
 	defer vc.wmu.Unlock()
-	return len(vc.outBuf) > 0
+	return len(vc.outBuf)-vc.outReadOff > 0
 }
 
 // UnshiftWrite prepends bytes to the front of the outbound buffer
@@ -655,8 +744,24 @@ func (vc *VirtualConn) UnshiftWrite(b []byte) {
 		return
 	}
 	vc.wmu.Lock()
-	vc.outBuf = append(b, vc.outBuf...)
-	vc.wmu.Unlock()
+	defer vc.wmu.Unlock()
+	if vc.outBlock != nil && vc.outReadOff >= len(b) {
+		copy(vc.outBlock.buf[vc.outReadOff-len(b):], b)
+		vc.outReadOff -= len(b)
+		return
+	}
+	unread := len(vc.outBuf) - vc.outReadOff
+	needed := unread + len(b)
+	newBlock := getOutBlock(needed)
+	newBuf := newBlock.buf[:0]
+	newBuf = append(newBuf, b...)
+	if unread > 0 {
+		newBuf = append(newBuf, vc.outBuf[vc.outReadOff:]...)
+	}
+	putOutBlock(vc.outBlock)
+	vc.outBlock = newBlock
+	vc.outBuf = newBuf
+	vc.outReadOff = 0
 }
 
 // ---------------------------------------------------------------------------
