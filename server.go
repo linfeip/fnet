@@ -49,8 +49,12 @@ type Server struct {
 
 	// WorkerPool is an optional worker pool function (e.g. pool.Submit, ants.Submit, or custom scheduler)
 	// used to execute HTTP worker tasks.
-	// If nil, fnet.DefaultWorkerPool is automatically used.
+	// If nil, Pool (if set) or fnet.DefaultWorkerPool is automatically used.
 	WorkerPool func(task func())
+
+	// Pool is an optional custom *WorkerPool instance.
+	// When provided, requests are scheduled using SubmitConn for connection affinity and work-stealing.
+	Pool *WorkerPool
 
 	lnMu        sync.Mutex
 	listeners   map[int]net.Addr // listener fd -> local address
@@ -700,6 +704,10 @@ func (s *Server) dispatchWorker(c *conn) {
 	}
 	if s.WorkerPool != nil {
 		s.WorkerPool(task)
+		return
+	}
+	if s.Pool != nil {
+		s.Pool.SubmitConn(uint64(c.fd), task)
 		return
 	}
 	DefaultWorkerPool.SubmitConn(uint64(c.fd), task)

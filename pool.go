@@ -73,11 +73,13 @@ type WorkerPool struct {
 
 type workerShard struct {
 	pool        *WorkerPool
+	id          int
 	tasks       chan func()
 	maxWorkers  int32
 	curWorkers  atomic.Int32
 	idleWorkers atomic.Int32
 	idleTimeout time.Duration
+	stealRound  atomic.Uint32
 }
 
 // NewWorkerPool creates a new high-concurrency sharded worker pool.
@@ -117,6 +119,7 @@ func NewWorkerPool(cfgs ...WorkerPoolConfig) *WorkerPool {
 	for i := 0; i < numShards; i++ {
 		p.shards[i] = &workerShard{
 			pool:        p,
+			id:          i,
 			tasks:       make(chan func(), queueSize),
 			maxWorkers:  maxWorkers,
 			idleTimeout: idleTimeout,
@@ -126,13 +129,35 @@ func NewWorkerPool(cfgs ...WorkerPoolConfig) *WorkerPool {
 	return p
 }
 
-// Submit dispatches a task to the pool using round-robin shard distribution.
+// Submit dispatches a task to the pool using power-of-two-choices load balancing.
+// It inspects two pseudo-random shards and assigns the task to the one with lower load
+// (more idle workers or fewer queued tasks), mitigating shard skew and hotspot buildup.
 func (p *WorkerPool) Submit(task func()) {
 	if task == nil || p.closed.Load() {
 		return
 	}
-	idx := p.round.Add(1) & p.shardMask
-	p.shards[idx].submit(task)
+	r := p.round.Add(1)
+	idx1 := r & p.shardMask
+	idx2 := (r + 7) & p.shardMask
+
+	s1 := p.shards[idx1]
+	s2 := p.shards[idx2]
+
+	var chosen *workerShard
+	i1 := s1.idleWorkers.Load()
+	i2 := s2.idleWorkers.Load()
+	if i1 > i2 {
+		chosen = s1
+	} else if i2 > i1 {
+		chosen = s2
+	} else {
+		if len(s1.tasks) <= len(s2.tasks) {
+			chosen = s1
+		} else {
+			chosen = s2
+		}
+	}
+	chosen.submit(task)
 }
 
 // SubmitConn dispatches a task with connection affinity based on connID (e.g. socket fd).
@@ -178,31 +203,143 @@ func (p *WorkerPool) IdleWorkers() int {
 	return total
 }
 
+// trySteal attempts to steal a task from another shard that has queued tasks.
+// Returns nil if no tasks could be stolen.
+func (p *WorkerPool) trySteal(myShardID int) func() {
+	if p.closed.Load() {
+		return nil
+	}
+	numShards := len(p.shards)
+	if numShards <= 1 {
+		return nil
+	}
+
+	myShard := p.shards[myShardID]
+	start := (uint32(myShardID) + myShard.stealRound.Add(1)) & uint32(p.shardMask)
+
+	for i := 0; i < numShards-1; i++ {
+		victimIdx := (start + uint32(i) + 1) & uint32(p.shardMask)
+		victim := p.shards[victimIdx]
+
+		// Fast path: avoid channel lock if queue is empty
+		if len(victim.tasks) == 0 {
+			continue
+		}
+
+		select {
+		case task, ok := <-victim.tasks:
+			if ok {
+				return task
+			}
+		default:
+		}
+	}
+	return nil
+}
+
+// tryOffloadToIdle attempts to push a task to another shard that has idle workers waiting.
+func (p *WorkerPool) tryOffloadToIdle(task func(), myShardID int) bool {
+	if p.closed.Load() {
+		return false
+	}
+	numShards := len(p.shards)
+	if numShards <= 1 {
+		return false
+	}
+
+	myShard := p.shards[myShardID]
+	start := (uint32(myShardID) + myShard.stealRound.Add(1)) & uint32(p.shardMask)
+
+	for i := 0; i < numShards-1; i++ {
+		targetIdx := (start + uint32(i) + 1) & uint32(p.shardMask)
+		target := p.shards[targetIdx]
+
+		if target.idleWorkers.Load() > 0 {
+			select {
+			case target.tasks <- task:
+				return true
+			default:
+			}
+		}
+	}
+	return false
+}
+
+// tryOffload attempts to push a task to any other shard with spare capacity.
+func (p *WorkerPool) tryOffload(task func(), myShardID int) bool {
+	if p.closed.Load() {
+		return false
+	}
+	numShards := len(p.shards)
+	if numShards <= 1 {
+		return false
+	}
+
+	myShard := p.shards[myShardID]
+	start := (uint32(myShardID) + myShard.stealRound.Add(1)) & uint32(p.shardMask)
+
+	for i := 0; i < numShards-1; i++ {
+		targetIdx := (start + uint32(i) + 1) & uint32(p.shardMask)
+		target := p.shards[targetIdx]
+
+		select {
+		case target.tasks <- task:
+			if target.idleWorkers.Load() == 0 && target.curWorkers.Load() < target.maxWorkers {
+				target.maybeSpawnWorker(nil)
+			}
+			return true
+		default:
+		}
+	}
+	return false
+}
+
 func (s *workerShard) submit(task func()) {
 	if s.pool.closed.Load() {
 		return
 	}
 
-	// 1. Try non-blocking enqueue into the shard task queue
+	// 1. If this shard has an idle worker ready to execute immediately, wake it up (affinity path)
+	if s.idleWorkers.Load() > 0 {
+		select {
+		case s.tasks <- task:
+			return
+		default:
+		}
+	}
+
+	// 2. No idle workers on this shard, but we can spawn another worker up to maxWorkers
+	if s.curWorkers.Load() < s.maxWorkers {
+		select {
+		case s.tasks <- task:
+			s.maybeSpawnWorker(nil)
+			return
+		default:
+			if s.maybeSpawnWorker(task) {
+				return
+			}
+		}
+	}
+
+	// 3. This shard is at capacity (all workers busy). If other shards have idle workers,
+	// offload to them immediately so idle CPU cores take the work rather than letting tasks stall.
+	if s.pool.tryOffloadToIdle(task, s.id) {
+		return
+	}
+
+	// 4. No idle workers anywhere across the pool. Buffer in local queue if space allows.
 	select {
 	case s.tasks <- task:
-		// Task enqueued. If no workers are currently idle and we haven't reached maxWorkers,
-		// spawn an additional worker to consume tasks.
-		if s.idleWorkers.Load() == 0 && s.curWorkers.Load() < s.maxWorkers {
-			s.maybeSpawnWorker(nil)
-		}
 		return
 	default:
 	}
 
-	// 2. Queue is full. Try spawning a new worker directly carrying this task
-	if s.curWorkers.Load() < s.maxWorkers {
-		if s.maybeSpawnWorker(task) {
-			return
-		}
+	// 5. Local queue is full. Try offload to any shard with spare queue capacity.
+	if s.pool.tryOffload(task, s.id) {
+		return
 	}
 
-	// 3. Fallback under extreme saturation: never block the caller (especially IO reactor loop).
+	// 6. Absolute saturation fallback: never block the caller (especially IO reactor loop).
 	// Run the task on a detached goroutine with panic protection.
 	go runSafe(task)
 }
@@ -237,6 +374,55 @@ func (s *workerShard) workerLoop(firstTask func()) {
 	halfTimeout := s.idleTimeout / 2
 
 	for {
+		// 1. Fast path: drain local shard tasks first (maximizes CPU cache locality)
+		for {
+			select {
+			case task, ok := <-s.tasks:
+				if !ok {
+					return
+				}
+				runSafe(task)
+			default:
+				goto checkSteal
+			}
+		}
+
+	checkSteal:
+		// 2. Local queue is empty: try stealing tasks from other busy shards before going to sleep.
+		// This eliminates shard skew where one shard is overloaded while others sit idle.
+		for {
+			stolen := s.pool.trySteal(s.id)
+			if stolen == nil {
+				break
+			}
+			runSafe(stolen)
+
+			// If new local tasks arrived while executing stolen work, switch back to local
+			// queue immediately to maintain connection and core affinity.
+			if len(s.tasks) > 0 {
+				break
+			}
+		}
+
+		if len(s.tasks) > 0 {
+			continue
+		}
+
+		// 3. All queues across all shards are drained.
+		// Refresh idle timer if needed before sleeping.
+		now := time.Now()
+		if now.Sub(lastReset) >= halfTimeout {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(s.idleTimeout)
+			lastReset = now
+		}
+
+		// Enter idle wait state
 		s.idleWorkers.Add(1)
 		select {
 		case task, ok := <-s.tasks:
@@ -245,34 +431,6 @@ func (s *workerShard) workerLoop(firstTask func()) {
 				return
 			}
 			runSafe(task)
-
-			// Drain already queued tasks in batch without touching runtime timer
-			for {
-				select {
-				case nextTask, ok := <-s.tasks:
-					if !ok {
-						return
-					}
-					runSafe(nextTask)
-				default:
-					goto drained
-				}
-			}
-
-		drained:
-			// Only refresh timer if at least half of idleTimeout has elapsed,
-			// eliminating millions of timer.Stop/Reset calls under continuous traffic.
-			now := time.Now()
-			if now.Sub(lastReset) >= halfTimeout {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer.Reset(s.idleTimeout)
-				lastReset = now
-			}
 
 		case <-timer.C:
 			s.idleWorkers.Add(-1)
@@ -286,6 +444,13 @@ func runSafe(fn func()) {
 		_ = recover()
 	}()
 	fn()
+}
+
+// SetDefaultWorkerPool replaces the globally shared default WorkerPool.
+func SetDefaultWorkerPool(p *WorkerPool) {
+	if p != nil {
+		DefaultWorkerPool = p
+	}
 }
 
 // DefaultWorkerPool is the globally shared, highly scalable default WorkerPool.

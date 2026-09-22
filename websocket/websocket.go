@@ -76,8 +76,11 @@ type Upgrader struct {
 	CompressionThreshold int
 
 	// WorkerPool is an optional worker pool function (e.g. pool.Submit, ants.Submit, or custom scheduler)
-	// used to execute async tasks. If nil, the built-in, highly scalable DefaultWorkerPool is automatically used.
+	// used to execute async tasks. If nil, Pool (if set) or the built-in DefaultWorkerPool is automatically used.
 	WorkerPool func(task func())
+
+	// Pool is an optional custom *WorkerPool instance with connection-affinity and work-stealing scheduling.
+	Pool *WorkerPool
 
 	// Optional event-driven callbacks. When OnMessage is set, Upgrade will
 	// automatically operate in event-driven mode (zero goroutines while idle).
@@ -121,6 +124,7 @@ type wsHandlerBridge struct {
 	fragBuf    []byte
 	fragComp   bool
 
+	pool       *WorkerPool
 	workerPool func(task func())
 	queueMu    sync.Mutex
 	queue      []wsTask
@@ -181,6 +185,8 @@ func (b *wsHandlerBridge) enqueueTaskOwned(op OpCode, payload []byte, pooled *po
 func (b *wsHandlerBridge) schedule(task func()) {
 	if b.workerPool != nil {
 		b.workerPool(task)
+	} else if b.pool != nil {
+		b.pool.SubmitConn(b.id, task)
 	} else {
 		DefaultWorkerPool.SubmitConn(b.id, task)
 	}
@@ -408,6 +414,7 @@ func (u *Upgrader) UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventH
 		id:         nextBridgeID.Add(1),
 		conn:       conn,
 		handler:    h,
+		pool:       u.Pool,
 		workerPool: u.WorkerPool,
 	}
 	if attacher != nil {

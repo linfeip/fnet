@@ -16,3 +16,9 @@ var NewWorkerPool = fnet.NewWorkerPool
 // DefaultWorkerPool points to fnet.DefaultWorkerPool for unified worker pool scheduling
 // across HTTP and WebSocket.
 var DefaultWorkerPool = fnet.DefaultWorkerPool
+
+// SetDefaultWorkerPool updates the global default WorkerPool across both HTTP and WebSocket.
+func SetDefaultWorkerPool(p *WorkerPool) {
+	fnet.SetDefaultWorkerPool(p)
+	DefaultWorkerPool = p
+}
