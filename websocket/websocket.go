@@ -245,6 +245,7 @@ func (b *wsHandlerBridge) executeTask(task wsTask) {
 	if task.op == OpText && !utf8.Valid(msgPayload) {
 		_ = b.conn.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8 in text message")
 		b.markClosed()
+		b.OnClose(ws.ErrProtocolInvalidUTF8)
 		return
 	}
 

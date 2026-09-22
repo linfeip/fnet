@@ -524,3 +524,32 @@ func TestWorkerPool_ServerAndUpgraderCustomPool(t *testing.T) {
 		t.Fatalf("expected customPool to have active running workers, got %d", running)
 	}
 }
+
+func TestWorkerPool_ConcurrentCloseAndSubmit(t *testing.T) {
+	pool := fnet.NewWorkerPool(fnet.WorkerPoolConfig{
+		Shards:             4,
+		MaxWorkersPerShard: 8,
+		QueueSizePerShard:  16,
+		IdleTimeout:        100 * time.Millisecond,
+	})
+
+	const numSubmitters = 50
+	var wg sync.WaitGroup
+	wg.Add(numSubmitters)
+
+	for i := 0; i < numSubmitters; i++ {
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				pool.SubmitConn(uint64(id), func() {
+					time.Sleep(time.Microsecond)
+				})
+			}
+		}(i)
+	}
+
+	time.Sleep(time.Millisecond)
+	pool.Close()
+	wg.Wait()
+}
+

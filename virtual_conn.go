@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -12,6 +13,11 @@ import (
 
 	"github.com/gobwas/ws"
 )
+
+// ErrWriteBufferFull is returned when outbound queue exceeds maxOutboundBufferSize.
+var ErrWriteBufferFull = errors.New("fnet: outbound write buffer full")
+
+const maxOutboundBufferSize = 16 * 1024 * 1024 // 16MB per connection safety cap against slowloris
 
 // VirtualConn is a concurrency-safe net.Conn adapter. The reactor feeds
 // inbound socket bytes via FeedInput; a worker goroutine may block in Read
@@ -396,7 +402,7 @@ func (vc *VirtualConn) Read(b []byte) (int, error) {
 			now := time.Now().UnixNano()
 			remain := time.Duration(vc.readDeadlineNano - now)
 			if remain <= 0 {
-				return 0, syscall.ETIMEDOUT
+				return 0, os.ErrDeadlineExceeded
 			}
 			timer := time.AfterFunc(remain, func() {
 				vc.mu.Lock()
@@ -408,7 +414,7 @@ func (vc *VirtualConn) Read(b []byte) (int, error) {
 			vc.condLocked().Wait()
 			timer.Stop()
 			if vc.readDeadlineNano > 0 && time.Now().UnixNano() > vc.readDeadlineNano && len(vc.inBuf) == vc.inReadOff {
-				return 0, syscall.ETIMEDOUT
+				return 0, os.ErrDeadlineExceeded
 			}
 			continue
 		}
@@ -429,7 +435,7 @@ func (vc *VirtualConn) checkWritableLocked() error {
 		return vc.writeErr
 	}
 	if vc.writeDeadlineNano > 0 && time.Now().UnixNano() > vc.writeDeadlineNano {
-		return syscall.ETIMEDOUT
+		return os.ErrDeadlineExceeded
 	}
 	return nil
 }
@@ -473,6 +479,10 @@ func (vc *VirtualConn) Write(b []byte) (int, error) {
 		}
 	}
 
+	if len(vc.outBuf)+len(b) > maxOutboundBufferSize {
+		vc.wmu.Unlock()
+		return 0, ErrWriteBufferFull
+	}
 	vc.outBuf = append(vc.outBuf, b...)
 	vc.wmu.Unlock()
 	vc.notifyWritable()
@@ -511,6 +521,12 @@ func (vc *VirtualConn) WriteVector(iovs [][]byte) (int, error) {
 			vc.wmu.Unlock()
 			return written, err
 		}
+	}
+
+	remLen := totalLen - written
+	if len(vc.outBuf)+remLen > maxOutboundBufferSize {
+		vc.wmu.Unlock()
+		return written, ErrWriteBufferFull
 	}
 
 	skip := written

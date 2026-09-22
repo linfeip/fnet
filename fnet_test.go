@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -84,6 +86,33 @@ func TestVirtualConnCloseUnblocksRead(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Read did not unblock")
+	}
+}
+
+func TestVirtualConnReadDeadline(t *testing.T) {
+	vc := NewVirtualConn(nil, nil)
+	_ = vc.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+	buf := make([]byte, 8)
+	_, err := vc.Read(buf)
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected os.ErrDeadlineExceeded, got %v", err)
+	}
+}
+
+func TestVirtualConnWriteBufferLimit(t *testing.T) {
+	vc := NewVirtualConn(nil, nil)
+	// direct write not available, so all writes buffer in outBuf
+	chunk := make([]byte, 1024*1024) // 1MB
+	for i := 0; i < 16; i++ {
+		_, err := vc.Write(chunk)
+		if err != nil {
+			t.Fatalf("unexpected write error at %d: %v", i, err)
+		}
+	}
+	// 17th MB should exceed maxOutboundBufferSize (16MB)
+	_, err := vc.Write(chunk)
+	if !errors.Is(err, ErrWriteBufferFull) {
+		t.Fatalf("expected ErrWriteBufferFull, got %v", err)
 	}
 }
 
@@ -424,3 +453,58 @@ func TestKeepAliveGoroutineRecycle(t *testing.T) {
 	}
 	readOne(2)
 }
+
+func TestServerCustomWorkerPoolPanicRecoveryAndGracefulClose(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/panic-pool", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	srv := &Server{
+		Addr:    addr,
+		Handler: mux,
+		WorkerPool: func(task func()) {
+			panic("simulated custom pool rejection/panic")
+		},
+	}
+	go func() { _ = srv.ListenAndServe() }()
+	defer func() { _ = srv.Close() }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	req := "GET /panic-pool HTTP/1.1\r\nHost: localhost\r\n\r\n"
+	_, _ = conn.Write([]byte(req))
+
+	// Connection should be closed by server due to pool panic
+	buf := make([]byte, 128)
+	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, _ = conn.Read(buf)
+
+	// Close must not deadlock on s.wg.Wait()
+	closed := make(chan struct{})
+	go func() {
+		_ = srv.Close()
+		close(closed)
+	}()
+
+	select {
+	case <-closed:
+		// Success: server closed cleanly without deadlocking on s.wg
+	case <-time.After(2 * time.Second):
+		t.Fatal("server.Close() deadlocked on WaitGroup after custom WorkerPool panic")
+	}
+}
+

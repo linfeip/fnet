@@ -74,6 +74,8 @@ type WorkerPool struct {
 type workerShard struct {
 	pool        *WorkerPool
 	id          int
+	mu          sync.RWMutex
+	closed      bool
 	tasks       chan func()
 	maxWorkers  int32
 	curWorkers  atomic.Int32
@@ -133,7 +135,11 @@ func NewWorkerPool(cfgs ...WorkerPoolConfig) *WorkerPool {
 // It inspects two pseudo-random shards and assigns the task to the one with lower load
 // (more idle workers or fewer queued tasks), mitigating shard skew and hotspot buildup.
 func (p *WorkerPool) Submit(task func()) {
-	if task == nil || p.closed.Load() {
+	if task == nil {
+		return
+	}
+	if p.closed.Load() {
+		go runSafe(task)
 		return
 	}
 	r := p.round.Add(1)
@@ -163,7 +169,11 @@ func (p *WorkerPool) Submit(task func()) {
 // SubmitConn dispatches a task with connection affinity based on connID (e.g. socket fd).
 // All tasks for the same connection hash to the same worker shard, maximizing CPU cache locality.
 func (p *WorkerPool) SubmitConn(connID uint64, task func()) {
-	if task == nil || p.closed.Load() {
+	if task == nil {
+		return
+	}
+	if p.closed.Load() {
+		go runSafe(task)
 		return
 	}
 	// SplitMix64 / Murmur3 64-bit mixer for uniform bit distribution
@@ -179,7 +189,10 @@ func (p *WorkerPool) SubmitConn(connID uint64, task func()) {
 func (p *WorkerPool) Close() {
 	if p.closed.CompareAndSwap(false, true) {
 		for _, s := range p.shards {
+			s.mu.Lock()
+			s.closed = true
 			close(s.tasks)
+			s.mu.Unlock()
 		}
 		p.wg.Wait()
 	}
@@ -255,11 +268,16 @@ func (p *WorkerPool) tryOffloadToIdle(task func(), myShardID int) bool {
 		target := p.shards[targetIdx]
 
 		if target.idleWorkers.Load() > 0 {
-			select {
-			case target.tasks <- task:
-				return true
-			default:
+			target.mu.RLock()
+			if !target.closed {
+				select {
+				case target.tasks <- task:
+					target.mu.RUnlock()
+					return true
+				default:
+				}
 			}
+			target.mu.RUnlock()
 		}
 	}
 	return false
@@ -282,20 +300,33 @@ func (p *WorkerPool) tryOffload(task func(), myShardID int) bool {
 		targetIdx := (start + uint32(i) + 1) & uint32(p.shardMask)
 		target := p.shards[targetIdx]
 
-		select {
-		case target.tasks <- task:
-			if target.idleWorkers.Load() == 0 && target.curWorkers.Load() < target.maxWorkers {
-				target.maybeSpawnWorker(nil)
+		target.mu.RLock()
+		if !target.closed {
+			select {
+			case target.tasks <- task:
+				if target.idleWorkers.Load() == 0 && target.curWorkers.Load() < target.maxWorkers {
+					target.maybeSpawnWorker(nil)
+				}
+				target.mu.RUnlock()
+				return true
+			default:
 			}
-			return true
-		default:
 		}
+		target.mu.RUnlock()
 	}
 	return false
 }
 
 func (s *workerShard) submit(task func()) {
 	if s.pool.closed.Load() {
+		go runSafe(task)
+		return
+	}
+
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		go runSafe(task)
 		return
 	}
 
@@ -303,6 +334,7 @@ func (s *workerShard) submit(task func()) {
 	if s.idleWorkers.Load() > 0 {
 		select {
 		case s.tasks <- task:
+			s.mu.RUnlock()
 			return
 		default:
 		}
@@ -312,14 +344,18 @@ func (s *workerShard) submit(task func()) {
 	if s.curWorkers.Load() < s.maxWorkers {
 		select {
 		case s.tasks <- task:
+			s.mu.RUnlock()
 			s.maybeSpawnWorker(nil)
 			return
 		default:
 			if s.maybeSpawnWorker(task) {
+				s.mu.RUnlock()
 				return
 			}
 		}
 	}
+
+	s.mu.RUnlock()
 
 	// 3. This shard is at capacity (all workers busy). If other shards have idle workers,
 	// offload to them immediately so idle CPU cores take the work rather than letting tasks stall.
@@ -328,11 +364,16 @@ func (s *workerShard) submit(task func()) {
 	}
 
 	// 4. No idle workers anywhere across the pool. Buffer in local queue if space allows.
-	select {
-	case s.tasks <- task:
-		return
-	default:
+	s.mu.RLock()
+	if !s.closed {
+		select {
+		case s.tasks <- task:
+			s.mu.RUnlock()
+			return
+		default:
+		}
 	}
+	s.mu.RUnlock()
 
 	// 5. Local queue is full. Try offload to any shard with spare queue capacity.
 	if s.pool.tryOffload(task, s.id) {

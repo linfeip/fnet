@@ -136,6 +136,10 @@ func (t *connTable) store(fd int, c *conn) {
 	if p := t.chunks.Load(); p != nil {
 		oldChunks = *p
 	}
+	if cIdx < len(oldChunks) && oldChunks[cIdx] != nil {
+		oldChunks[cIdx][sIdx].Store(c)
+		return
+	}
 	newLen := len(oldChunks)
 	if newLen == 0 {
 		newLen = 32
@@ -427,6 +431,10 @@ func (s *Server) handleAccept(lnFD int, laddr net.Addr) {
 			// EAGAIN / EWOULDBLOCK: backlog drained. Anything else: give up for now.
 			return
 		}
+		if s.closing.Load() {
+			_ = closeFD(nfd)
+			return
+		}
 
 		idx := s.nextReactor.Add(1) % uint64(len(s.reactors))
 		r := s.reactors[idx]
@@ -656,6 +664,10 @@ func (r *subReactor) handleWrite(c *conn) {
 
 // checkAndDispatch is called on the reactor after inbound bytes were buffered.
 func (s *Server) checkAndDispatch(c *conn) {
+	if s.closing.Load() {
+		s.closeConn(c)
+		return
+	}
 	switch c.state.Load() {
 	case connStateWSEventDriven:
 		s.drainWS(c)
@@ -703,7 +715,15 @@ func (s *Server) dispatchWorker(c *conn) {
 		s.serveConn(c)
 	}
 	if s.WorkerPool != nil {
-		s.WorkerPool(task)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.wg.Done()
+					s.closeConn(c)
+				}
+			}()
+			s.WorkerPool(task)
+		}()
 		return
 	}
 	if s.Pool != nil {
@@ -1070,6 +1090,14 @@ func (s *Server) serveConn(c *conn) {
 		// this goroutine. Any partially written response is flushed by the
 		// reactor on write readiness.
 		c.state.Store(connStateIdle)
+		if s.TLSConfig == nil && c.vc.HasCompleteHeader() {
+			// Inbound request arrived right as we were returning to idle:
+			// keep this worker so the request is not stalled.
+			c.state.Store(connStateWorking)
+			c.mu.Unlock()
+			reader.Reset(rw)
+			continue
+		}
 		c.mu.Unlock()
 		return
 	}
