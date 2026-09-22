@@ -22,90 +22,25 @@
 
 fnet 采用**“多 Reactor 事件驱动 I/O + VirtualConn 虚拟抽象桥梁 + 分片工作协程池”**的混合高性能架构。既享有 Reactor 驱动百万级并发连接的超轻量开销，又完整兼容 Go 标准库的阻塞式业务逻辑。
 
-```mermaid
-flowchart TB
-    subgraph ClientLayer["客户端层 (Clients)"]
-        C1["HTTP Client"]
-        C2["WebSocket Client 1"]
-        C3["WebSocket Client N (1M+)"]
-    end
-
-    subgraph PollerLayer["多 Reactor 事件驱动层 (I/O Multiplexing)"]
-        MainR["Main Reactor (主轮询器)<br/>非阻塞 accept4 / kevent"]
-        
-        subgraph SubReactors["Sub-Reactors (匹配 CPU 核心数)"]
-            SR1["Sub-Reactor 1<br/>(epoll / kqueue)"]
-            SR2["Sub-Reactor 2<br/>(epoll / kqueue)"]
-            SRN["Sub-Reactor N<br/>(epoll / kqueue)"]
-        end
-        
-        ConnTable[("全局分块连接表<br/>Lock-Free Conn Table<br/>(O(1) 索引, 1M+ 极低开销)")]
-    end
-
-    subgraph CoreEngine["协议编解码与流控核心 (Core Engine)"]
-        direction TB
-        VC["VirtualConn (虚拟连接桥梁)<br/>标准 net.Conn 兼容适配"]
-        
-        subgraph WSPath["WebSocket 极速链路"]
-            WSHdr["帧头解析 (Zero-Alloc)"]
-            Unmask["SIMD / SWAR 原地解掩码"]
-            
-            subgraph SlabPool["阶梯式分级对象池 (Slab Pool)"]
-                P1["小包池: 128B ~ 64KB"]
-                P2["大包池: 128KB ~ 16MB"]
-            end
-            
-            StreamAsm["大包流式组装器<br/>(直接灌入 Slab Pool，零重复拷贝)"]
-            Backpressure{"静默反压控制<br/>(待处理堆积 > 4MB?)"}
-        end
-        
-        subgraph HTTPPath["HTTP / HTTPS 链路"]
-            HeaderDet{"完整头部探测<br/>HasCompleteHeader (\r\n\r\n)"}
-            Slowloris["防慢速攻击超时/截断 (64KB)"]
-        end
-    end
-
-    subgraph WorkerPoolLayer["分片并发工作协程池 (Worker Pool Layer)"]
-        WP["Sharded Worker Pool<br/>- 连接亲和性分片 (SubmitConn FIFO)<br/>- 跨分片工作窃取 (Work-Stealing)<br/>- 空闲 Worker 自动弹性伸缩"]
-        Handler["HTTP 业务: s.Handler.ServeHTTP(w, req)<br/>支持流式 io.Copy / Range / 静态文件"]
-        WSCallback["WebSocket 业务: OnMessage(c, op, payload)<br/>业务回调结束隐式归还内存池"]
-    end
-
-    subgraph WritePath["输出直写链路 (Write Path)"]
-        Writev["writev 向量化零拷贝合并<br/>(栈上帧头 + Payload 直达网卡)"]
-        SocketCheck{"内核发送缓冲区满?"}
-        DirectOut["直达网卡 (0 调度延迟)"]
-        QueueFlush["追加至 VirtualConn 队列<br/>Reactor 监听 EPOLLOUT 后台冲刷"]
-    end
-
-    %% 连接与数据流
-    C1 & C2 & C3 -->|"TCP 连接"| MainR
-    MainR -->|"轮询分发新连接"| SR1 & SR2 & SRN
-    MainR -.->|"注册槽位"| ConnTable
-    SR1 & SR2 & SRN <-->|"读写事件驱动"| VC
-
-    %% HTTP 读流
-    VC --> HeaderDet
-    HeaderDet --"未完整"--> Slowloris
-    HeaderDet --"已完整"--> WP
-    
-    %% WebSocket 读流
-    VC --> WSHdr --> Unmask
-    Unmask -->|"<= 64KB"| P1
-    Unmask -->|"> 64KB"| StreamAsm
-    P1 & StreamAsm --> Backpressure
-    Backpressure --"超阈值"-->|"PauseRead 暂停"| SR1
-    Backpressure --"正常排队"--> WP
-
-    %% 业务调度
-    WP --> Handler
-    WP --> WSCallback
-    
-    %% 写回
-    Handler & WSCallback --> Writev --> SocketCheck
-    SocketCheck --"未满"--> DirectOut
-    SocketCheck --"已满"--> QueueFlush
-    QueueFlush -.->|"可写通知"| SR1
+```text
+客户端
+  |
+  v
+Main Reactor（accept）
+  |
+  v
+Sub-Reactor（epoll / kqueue）---- 空闲连接停在这里，0 协程
+  |
+  +-- HTTP：头部收齐（\r\n\r\n）--> 协程池 --> ServeHTTP
+  |
+  +-- WebSocket：完整帧 --> 解掩码 --> 缓冲池 --> 协程池 --> OnMessage
+  |                 |
+  |                 +-- 积压过高 --> 暂停读取
+  |
+  v
+写出：writev 直达 socket
+  |
+  +-- 内核缓冲满 --> 排队，可写时由 Reactor 刷出
 ```
 
 ---

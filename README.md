@@ -22,90 +22,25 @@ I/O is driven by native multi-reactor pollers (**epoll** on Linux, **kqueue** on
 
 fnet employs a hybrid high-performance architecture: **Multi-Reactor Event-Driven I/O + VirtualConn Bridge + Sharded Concurrent Worker Pool**. It combines the near-zero resource cost of reactor-driven millions of concurrent connections with full compatibility for standard Go blocking business logic.
 
-```mermaid
-flowchart TB
-    subgraph ClientLayer["Client Layer"]
-        C1["HTTP Client"]
-        C2["WebSocket Client 1"]
-        C3["WebSocket Client N (1M+)"]
-    end
-
-    subgraph PollerLayer["Multi-Reactor Event-Driven Layer (I/O Multiplexing)"]
-        MainR["Main Reactor (Listener Poller)<br/>Non-blocking accept4 / kevent"]
-        
-        subgraph SubReactors["Sub-Reactors (Matching CPU Cores)"]
-            SR1["Sub-Reactor 1<br/>(epoll / kqueue)"]
-            SR2["Sub-Reactor 2<br/>(epoll / kqueue)"]
-            SRN["Sub-Reactor N<br/>(epoll / kqueue)"]
-        end
-        
-        ConnTable[("Lock-Free Chunked Conn Table<br/>(O(1) indexing, 1M+ low footprint)")]
-    end
-
-    subgraph CoreEngine["Protocol Framing & Flow Control (Core Engine)"]
-        direction TB
-        VC["VirtualConn Bridge<br/>Standard net.Conn Adapter"]
-        
-        subgraph WSPath["WebSocket Fast Path"]
-            WSHdr["Frame Header Decode (Zero-Alloc)"]
-            Unmask["SIMD / SWAR In-Place Unmasking"]
-            
-            subgraph SlabPool["Multi-Tier Slab Buffer Pool"]
-                P1["Small Buffers: 128B ~ 64KB"]
-                P2["Large Buffers: 128KB ~ 16MB"]
-            end
-            
-            StreamAsm["Streaming Frame Assembler<br/>(Direct fill into Slab Pool, 0 re-alloc)"]
-            Backpressure{"Silent Backpressure<br/>(Pending Bytes > 4MB?)"}
-        end
-        
-        subgraph HTTPPath["HTTP / HTTPS Path"]
-            HeaderDet{"Header Detection<br/>HasCompleteHeader (\r\n\r\n)"}
-            Slowloris["Slowloris Defense / 64KB Cap"]
-        end
-    end
-
-    subgraph WorkerPoolLayer["Sharded Worker Pool Layer"]
-        WP["Sharded Worker Pool<br/>- Per-connection affinity (SubmitConn FIFO)<br/>- Work-stealing across shards<br/>- Idle worker auto-reclamation"]
-        Handler["HTTP Handler: s.Handler.ServeHTTP(w, req)<br/>Supports streaming io.Copy / Range / Static files"]
-        WSCallback["WebSocket: OnMessage(c, op, payload)<br/>Implicit buffer recycling on callback return"]
-    end
-
-    subgraph WritePath["Write & Output Path"]
-        Writev["writev Zero-Copy Scatter-Gather<br/>(Stack header + Payload direct to kernel)"]
-        SocketCheck{"Kernel send buffer full?"}
-        DirectOut["Direct to NIC (0 dispatch latency)"]
-        QueueFlush["Queue to VirtualConn outBuf<br/>Reactor drains via EPOLLOUT"]
-    end
-
-    %% Connections and Data Flow
-    C1 & C2 & C3 -->|"TCP Conns"| MainR
-    MainR -->|"Round-robin distribution"| SR1 & SR2 & SRN
-    MainR -.->|"Register slot"| ConnTable
-    SR1 & SR2 & SRN <-->|"Read/Write Events"| VC
-
-    %% HTTP Read Flow
-    VC --> HeaderDet
-    HeaderDet --"Incomplete"--> Slowloris
-    HeaderDet --"Complete"--> WP
-    
-    %% WebSocket Read Flow
-    VC --> WSHdr --> Unmask
-    Unmask -->|"<= 64KB"| P1
-    Unmask -->|"> 64KB"| StreamAsm
-    P1 & StreamAsm --> Backpressure
-    Backpressure --"Exceeded"-->|"PauseRead"| SR1
-    Backpressure --"Normal"--> WP
-
-    %% Business Dispatch
-    WP --> Handler
-    WP --> WSCallback
-    
-    %% Write Back
-    Handler & WSCallback --> Writev --> SocketCheck
-    SocketCheck --"Not Full"--> DirectOut
-    SocketCheck --"Full"--> QueueFlush
-    QueueFlush -.->|"Writable Event"| SR1
+```text
+Client
+  |
+  v
+Main Reactor (accept)
+  |
+  v
+Sub-Reactor (epoll / kqueue) ---- idle connection stays here, 0 goroutines
+  |
+  +-- HTTP: header complete (\r\n\r\n) --> Worker Pool --> ServeHTTP
+  |
+  +-- WebSocket: full frame --> unmask --> buffer pool --> Worker Pool --> OnMessage
+  |                 |
+  |                 +-- queued bytes too high --> pause read
+  |
+  v
+Write: writev to the socket
+  |
+  +-- kernel buffer full --> queue, reactor flushes on writable
 ```
 
 ---
