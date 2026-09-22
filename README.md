@@ -18,6 +18,120 @@ I/O is driven by native multi-reactor pollers (**epoll** on Linux, **kqueue** on
 
 ---
 
+## 🏗️ Architecture
+
+fnet employs a hybrid high-performance architecture: **Multi-Reactor Event-Driven I/O + VirtualConn Bridge + Sharded Concurrent Worker Pool**. It combines the near-zero resource cost of reactor-driven millions of concurrent connections with full compatibility for standard Go blocking business logic.
+
+```mermaid
+flowchart TB
+    subgraph ClientLayer["Client Layer"]
+        C1["HTTP Client"]
+        C2["WebSocket Client 1"]
+        C3["WebSocket Client N (1M+)"]
+    end
+
+    subgraph PollerLayer["Multi-Reactor Event-Driven Layer (I/O Multiplexing)"]
+        MainR["Main Reactor (Listener Poller)<br/>Non-blocking accept4 / kevent"]
+        
+        subgraph SubReactors["Sub-Reactors (Matching CPU Cores)"]
+            SR1["Sub-Reactor 1<br/>(epoll / kqueue)"]
+            SR2["Sub-Reactor 2<br/>(epoll / kqueue)"]
+            SRN["Sub-Reactor N<br/>(epoll / kqueue)"]
+        end
+        
+        ConnTable[("Lock-Free Chunked Conn Table<br/>(O(1) indexing, 1M+ low footprint)")]
+    end
+
+    subgraph CoreEngine["Protocol Framing & Flow Control (Core Engine)"]
+        direction TB
+        VC["VirtualConn Bridge<br/>Standard net.Conn Adapter"]
+        
+        subgraph WSPath["WebSocket Fast Path"]
+            WSHdr["Frame Header Decode (Zero-Alloc)"]
+            Unmask["SIMD / SWAR In-Place Unmasking"]
+            
+            subgraph SlabPool["Multi-Tier Slab Buffer Pool"]
+                P1["Small Buffers: 128B ~ 64KB"]
+                P2["Large Buffers: 128KB ~ 16MB"]
+            end
+            
+            StreamAsm["Streaming Frame Assembler<br/>(Direct fill into Slab Pool, 0 re-alloc)"]
+            Backpressure{"Silent Backpressure<br/>(Pending Bytes > 4MB?)"}
+        end
+        
+        subgraph HTTPPath["HTTP / HTTPS Path"]
+            HeaderDet{"Header Detection<br/>HasCompleteHeader (\r\n\r\n)"}
+            Slowloris["Slowloris Defense / 64KB Cap"]
+        end
+    end
+
+    subgraph WorkerPoolLayer["Sharded Worker Pool Layer"]
+        WP["Sharded Worker Pool<br/>- Per-connection affinity (SubmitConn FIFO)<br/>- Work-stealing across shards<br/>- Idle worker auto-reclamation"]
+        Handler["HTTP Handler: s.Handler.ServeHTTP(w, req)<br/>Supports streaming io.Copy / Range / Static files"]
+        WSCallback["WebSocket: OnMessage(c, op, payload)<br/>Implicit buffer recycling on callback return"]
+    end
+
+    subgraph WritePath["Write & Output Path"]
+        Writev["writev Zero-Copy Scatter-Gather<br/>(Stack header + Payload direct to kernel)"]
+        SocketCheck{"Kernel send buffer full?"}
+        DirectOut["Direct to NIC (0 dispatch latency)"]
+        QueueFlush["Queue to VirtualConn outBuf<br/>Reactor drains via EPOLLOUT"]
+    end
+
+    %% Connections and Data Flow
+    C1 & C2 & C3 -->|"TCP Conns"| MainR
+    MainR -->|"Round-robin distribution"| SR1 & SR2 & SRN
+    MainR -.->|"Register slot"| ConnTable
+    SR1 & SR2 & SRN <-->|"Read/Write Events"| VC
+
+    %% HTTP Read Flow
+    VC --> HeaderDet
+    HeaderDet --"Incomplete"--> Slowloris
+    HeaderDet --"Complete"--> WP
+    
+    %% WebSocket Read Flow
+    VC --> WSHdr --> Unmask
+    Unmask -->|"<= 64KB"| P1
+    Unmask -->|"> 64KB"| StreamAsm
+    P1 & StreamAsm --> Backpressure
+    Backpressure --"Exceeded"-->|"PauseRead"| SR1
+    Backpressure --"Normal"--> WP
+
+    %% Business Dispatch
+    WP --> Handler
+    WP --> WSCallback
+    
+    %% Write Back
+    Handler & WSCallback --> Writev --> SocketCheck
+    SocketCheck --"Not Full"--> DirectOut
+    SocketCheck --"Full"--> QueueFlush
+    QueueFlush -.->|"Writable Event"| SR1
+```
+
+---
+
+## Core Design Principles
+
+### 1. 1M Conns "Zero-Goroutine While Idle"
+* **Idle Connections**: Live sockets wait directly on the reactor's epoll/kqueue set, taking only a single pointer slot in the global chunked connection table. Idle connections hold **0 goroutines, 0 workers, and 0 read/write buffers**.
+* **Lock-Free Chunked Table**: 2048-entry atomic pointer chunks allow $O(1)$ concurrent lookups for 1M+ active connections without global lock contention during scaling.
+
+### 2. High-Performance HTTP & Streaming
+* **Immediate Header Dispatch**: Sub-reactors continuously receive TCP streams and immediately dispatch the connection to the worker pool upon detecting a complete header (`\r\n\r\n`), without waiting for the body to finish downloading.
+* **Large File & `io.Copy` Streaming**: `VirtualConn` provides true `net.Conn` semantics. In handlers, `io.Copy(dst, req.Body)` streams data directly to disk as chunks arrive, maintaining a constant memory footprint of ~32KB regardless of whether the file is 100MB or 1GB.
+
+### 3. WebSocket Throughput & Large Frame Optimization
+* **Zero-Allocation In-Place Framing**: Headers are decoded directly on the reactor's 64KB shared read buffer. Client payloads are unmasked in place using **SIMD (AVX2 / NEON)** vector instructions.
+* **Tiered Slab Buffer Pool**: Comprehensive buffer pools cover sizes from 128B up to 16MB. Frames within 16MB require **0 heap allocations**.
+* **Streaming Frame Assembler**: Large frames (>64KB) stream directly into dedicated slab buffers, completely avoiding repeated `append` reallocations. Buffer ownership is handed off to tasks and automatically returned upon callback exit with zero user burden.
+* **Silent Backpressure**: If queued, unprocessed payload bytes exceed the threshold (default 4MB), `PauseRead` automatically suspends socket reads, using TCP sliding windows to throttle sender throughput and eliminate OOM risks.
+
+### 4. Direct Output & Vector I/O (`writev`)
+* **Fast-Path Direct Writes**: Senders prioritize direct non-blocking writes to the socket. As long as the kernel send buffer is not saturated, output bypasses the reactor entirely with 0 dispatch overhead.
+* **Scatter-Gather Framing**: Stack-formatted 2~10 byte headers and payload slices are merged into single `writev` syscalls, eliminating user-space frame assembly buffer copies.
+
+---
+
 ## Features
 
 - **Standard `net/http` API**: Direct drop-in for `http.Handler` / `http.ServeMux` via `fnet.ListenAndServe` and `fnet.ListenAndServeTLS`.

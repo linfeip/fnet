@@ -18,6 +18,120 @@
 
 ---
 
+## 🏗️ 整体架构图
+
+fnet 采用**“多 Reactor 事件驱动 I/O + VirtualConn 虚拟抽象桥梁 + 分片工作协程池”**的混合高性能架构。既享有 Reactor 驱动百万级并发连接的超轻量开销，又完整兼容 Go 标准库的阻塞式业务逻辑。
+
+```mermaid
+flowchart TB
+    subgraph ClientLayer["客户端层 (Clients)"]
+        C1["HTTP Client"]
+        C2["WebSocket Client 1"]
+        C3["WebSocket Client N (1M+)"]
+    end
+
+    subgraph PollerLayer["多 Reactor 事件驱动层 (I/O Multiplexing)"]
+        MainR["Main Reactor (主轮询器)<br/>非阻塞 accept4 / kevent"]
+        
+        subgraph SubReactors["Sub-Reactors (匹配 CPU 核心数)"]
+            SR1["Sub-Reactor 1<br/>(epoll / kqueue)"]
+            SR2["Sub-Reactor 2<br/>(epoll / kqueue)"]
+            SRN["Sub-Reactor N<br/>(epoll / kqueue)"]
+        end
+        
+        ConnTable[("全局分块连接表<br/>Lock-Free Conn Table<br/>(O(1) 索引, 1M+ 极低开销)")]
+    end
+
+    subgraph CoreEngine["协议编解码与流控核心 (Core Engine)"]
+        direction TB
+        VC["VirtualConn (虚拟连接桥梁)<br/>标准 net.Conn 兼容适配"]
+        
+        subgraph WSPath["WebSocket 极速链路"]
+            WSHdr["帧头解析 (Zero-Alloc)"]
+            Unmask["SIMD / SWAR 原地解掩码"]
+            
+            subgraph SlabPool["阶梯式分级对象池 (Slab Pool)"]
+                P1["小包池: 128B ~ 64KB"]
+                P2["大包池: 128KB ~ 16MB"]
+            end
+            
+            StreamAsm["大包流式组装器<br/>(直接灌入 Slab Pool，零重复拷贝)"]
+            Backpressure{"静默反压控制<br/>(待处理堆积 > 4MB?)"}
+        end
+        
+        subgraph HTTPPath["HTTP / HTTPS 链路"]
+            HeaderDet{"完整头部探测<br/>HasCompleteHeader (\r\n\r\n)"}
+            Slowloris["防慢速攻击超时/截断 (64KB)"]
+        end
+    end
+
+    subgraph WorkerPoolLayer["分片并发工作协程池 (Worker Pool Layer)"]
+        WP["Sharded Worker Pool<br/>- 连接亲和性分片 (SubmitConn FIFO)<br/>- 跨分片工作窃取 (Work-Stealing)<br/>- 空闲 Worker 自动弹性伸缩"]
+        Handler["HTTP 业务: s.Handler.ServeHTTP(w, req)<br/>支持流式 io.Copy / Range / 静态文件"]
+        WSCallback["WebSocket 业务: OnMessage(c, op, payload)<br/>业务回调结束隐式归还内存池"]
+    end
+
+    subgraph WritePath["输出直写链路 (Write Path)"]
+        Writev["writev 向量化零拷贝合并<br/>(栈上帧头 + Payload 直达网卡)"]
+        SocketCheck{"内核发送缓冲区满?"}
+        DirectOut["直达网卡 (0 调度延迟)"]
+        QueueFlush["追加至 VirtualConn 队列<br/>Reactor 监听 EPOLLOUT 后台冲刷"]
+    end
+
+    %% 连接与数据流
+    C1 & C2 & C3 -->|"TCP 连接"| MainR
+    MainR -->|"轮询分发新连接"| SR1 & SR2 & SRN
+    MainR -.->|"注册槽位"| ConnTable
+    SR1 & SR2 & SRN <-->|"读写事件驱动"| VC
+
+    %% HTTP 读流
+    VC --> HeaderDet
+    HeaderDet --"未完整"--> Slowloris
+    HeaderDet --"已完整"--> WP
+    
+    %% WebSocket 读流
+    VC --> WSHdr --> Unmask
+    Unmask -->|"<= 64KB"| P1
+    Unmask -->|"> 64KB"| StreamAsm
+    P1 & StreamAsm --> Backpressure
+    Backpressure --"超阈值"-->|"PauseRead 暂停"| SR1
+    Backpressure --"正常排队"--> WP
+
+    %% 业务调度
+    WP --> Handler
+    WP --> WSCallback
+    
+    %% 写回
+    Handler & WSCallback --> Writev --> SocketCheck
+    SocketCheck --"未满"--> DirectOut
+    SocketCheck --"已满"--> QueueFlush
+    QueueFlush -.->|"可写通知"| SR1
+```
+
+---
+
+## 核心设计与数据流转
+
+### 1. 百万连接“零协程常驻”模型
+* **空闲连接**：仅挂在 Reactor 的 epoll/kqueue 事件树上，在全局分块连接表中仅占一个指针槽位。连接空闲时不持有任何 Goroutine、不持有 Worker、不持有读写缓冲区。
+* **连接表设计**：采用分块（2048 槽位/块）原子指针数组，支持高达百万连接的并发 $O(1)$ 查找，杜绝高并发扩容锁争用。
+
+### 2. HTTP 极速流式链路
+* **头部就绪即调度**：Reactor 持续读取 TCP 数据，当检测到完整 HTTP 头部（`\r\n\r\n`）时立刻交割给 WorkerPool 执行 `ServeHTTP`，不等待 Body 接收完毕。
+* **支持大文件与 `io.Copy`**：通过 `VirtualConn` 实现标准 `net.Conn` 语义。在 Handler 中进行 `io.Copy(dst, req.Body)` 时，数据边从网卡读入边刷盘，无需在内存全量缓存，内存始终保持恒定几十 KB。
+
+### 3. WebSocket 高吞吐与大包优化
+* **原地无分配解析**：直接在 Reactor 共享的 64KB 读缓冲上解析帧头，并调用 `gobwas/ws` 通过 **SIMD（AVX2 / NEON）向量指令**原地解掩码（Unmask）。
+* **阶梯式分级对象池（Slab Pool）**：内置覆盖 128B 至 16MB 的多级缓冲区对象池，16MB 以内数据帧**完全零堆分配**（0 Heap Allocations）。
+* **大包流式组装器（Streaming Assembler）**：当遇到大于 64KB 的大包时，直接将网卡数据流式组装至专用的池化大缓冲区中，**彻底消除多次 `append` 扩容与中间全量内存拷贝**。组装完毕所有权直接移交 Task，`OnMessage` 退出后由框架底层安全自动回收。
+* **静默流控回压（Silent Backpressure）**：当某连接未处理的消息字节数超过阈值（默认 4MB）时，自动触发 `PauseRead` 暂停读取该连接 Socket，利用 TCP 滑动窗口物理压制发送端，从根本上杜绝大包瞬时并发导致的单机 OOM。
+
+### 4. 输出直写与向量化写入 (`writev`)
+* **直写优先（Fast Path）**：写出时优先执行非阻塞系统调用直达网卡，只要内核缓冲区未满，即可享受到 0 协程调度延迟的直出性能。
+* **零拷贝拼包**：通过 `WriteVector` (`writev`) 将栈上编码的 2~10 字节帧头与业务 Payload 直接合成 `iovec` 发送，避免在用户态进行拼包内存拷贝。
+
+---
+
 ## 特性
 
 - **标准 `net/http` 接口**：直接对接 `http.Handler` / `http.ServeMux`，支持 `fnet.ListenAndServe` 与 `fnet.ListenAndServeTLS`。
