@@ -156,12 +156,9 @@ func (w *responseWriter) WriteHeader(statusCode int) {
 	}
 }
 
-func (w *responseWriter) writeHeaderLocked() {
-	if w.wroteHeader {
-		return
-	}
-	w.wroteHeader = true
-
+// prepareHeaderLocked fills in the framing, Date and Connection fields and
+// records contentLength and chunked, without emitting any bytes.
+func (w *responseWriter) prepareHeaderLocked() {
 	if cl := w.header.Get("Content-Length"); cl != "" {
 		if n, err := strconv.ParseInt(cl, 10, 64); err == nil {
 			w.contentLength = n
@@ -182,12 +179,36 @@ func (w *responseWriter) writeHeaderLocked() {
 			w.header.Set("Connection", "keep-alive")
 		}
 	}
+}
 
-	buf := bufio.NewWriter(w.conn)
+// serializeHeaderLocked writes the status line and header block into buf.
+func (w *responseWriter) serializeHeaderLocked(buf *bytes.Buffer) {
+	buf.WriteString("HTTP/1.1 ")
+	buf.WriteString(strconv.Itoa(w.status))
+	buf.WriteByte(' ')
+	buf.WriteString(http.StatusText(w.status))
+	buf.WriteString("\r\n")
+	_ = w.header.Write(buf)
+	buf.WriteString("\r\n")
+}
+
+var hdrBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+func (w *responseWriter) writeHeaderLocked() {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	w.prepareHeaderLocked()
+
+	buf := writerPool.Get().(*bufio.Writer)
+	buf.Reset(w.conn)
 	fmt.Fprintf(buf, "HTTP/1.1 %d %s\r\n", w.status, http.StatusText(w.status))
 	_ = w.header.Write(buf)
 	_, _ = buf.WriteString("\r\n")
 	_ = buf.Flush()
+	buf.Reset(nil)
+	writerPool.Put(buf)
 }
 
 func (w *responseWriter) Write(b []byte) (int, error) {
@@ -289,6 +310,31 @@ func (w *responseWriter) finish() error {
 				}
 				w.header.Set("Content-Length", strconv.FormatInt(n, 10))
 			}
+		}
+
+		// Fast path: the whole body is already buffered, so the headers and the
+		// body can leave in a single write instead of two. Mirrors what
+		// ws_frame.go does for frame header + payload.
+		if !bodyless && !w.chunked && w.header.Get("Transfer-Encoding") != "chunked" {
+			w.wroteHeader = true
+			w.prepareHeaderLocked()
+			hb := hdrBufPool.Get().(*bytes.Buffer)
+			hb.Reset()
+			w.serializeHeaderLocked(hb)
+
+			var err error
+			if wv, ok := w.conn.(interface {
+				WriteVector([][]byte) (int, error)
+			}); ok && w.bodyBuf.Len() > 0 {
+				_, err = wv.WriteVector([][]byte{hb.Bytes(), w.bodyBuf.Bytes()})
+			} else {
+				// No writev (e.g. *tls.Conn): still one syscall, via one buffer.
+				hb.Write(w.bodyBuf.Bytes())
+				_, err = w.conn.Write(hb.Bytes())
+			}
+			w.bodyBuf.Reset()
+			hdrBufPool.Put(hb)
+			return err
 		}
 		w.writeHeaderLocked()
 	}

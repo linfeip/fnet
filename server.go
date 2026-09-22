@@ -978,7 +978,7 @@ func (s *Server) serveConn(c *conn) {
 			s.closeConn(c)
 			return
 		}
-		req.RemoteAddr = c.vc.RemoteAddr().String()
+		req.RemoteAddr = c.vc.RemoteAddrString()
 		req.TLS = tlsState
 
 		if s.WriteTimeout > 0 {

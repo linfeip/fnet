@@ -38,6 +38,10 @@ type VirtualConn struct {
 	raddrPort uint16
 	raddrLen  uint8 // 4 for IPv4, 16 for IPv6, 0 for unset
 
+	// raddrStr caches the textual peer address. It never changes for the life
+	// of the connection, so re-formatting it per request is wasted work.
+	raddrStr atomic.Value // string
+
 	fd int
 	c  *conn
 
@@ -635,6 +639,17 @@ func (vc *VirtualConn) RemoteAddr() net.Addr {
 		}
 	}
 	return &net.TCPAddr{}
+}
+
+// RemoteAddrString returns the textual peer address, formatting it once per
+// connection rather than once per request.
+func (vc *VirtualConn) RemoteAddrString() string {
+	if s, ok := vc.raddrStr.Load().(string); ok {
+		return s
+	}
+	s := vc.RemoteAddr().String()
+	vc.raddrStr.Store(s)
+	return s
 }
 
 // SetDeadline implements net.Conn.
