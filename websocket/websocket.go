@@ -107,6 +107,7 @@ type EventHandler struct {
 type wsTask struct {
 	op           OpCode
 	payload      []byte
+	pooled       *pooledBuffer
 	isCompressed bool
 }
 
@@ -123,6 +124,7 @@ type wsHandlerBridge struct {
 	workerPool func(task func())
 	queueMu    sync.Mutex
 	queue      []wsTask
+	batch      []wsTask
 	running    bool
 	closed     bool
 	closeOnce  sync.Once
@@ -143,23 +145,28 @@ func (b *wsHandlerBridge) OnMessage(opcode byte, payload []byte) {
 }
 
 func (b *wsHandlerBridge) enqueueTask(op OpCode, payload []byte, isCompressed bool) {
-	var copied []byte
-	if len(payload) > 0 {
-		copied = make([]byte, len(payload))
-		copy(copied, payload)
+	if len(payload) == 0 {
+		b.enqueueTaskOwned(op, nil, nil, isCompressed)
+		return
 	}
-	b.enqueueTaskOwned(op, copied, isCompressed)
+	buf, pb := getPayloadBuffer(len(payload))
+	copy(buf, payload)
+	b.enqueueTaskOwned(op, buf, pb, isCompressed)
 }
 
-func (b *wsHandlerBridge) enqueueTaskOwned(op OpCode, payload []byte, isCompressed bool) {
+func (b *wsHandlerBridge) enqueueTaskOwned(op OpCode, payload []byte, pooled *pooledBuffer, isCompressed bool) {
 	b.queueMu.Lock()
 	if b.closed {
 		b.queueMu.Unlock()
+		if pooled != nil {
+			putPayloadBuffer(pooled)
+		}
 		return
 	}
 	b.queue = append(b.queue, wsTask{
 		op:           op,
 		payload:      payload,
+		pooled:       pooled,
 		isCompressed: isCompressed,
 	})
 	if !b.running {
@@ -184,49 +191,73 @@ func (b *wsHandlerBridge) processQueue() {
 		b.queueMu.Lock()
 		if len(b.queue) == 0 || b.closed {
 			b.running = false
-			b.queue = nil
+			b.queue = b.queue[:0]
 			b.queueMu.Unlock()
 			return
 		}
-		task := b.queue[0]
-		b.queue[0] = wsTask{}
-		b.queue = b.queue[1:]
+		// Batch drain: swap active queue with local batch slice to minimize lock duration
+		b.batch, b.queue = b.queue, b.batch[:0]
 		b.queueMu.Unlock()
 
-		msgPayload := task.payload
-		if task.isCompressed {
-			decompressed, err := decompressMessage(task.payload, b.conn.maxDecompressSize)
-			if err != nil {
-				if errors.Is(err, ErrMessageTooBig) {
-					_ = b.conn.CloseWithStatus(ws.StatusMessageTooBig, "decompressed message too large")
-				} else {
-					_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "decompression error")
-				}
-				b.queueMu.Lock()
-				b.closed = true
-				b.queue = nil
-				b.running = false
-				b.queueMu.Unlock()
-				b.OnClose(err)
-				return
-			}
-			msgPayload = decompressed
-		}
+		for i := range b.batch {
+			task := b.batch[i]
+			b.batch[i] = wsTask{} // Clear pointer for GC
 
-		if task.op == OpText && !utf8.Valid(msgPayload) {
-			_ = b.conn.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8 in text message")
-			b.queueMu.Lock()
-			b.closed = true
-			b.queue = nil
-			b.running = false
-			b.queueMu.Unlock()
+			if b.closed {
+				if task.pooled != nil {
+					putPayloadBuffer(task.pooled)
+				}
+				continue
+			}
+
+			b.executeTask(task)
+			if task.pooled != nil {
+				putPayloadBuffer(task.pooled)
+			}
+		}
+		b.batch = b.batch[:0]
+	}
+}
+
+func (b *wsHandlerBridge) executeTask(task wsTask) {
+	msgPayload := task.payload
+	if task.isCompressed {
+		decompressed, err := decompressMessage(task.payload, b.conn.maxDecompressSize)
+		if err != nil {
+			if errors.Is(err, ErrMessageTooBig) {
+				_ = b.conn.CloseWithStatus(ws.StatusMessageTooBig, "decompressed message too large")
+			} else {
+				_ = b.conn.CloseWithStatus(ws.StatusProtocolError, "decompression error")
+			}
+			b.markClosed()
+			b.OnClose(err)
 			return
 		}
-
-		if b.handler.OnMessage != nil {
-			b.handler.OnMessage(b.conn, task.op, msgPayload)
-		}
+		msgPayload = decompressed
 	}
+
+	if task.op == OpText && !utf8.Valid(msgPayload) {
+		_ = b.conn.CloseWithStatus(ws.StatusInvalidFramePayloadData, "invalid UTF-8 in text message")
+		b.markClosed()
+		return
+	}
+
+	if b.handler.OnMessage != nil {
+		b.handler.OnMessage(b.conn, task.op, msgPayload)
+	}
+}
+
+func (b *wsHandlerBridge) markClosed() {
+	b.queueMu.Lock()
+	b.closed = true
+	for i := range b.queue {
+		if b.queue[i].pooled != nil {
+			putPayloadBuffer(b.queue[i].pooled)
+		}
+		b.queue[i] = wsTask{}
+	}
+	b.queue = b.queue[:0]
+	b.queueMu.Unlock()
 }
 
 func checkClosePayload(payload []byte) (ws.StatusCode, bool) {
@@ -304,7 +335,7 @@ func (b *wsHandlerBridge) OnFrame(h ws.Header, payload []byte) {
 		b.fragBuf = b.fragBuf[:0]
 		b.fragComp = false
 
-		b.enqueueTaskOwned(op, fullPayload, isComp)
+		b.enqueueTaskOwned(op, fullPayload, nil, isComp)
 		return
 	}
 }
@@ -312,7 +343,13 @@ func (b *wsHandlerBridge) OnFrame(h ws.Header, payload []byte) {
 func (b *wsHandlerBridge) OnClose(err error) {
 	b.queueMu.Lock()
 	b.closed = true
-	b.queue = nil
+	for i := range b.queue {
+		if b.queue[i].pooled != nil {
+			putPayloadBuffer(b.queue[i].pooled)
+		}
+		b.queue[i] = wsTask{}
+	}
+	b.queue = b.queue[:0]
 	b.queueMu.Unlock()
 
 	b.closeOnce.Do(func() {

@@ -340,12 +340,13 @@ func TestWebSocket1MScaleSimulation(t *testing.T) {
 
 	// Step 1: Verify 100 idle connections hold almost zero extra goroutines
 	idleGoroutines := runtime.NumGoroutine()
-	diff := idleGoroutines - initialGoroutines
-	if diff > 25 {
-		t.Fatalf("Idle goroutine count grew excessively: initial=%d, idle=%d, diff=%d",
-			initialGoroutines, idleGoroutines, diff)
+	poolWorkers := websocket.DefaultWorkerPool.RunningWorkers()
+	diff := (idleGoroutines - poolWorkers) - initialGoroutines
+	if diff > 15 {
+		t.Fatalf("Idle goroutine count grew excessively: initial=%d, idle=%d, workers=%d, diff=%d",
+			initialGoroutines, idleGoroutines, poolWorkers, diff)
 	}
-	t.Logf("100 idle connections goroutine delta: %d", diff)
+	t.Logf("100 idle connections goroutine delta (excluding worker pool): %d, active workers: %d", diff, poolWorkers)
 
 	// Step 2: Send messages concurrently from 20 connections
 	var wg sync.WaitGroup

@@ -233,6 +233,8 @@ func (s *workerShard) workerLoop(firstTask func()) {
 
 	timer := time.NewTimer(s.idleTimeout)
 	defer timer.Stop()
+	lastReset := time.Now()
+	halfTimeout := s.idleTimeout / 2
 
 	for {
 		s.idleWorkers.Add(1)
@@ -244,13 +246,33 @@ func (s *workerShard) workerLoop(firstTask func()) {
 			}
 			runSafe(task)
 
-			if !timer.Stop() {
+			// Drain already queued tasks in batch without touching runtime timer
+			for {
 				select {
-				case <-timer.C:
+				case nextTask, ok := <-s.tasks:
+					if !ok {
+						return
+					}
+					runSafe(nextTask)
 				default:
+					goto drained
 				}
 			}
-			timer.Reset(s.idleTimeout)
+
+		drained:
+			// Only refresh timer if at least half of idleTimeout has elapsed,
+			// eliminating millions of timer.Stop/Reset calls under continuous traffic.
+			now := time.Now()
+			if now.Sub(lastReset) >= halfTimeout {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(s.idleTimeout)
+				lastReset = now
+			}
 
 		case <-timer.C:
 			s.idleWorkers.Add(-1)
