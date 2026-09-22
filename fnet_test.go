@@ -470,7 +470,7 @@ func TestServerCustomWorkerPoolPanicRecoveryAndGracefulClose(t *testing.T) {
 	srv := &Server{
 		Addr:    addr,
 		Handler: mux,
-		WorkerPool: func(task func()) {
+		WorkerPool: func(connID uint64, task func()) {
 			panic("simulated custom pool rejection/panic")
 		},
 	}

@@ -22,3 +22,7 @@ func SetDefaultWorkerPool(p *WorkerPool) {
 	fnet.SetDefaultWorkerPool(p)
 	DefaultWorkerPool = p
 }
+
+// AdaptPool adapts a simple task submission function to a connection-aware WorkerPool function.
+var AdaptPool = fnet.AdaptPool
+

@@ -146,7 +146,7 @@ func TestHTTPWorkerPool_KeepAliveIdleZeroGoroutines(t *testing.T) {
 	srv := &fnet.Server{
 		Addr:       addr,
 		Handler:    mux,
-		WorkerPool: testPool.Submit,
+		WorkerPool: testPool.SubmitConn,
 	}
 
 	go func() { _ = srv.ListenAndServe() }()
@@ -259,7 +259,7 @@ func TestHTTPWorkerPool_CustomPool(t *testing.T) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	var customPoolDispatched atomic.Int64
-	customPool := func(task func()) {
+	customPool := func(connID uint64, task func()) {
 		customPoolDispatched.Add(1)
 		go task()
 	}
@@ -479,7 +479,7 @@ func TestWorkerPool_PowerOfTwoChoicesBalance(t *testing.T) {
 }
 
 func TestWorkerPool_ServerAndUpgraderCustomPool(t *testing.T) {
-	// Test passing custom *WorkerPool directly via Server.Pool
+	// Test passing custom *WorkerPool directly via Server.WorkerPool (SubmitConn)
 	customPool := fnet.NewWorkerPool(fnet.WorkerPoolConfig{
 		Shards:             4,
 		MaxWorkersPerShard: 8,
@@ -500,9 +500,9 @@ func TestWorkerPool_ServerAndUpgraderCustomPool(t *testing.T) {
 	})
 
 	srv := &fnet.Server{
-		Addr:    addr,
-		Handler: mux,
-		Pool:    customPool,
+		Addr:       addr,
+		Handler:    mux,
+		WorkerPool: customPool.SubmitConn,
 	}
 
 	go func() { _ = srv.ListenAndServe() }()
@@ -552,4 +552,31 @@ func TestWorkerPool_ConcurrentCloseAndSubmit(t *testing.T) {
 	pool.Close()
 	wg.Wait()
 }
+
+func TestWorkerPool_AdaptPool(t *testing.T) {
+	var count atomic.Int64
+	legacySubmit := func(task func()) {
+		count.Add(1)
+		task()
+	}
+
+	adapted := fnet.AdaptPool(legacySubmit)
+	if adapted == nil {
+		t.Fatal("expected non-nil adapted pool")
+	}
+
+	var executed atomic.Bool
+	adapted(12345, func() {
+		executed.Store(true)
+	})
+
+	if count.Load() != 1 || !executed.Load() {
+		t.Fatalf("expected legacySubmit to execute task, count=%d, executed=%v", count.Load(), executed.Load())
+	}
+
+	if fnet.AdaptPool(nil) != nil {
+		t.Fatal("expected nil for nil submit function")
+	}
+}
+
 

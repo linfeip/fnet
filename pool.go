@@ -497,3 +497,14 @@ func SetDefaultWorkerPool(p *WorkerPool) {
 // DefaultWorkerPool is the globally shared, highly scalable default WorkerPool.
 // Idle connections hold zero goroutines inside this pool.
 var DefaultWorkerPool = NewWorkerPool()
+
+// AdaptPool adapts a simple task submission function (such as ants.Submit, pool.Submit, or a custom scheduler)
+// to a connection-aware WorkerPool function by ignoring the connection ID.
+func AdaptPool(submit func(task func())) func(connID uint64, task func()) {
+	if submit == nil {
+		return nil
+	}
+	return func(_ uint64, task func()) {
+		submit(task)
+	}
+}

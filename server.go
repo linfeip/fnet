@@ -47,14 +47,10 @@ type Server struct {
 	// When nil, net.ListenConfig with SO_REUSEADDR and SO_REUSEPORT is used.
 	Listen func(network, addr string) (net.Listener, error)
 
-	// WorkerPool is an optional worker pool function (e.g. pool.Submit, ants.Submit, or custom scheduler)
-	// used to execute HTTP worker tasks.
-	// If nil, Pool (if set) or fnet.DefaultWorkerPool is automatically used.
-	WorkerPool func(task func())
-
-	// Pool is an optional custom *WorkerPool instance.
-	// When provided, requests are scheduled using SubmitConn for connection affinity and work-stealing.
-	Pool *WorkerPool
+	// WorkerPool is an optional worker pool function (e.g. pool.SubmitConn, or fnet.AdaptPool(ants.Submit))
+	// used to execute HTTP worker tasks with connection affinity.
+	// If nil, fnet.DefaultWorkerPool.SubmitConn is automatically used.
+	WorkerPool func(connID uint64, task func())
 
 	lnMu        sync.Mutex
 	listeners   map[int]net.Addr // listener fd -> local address
@@ -727,12 +723,8 @@ func (s *Server) dispatchWorker(c *conn) {
 					s.closeConn(c)
 				}
 			}()
-			s.WorkerPool(task)
+			s.WorkerPool(uint64(c.fd), task)
 		}()
-		return
-	}
-	if s.Pool != nil {
-		s.Pool.SubmitConn(uint64(c.fd), task)
 		return
 	}
 	DefaultWorkerPool.SubmitConn(uint64(c.fd), task)

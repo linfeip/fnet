@@ -380,3 +380,26 @@ func TestWebSocket1MScaleSimulation(t *testing.T) {
 
 	t.Logf("Successfully verified %d burst messages dispatched cleanly through worker pool", expectedTotal)
 }
+
+func TestWebSocketWorkerPool_AdaptPool(t *testing.T) {
+	var count atomic.Int64
+	simpleSubmit := func(task func()) {
+		count.Add(1)
+		task()
+	}
+
+	adapted := websocket.AdaptPool(simpleSubmit)
+	if adapted == nil {
+		t.Fatal("expected non-nil adapted pool")
+	}
+
+	var executed atomic.Bool
+	adapted(8888, func() {
+		executed.Store(true)
+	})
+
+	if count.Load() != 1 || !executed.Load() {
+		t.Fatalf("expected simpleSubmit to run, count=%d, executed=%v", count.Load(), executed.Load())
+	}
+}
+
