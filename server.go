@@ -205,9 +205,10 @@ const (
 )
 
 const (
-	maxHeaderBuffer = 64 * 1024 // max buffered header bytes before a slow-loris connection is dropped
-	reactorBufSize  = 64 * 1024
-	pollTimeout     = time.Second
+	maxHeaderBuffer     = 64 * 1024 // max buffered header bytes before a slow-loris connection is dropped
+	reactorBufSize      = 64 * 1024
+	largeFrameThreshold = 64 * 1024
+	pollTimeout         = time.Second
 )
 
 type conn struct {
@@ -220,6 +221,7 @@ type conn struct {
 	closed          atomic.Bool
 	writeArmed      atomic.Bool // write interest registered with the poller
 	closeAfterFlush atomic.Bool // close once the outbound queue drains
+	readPaused      atomic.Bool // reading paused for backpressure
 
 	mu        sync.Mutex
 	wsHandler WSHandler
@@ -572,6 +574,9 @@ func (r *subReactor) handleRead(c *conn) {
 		r.discardRead(c)
 		return
 	}
+	if c.readPaused.Load() {
+		return
+	}
 	buf := r.rbuf
 	for {
 		n, err := readFD(c.fd, buf)
@@ -738,6 +743,29 @@ func (s *Server) dispatchWorker(c *conn) {
 // straight out of the reactor read buffer (zero copy); only an incomplete tail is
 // retained. Returns false if the connection was closed.
 func (s *Server) feedWS(c *conn, data []byte) bool {
+	c.mu.Lock()
+	handler := c.wsHandler
+	c.mu.Unlock()
+	asm, hasAsm := handler.(WSFrameAssembler)
+
+	if hasAsm && asm.IsAssembling() {
+		consumed, complete, err := asm.FeedFrame(data)
+		if err != nil {
+			s.closeConnWithErr(c, err)
+			return false
+		}
+		if c.closed.Load() {
+			return false
+		}
+		if !complete {
+			return true
+		}
+		data = data[consumed:]
+		if len(data) == 0 {
+			return true
+		}
+	}
+
 	vc := c.vc
 	if vc.InputLen() == 0 {
 		n, err := s.dispatchWSFrames(c, data)
@@ -781,6 +809,11 @@ func (s *Server) drainWS(c *conn) bool {
 // each. It returns the number of bytes consumed. Payloads are unmasked in place
 // and passed as sub-slices of data: they are only valid during the callback.
 func (s *Server) dispatchWSFrames(c *conn, data []byte) (int, error) {
+	c.mu.Lock()
+	handler := c.wsHandler
+	c.mu.Unlock()
+	asm, hasAsm := handler.(WSFrameAssembler)
+
 	off := 0
 	for off < len(data) {
 		h, hlen, ok, err := parseWSHeader(data[off:])
@@ -792,6 +825,13 @@ func (s *Server) dispatchWSFrames(c *conn, data []byte) (int, error) {
 		}
 		total := hlen + int(h.Length)
 		if len(data)-off < total {
+			if hasAsm && h.Length > largeFrameThreshold && !h.OpCode.IsControl() && h.Fin && h.OpCode != ws.OpContinuation {
+				initial := data[off+hlen:]
+				if asm.StartFrame(h, initial) {
+					off = len(data)
+					break
+				}
+			}
 			break
 		}
 		start, end := off+hlen, off+total
@@ -936,6 +976,10 @@ func (s *Server) closeConnWithErr(c *conn, err error) {
 
 	s.conns.delete(c.fd)
 	_ = c.vc.Close()
+
+	if asm, ok := handler.(WSFrameAssembler); ok {
+		asm.AbortFrame()
+	}
 
 	if handler != nil {
 		handler.OnClose(err)

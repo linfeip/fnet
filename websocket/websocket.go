@@ -35,6 +35,13 @@ const (
 // to protect against decompression bombs (zip bombs).
 const DefaultMaxDecompressedMessageSize int64 = 16 * 1024 * 1024
 
+// DefaultMaxMessageSize is the default limit (32MB) on incoming message payload size.
+const DefaultMaxMessageSize int64 = 32 * 1024 * 1024
+
+// DefaultMaxPendingMessageBytes is the default threshold (4MB) of queued payload bytes
+// before backpressure triggers, pausing reads on the connection.
+const DefaultMaxPendingMessageBytes int64 = 4 * 1024 * 1024
+
 // DefaultCompressionThreshold is the minimum payload size in bytes to trigger compression.
 const DefaultCompressionThreshold = 128
 
@@ -66,6 +73,16 @@ type Upgrader struct {
 	// If 0, DefaultMaxDecompressedMessageSize (16MB) is used.
 	// If negative, size limit is disabled (not recommended in production).
 	MaxDecompressedMessageSize int64
+
+	// MaxMessageSize limits the maximum allowable received payload size in bytes.
+	// If 0, DefaultMaxMessageSize (32MB) is used.
+	// If negative, size limit is disabled.
+	MaxMessageSize int64
+
+	// MaxPendingMessageBytes limits the maximum queued payload bytes waiting in the worker pool
+	// before pausing reads on the connection to prevent memory exhaustion (backpressure).
+	// Defaults to DefaultMaxPendingMessageBytes (4MB) if 0. If negative, backpressure is disabled.
+	MaxPendingMessageBytes int64
 
 	// CompressionLevel specifies the flate compression level (-1 to 9).
 	// If 0, flate.DefaultCompression (-1) is used.
@@ -116,6 +133,14 @@ type wsTask struct {
 
 var nextBridgeID atomic.Uint64
 
+type wsAssembler struct {
+	h        ws.Header
+	pb       *pooledBuffer
+	buf      []byte
+	received int
+	total    int
+}
+
 type wsHandlerBridge struct {
 	id         uint64
 	conn       *Conn
@@ -124,17 +149,24 @@ type wsHandlerBridge struct {
 	fragBuf    []byte
 	fragComp   bool
 
-	pool       *WorkerPool
-	workerPool func(task func())
-	queueMu    sync.Mutex
-	queue      []wsTask
-	batch      []wsTask
-	running    bool
-	closed     bool
-	closeOnce  sync.Once
+	pool            *WorkerPool
+	workerPool      func(task func())
+	queueMu         sync.Mutex
+	queue           []wsTask
+	batch           []wsTask
+	running         bool
+	closed          bool
+	closeOnce       sync.Once
+
+	asm             *wsAssembler
+	pendingBytes    atomic.Int64
+	maxPendingBytes int64
+	lowPendingBytes int64
+	readPaused      atomic.Bool
+	maxMessageSize  int64
 }
 
-var _ fnet.WSFrameHandler = (*wsHandlerBridge)(nil)
+var _ fnet.WSFrameAssembler = (*wsHandlerBridge)(nil)
 
 func (b *wsHandlerBridge) OnOpen() {
 	if b.handler.OnOpen != nil {
@@ -145,6 +177,98 @@ func (b *wsHandlerBridge) OnOpen() {
 func (b *wsHandlerBridge) OnMessage(opcode byte, payload []byte) {
 	if b.handler.OnMessage != nil {
 		b.handler.OnMessage(b.conn, OpCode(opcode), payload)
+	}
+}
+
+type readPauser interface {
+	PauseRead()
+	ResumeRead()
+}
+
+func (b *wsHandlerBridge) pauseRead() {
+	if b.readPaused.CompareAndSwap(false, true) {
+		if rp, ok := b.conn.conn.(readPauser); ok {
+			rp.PauseRead()
+		}
+	}
+}
+
+func (b *wsHandlerBridge) resumeRead() {
+	if b.readPaused.CompareAndSwap(true, false) {
+		if rp, ok := b.conn.conn.(readPauser); ok {
+			rp.ResumeRead()
+		}
+	}
+}
+
+func (b *wsHandlerBridge) IsAssembling() bool {
+	return b.asm != nil
+}
+
+func (b *wsHandlerBridge) StartFrame(h ws.Header, initial []byte) bool {
+	b.queueMu.Lock()
+	closed := b.closed
+	b.queueMu.Unlock()
+	if closed {
+		return false
+	}
+	if b.maxMessageSize > 0 && h.Length > b.maxMessageSize {
+		_ = b.conn.CloseWithStatus(ws.StatusMessageTooBig, "message too large")
+		return false
+	}
+	total := int(h.Length)
+	buf, pb := getPayloadBuffer(total)
+	n := copy(buf, initial)
+	b.asm = &wsAssembler{
+		h:        h,
+		pb:       pb,
+		buf:      buf,
+		received: n,
+		total:    total,
+	}
+	if n == total {
+		b.finishAssembly()
+	}
+	return true
+}
+
+func (b *wsHandlerBridge) FeedFrame(chunk []byte) (consumed int, complete bool, err error) {
+	asm := b.asm
+	if asm == nil {
+		return 0, false, nil
+	}
+	need := asm.total - asm.received
+	toCopy := len(chunk)
+	if toCopy > need {
+		toCopy = need
+	}
+	copy(asm.buf[asm.received:], chunk[:toCopy])
+	asm.received += toCopy
+	if asm.received < asm.total {
+		return toCopy, false, nil
+	}
+
+	b.finishAssembly()
+	return toCopy, true, nil
+}
+
+func (b *wsHandlerBridge) finishAssembly() {
+	asm := b.asm
+	b.asm = nil
+	if asm.h.Masked {
+		ws.Cipher(asm.buf, asm.h.Mask, 0)
+	}
+	isComp := b.conn.compressed && asm.h.Rsv1()
+	b.enqueueTaskOwned(OpCode(asm.h.OpCode), asm.buf, asm.pb, isComp)
+}
+
+func (b *wsHandlerBridge) AbortFrame() {
+	b.queueMu.Lock()
+	asm := b.asm
+	b.asm = nil
+	b.queueMu.Unlock()
+	if asm != nil && asm.pb != nil {
+		putPayloadBuffer(asm.pb)
 	}
 }
 
@@ -173,6 +297,12 @@ func (b *wsHandlerBridge) enqueueTaskOwned(op OpCode, payload []byte, pooled *po
 		pooled:       pooled,
 		isCompressed: isCompressed,
 	})
+	if b.maxPendingBytes > 0 {
+		cur := b.pendingBytes.Add(int64(len(payload)))
+		if cur > b.maxPendingBytes {
+			b.pauseRead()
+		}
+	}
 	if !b.running {
 		b.running = true
 		b.queueMu.Unlock()
@@ -213,12 +343,21 @@ func (b *wsHandlerBridge) processQueue() {
 				if task.pooled != nil {
 					putPayloadBuffer(task.pooled)
 				}
+				if b.maxPendingBytes > 0 {
+					b.pendingBytes.Add(-int64(len(task.payload)))
+				}
 				continue
 			}
 
 			b.executeTask(task)
 			if task.pooled != nil {
 				putPayloadBuffer(task.pooled)
+			}
+			if b.maxPendingBytes > 0 {
+				cur := b.pendingBytes.Add(-int64(len(task.payload)))
+				if cur <= b.lowPendingBytes && b.readPaused.Load() {
+					b.resumeRead()
+				}
 			}
 		}
 		b.batch = b.batch[:0]
@@ -264,7 +403,11 @@ func (b *wsHandlerBridge) markClosed() {
 		b.queue[i] = wsTask{}
 	}
 	b.queue = b.queue[:0]
+	b.pendingBytes.Store(0)
 	b.queueMu.Unlock()
+
+	b.AbortFrame()
+	b.resumeRead()
 }
 
 func checkClosePayload(payload []byte) (ws.StatusCode, bool) {
@@ -289,6 +432,11 @@ func checkClosePayload(payload []byte) (ws.StatusCode, bool) {
 }
 
 func (b *wsHandlerBridge) OnFrame(h ws.Header, payload []byte) {
+	if b.maxMessageSize > 0 && h.Length > b.maxMessageSize {
+		_ = b.conn.CloseWithStatus(ws.StatusMessageTooBig, "message too large")
+		return
+	}
+
 	// 1. RSV validation (RFC 6455 5.2 & RFC 7692 5.1)
 	if !b.conn.compressed {
 		if h.Rsv != 0 {
@@ -333,16 +481,27 @@ func (b *wsHandlerBridge) OnFrame(h ws.Header, payload []byte) {
 		return
 	}
 
+	if b.maxMessageSize > 0 && int64(len(b.fragBuf))+int64(len(payload)) > b.maxMessageSize {
+		_ = b.conn.CloseWithStatus(ws.StatusMessageTooBig, "message too large")
+		return
+	}
+
 	b.fragBuf = append(b.fragBuf, payload...)
 	if h.Fin {
 		op := b.fragOp
-		fullPayload := append([]byte(nil), b.fragBuf...)
 		isComp := b.fragComp
 		b.fragOp = 0
-		b.fragBuf = b.fragBuf[:0]
 		b.fragComp = false
 
-		b.enqueueTaskOwned(op, fullPayload, nil, isComp)
+		buf, pb := getPayloadBuffer(len(b.fragBuf))
+		copy(buf, b.fragBuf)
+		if cap(b.fragBuf) > 64*1024 {
+			b.fragBuf = nil
+		} else {
+			b.fragBuf = b.fragBuf[:0]
+		}
+
+		b.enqueueTaskOwned(op, buf, pb, isComp)
 		return
 	}
 }
@@ -357,7 +516,11 @@ func (b *wsHandlerBridge) OnClose(err error) {
 		b.queue[i] = wsTask{}
 	}
 	b.queue = b.queue[:0]
+	b.pendingBytes.Store(0)
 	b.queueMu.Unlock()
+
+	b.AbortFrame()
+	b.resumeRead()
 
 	b.closeOnce.Do(func() {
 		if b.handler.OnClose != nil {
@@ -411,12 +574,24 @@ func (u *Upgrader) UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventH
 		attacher = a
 	}
 
+	maxPending := u.MaxPendingMessageBytes
+	if maxPending == 0 {
+		maxPending = DefaultMaxPendingMessageBytes
+	}
+	var lowPending int64
+	if maxPending > 0 {
+		lowPending = maxPending / 2
+	}
+
 	bridge := &wsHandlerBridge{
-		id:         nextBridgeID.Add(1),
-		conn:       conn,
-		handler:    h,
-		pool:       u.Pool,
-		workerPool: u.WorkerPool,
+		id:              nextBridgeID.Add(1),
+		conn:            conn,
+		handler:         h,
+		pool:            u.Pool,
+		workerPool:      u.WorkerPool,
+		maxPendingBytes: maxPending,
+		lowPendingBytes: lowPending,
+		maxMessageSize:  conn.maxMessageSize,
 	}
 	if attacher != nil {
 		vc, err := attacher.AttachWS(bridge)
@@ -505,6 +680,10 @@ func (u *Upgrader) upgradeInternal(w http.ResponseWriter, r *http.Request) (*Con
 	if maxDecompress == 0 {
 		maxDecompress = DefaultMaxDecompressedMessageSize
 	}
+	maxMessage := u.MaxMessageSize
+	if maxMessage == 0 {
+		maxMessage = DefaultMaxMessageSize
+	}
 	compLevel := u.CompressionLevel
 	if compLevel == 0 {
 		compLevel = flate.DefaultCompression
@@ -521,6 +700,7 @@ func (u *Upgrader) upgradeInternal(w http.ResponseWriter, r *http.Request) (*Con
 		protocol:          hs.Protocol,
 		compressed:        compressAccepted,
 		maxDecompressSize: maxDecompress,
+		maxMessageSize:    maxMessage,
 		compressLevel:     compLevel,
 		compressThreshold: compThreshold,
 	}, nil
@@ -634,6 +814,7 @@ type Conn struct {
 	writeMu           sync.Mutex
 	compressed        bool
 	maxDecompressSize int64
+	maxMessageSize    int64
 	compressLevel     int
 	compressThreshold int
 }
@@ -646,6 +827,11 @@ func (c *Conn) IsCompressed() bool {
 // SetMaxDecompressedMessageSize updates the limit on decompressed message size for this connection.
 func (c *Conn) SetMaxDecompressedMessageSize(limit int64) {
 	c.maxDecompressSize = limit
+}
+
+// SetMaxMessageSize updates the limit on incoming message payload size for this connection.
+func (c *Conn) SetMaxMessageSize(limit int64) {
+	c.maxMessageSize = limit
 }
 
 // CloseWithStatus closes the connection with a specific WebSocket close status and reason.
@@ -774,6 +960,10 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 		}
 
 		// Data frame (Text, Binary)
+		if c.maxMessageSize > 0 && header.Length > c.maxMessageSize {
+			_ = c.CloseWithStatus(ws.StatusMessageTooBig, "message too large")
+			return 0, nil, ws.ErrHeaderLengthMSB
+		}
 		payload := make([]byte, header.Length)
 		if header.Length > 0 {
 			if _, err := io.ReadFull(c.reader, payload); err != nil {
@@ -862,6 +1052,10 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 			}
 
 			if nextHdr.Length > 0 {
+				if c.maxMessageSize > 0 && int64(len(payload))+nextHdr.Length > c.maxMessageSize {
+					_ = c.CloseWithStatus(ws.StatusMessageTooBig, "message too large")
+					return 0, nil, ws.ErrHeaderLengthMSB
+				}
 				part := make([]byte, nextHdr.Length)
 				if _, err := io.ReadFull(c.reader, part); err != nil {
 					return 0, nil, err

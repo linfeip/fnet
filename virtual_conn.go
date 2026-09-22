@@ -34,6 +34,8 @@ type vcCallbacks struct {
 	onClose      func()
 	directWrite  func([]byte) (int, error)
 	directWritev func([][]byte) (int, error)
+	pauseRead    func()
+	resumeRead   func()
 }
 
 type VirtualConn struct {
@@ -177,6 +179,46 @@ func (vc *VirtualConn) SetDirectWritev(fn func([][]byte) (int, error)) {
 	vc.wmu.Lock()
 	vc.callbacksLocked().directWritev = fn
 	vc.wmu.Unlock()
+}
+
+// PauseRead pauses event-driven reading on the connection for backpressure.
+func (vc *VirtualConn) PauseRead() {
+	if vc.c != nil {
+		vc.c.readPaused.Store(true)
+	}
+	if vc.cb != nil && vc.cb.pauseRead != nil {
+		vc.cb.pauseRead()
+	}
+}
+
+// ResumeRead resumes event-driven reading on the connection and wakes the reactor.
+func (vc *VirtualConn) ResumeRead() {
+	if vc.c != nil {
+		if vc.c.readPaused.CompareAndSwap(true, false) {
+			if vc.c.reactor != nil {
+				vc.c.reactor.enqueue(func() {
+					vc.c.reactor.handleRead(vc.c)
+				})
+			}
+		}
+	}
+	if vc.cb != nil && vc.cb.resumeRead != nil {
+		vc.cb.resumeRead()
+	}
+}
+
+// SetPauseReadCallback registers a callback invoked when PauseRead is called.
+func (vc *VirtualConn) SetPauseReadCallback(fn func()) {
+	vc.mu.Lock()
+	vc.callbacksLocked().pauseRead = fn
+	vc.mu.Unlock()
+}
+
+// SetResumeReadCallback registers a callback invoked when ResumeRead is called.
+func (vc *VirtualConn) SetResumeReadCallback(fn func()) {
+	vc.mu.Lock()
+	vc.callbacksLocked().resumeRead = fn
+	vc.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +569,17 @@ func (vc *VirtualConn) WriteVector(iovs [][]byte) (int, error) {
 	if len(vc.outBuf)+remLen > maxOutboundBufferSize {
 		vc.wmu.Unlock()
 		return written, ErrWriteBufferFull
+	}
+
+	needed := len(vc.outBuf) + remLen
+	if cap(vc.outBuf) < needed {
+		newCap := 2 * cap(vc.outBuf)
+		if newCap < needed {
+			newCap = needed
+		}
+		newBuf := make([]byte, len(vc.outBuf), newCap)
+		copy(newBuf, vc.outBuf)
+		vc.outBuf = newBuf
 	}
 
 	skip := written

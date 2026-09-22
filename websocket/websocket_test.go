@@ -1648,3 +1648,352 @@ func TestWebSocketAsyncDecompressionBombDoesNotBlockReactor(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Tests for Large Frames, Streaming Assembly, Backpressure, and Cleanup
+// ---------------------------------------------------------------------------
+
+func TestWebSocketLargeFrames_StreamingAssemblyAndEcho(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	upgrader := &websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		_, err := upgrader.UpgradeEvent(w, r, websocket.EventHandler{
+			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+				_ = c.WriteMessage(op, msg)
+			},
+		})
+		if err != nil {
+			t.Errorf("UpgradeEvent error: %v", err)
+		}
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	testSizes := []int{
+		128 * 1024,  // 128 KB
+		512 * 1024,  // 512 KB
+		1024 * 1024, // 1 MB
+		2048 * 1024, // 2 MB
+	}
+
+	for _, size := range testSizes {
+		t.Run(fmt.Sprintf("%d_Bytes", size), func(t *testing.T) {
+			payload := make([]byte, size)
+			for i := range payload {
+				payload[i] = byte((i * 37) & 0xff)
+			}
+
+			// Send binary frame
+			f := ws.MaskFrame(ws.NewBinaryFrame(payload))
+			if err := ws.WriteFrame(conn, f); err != nil {
+				t.Fatalf("write %d bytes failed: %v", size, err)
+			}
+
+			// Read echo
+			resp, err := ws.ReadFrame(conn)
+			if err != nil {
+				t.Fatalf("read %d bytes failed: %v", size, err)
+			}
+			if len(resp.Payload) != size {
+				t.Fatalf("expected len %d, got %d", size, len(resp.Payload))
+			}
+			if !bytes.Equal(resp.Payload, payload) {
+				t.Fatalf("payload content mismatch for %d bytes", size)
+			}
+		})
+	}
+}
+
+func TestWebSocketLargeFrame_PipeliningWithSmallFrame(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	upgrader := &websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		_, err := upgrader.UpgradeEvent(w, r, websocket.EventHandler{
+			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+				_ = c.WriteMessage(op, msg)
+			},
+		})
+		if err != nil {
+			t.Errorf("UpgradeEvent error: %v", err)
+		}
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	bigSize := 256 * 1024
+	bigPayload := make([]byte, bigSize)
+	for i := range bigPayload {
+		bigPayload[i] = byte(i % 251)
+	}
+	smallPayload := []byte("immediately following small frame!")
+
+	f1 := ws.MaskFrame(ws.NewBinaryFrame(bigPayload))
+	f2 := ws.MaskFrame(ws.NewTextFrame(smallPayload))
+
+	// Write both frames back-to-back in a single combined buffer
+	var combined bytes.Buffer
+	if err := ws.WriteFrame(&combined, f1); err != nil {
+		t.Fatalf("write f1: %v", err)
+	}
+	if err := ws.WriteFrame(&combined, f2); err != nil {
+		t.Fatalf("write f2: %v", err)
+	}
+
+	if _, err := conn.Write(combined.Bytes()); err != nil {
+		t.Fatalf("conn.Write combined: %v", err)
+	}
+
+	// First echo must be the big frame
+	resp1, err := ws.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("read resp1: %v", err)
+	}
+	if !bytes.Equal(resp1.Payload, bigPayload) {
+		t.Fatalf("resp1 mismatch: len %d vs %d", len(resp1.Payload), len(bigPayload))
+	}
+
+	// Second echo must be the small frame
+	resp2, err := ws.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("read resp2: %v", err)
+	}
+	if !bytes.Equal(resp2.Payload, smallPayload) {
+		t.Fatalf("resp2 mismatch: %q vs %q", string(resp2.Payload), string(smallPayload))
+	}
+}
+
+func TestWebSocketSilentBackpressure(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	var receivedCount atomic.Int32
+	upgrader := &websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+		// Set low threshold to easily trigger backpressure
+		MaxPendingMessageBytes: 256 * 1024, // 256KB
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		_, err := upgrader.UpgradeEvent(w, r, websocket.EventHandler{
+			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+				receivedCount.Add(1)
+				// Simulate slow business processing
+				time.Sleep(10 * time.Millisecond)
+				_ = c.WriteMessage(op, msg[:10]) // reply with small ack
+			},
+		})
+		if err != nil {
+			t.Errorf("UpgradeEvent error: %v", err)
+		}
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Send 8 messages of 64KB each (8 * 64KB = 512KB > 256KB threshold)
+	const numMessages = 8
+	const msgSize = 64 * 1024
+	payload := make([]byte, msgSize)
+
+	for i := 0; i < numMessages; i++ {
+		payload[0] = byte(i)
+		f := ws.MaskFrame(ws.NewBinaryFrame(payload))
+		if err := ws.WriteFrame(conn, f); err != nil {
+			t.Fatalf("write frame %d: %v", i, err)
+		}
+	}
+
+	// Read all 8 replies
+	for i := 0; i < numMessages; i++ {
+		resp, err := ws.ReadFrame(conn)
+		if err != nil {
+			t.Fatalf("read reply %d: %v", i, err)
+		}
+		if len(resp.Payload) < 1 || resp.Payload[0] != byte(i) {
+			t.Fatalf("reply %d out of order or invalid: %v", i, resp.Payload)
+		}
+	}
+
+	if receivedCount.Load() != numMessages {
+		t.Fatalf("expected %d messages, got %d", numMessages, receivedCount.Load())
+	}
+}
+
+func TestWebSocketMaxMessageSizeProtection(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	upgrader := &websocket.Upgrader{
+		CheckOrigin:    func(r *http.Request) bool { return true },
+		MaxMessageSize: 64 * 1024, // 64KB limit
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		_, err := upgrader.UpgradeEvent(w, r, websocket.EventHandler{
+			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+				_ = c.WriteMessage(op, msg)
+			},
+		})
+		if err != nil {
+			t.Errorf("UpgradeEvent error: %v", err)
+		}
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// 1. Send frame within limit: 32KB -> should succeed
+	smallPayload := make([]byte, 32*1024)
+	if err := ws.WriteFrame(conn, ws.MaskFrame(ws.NewBinaryFrame(smallPayload))); err != nil {
+		t.Fatalf("write small: %v", err)
+	}
+	resp, err := ws.ReadFrame(conn)
+	if err != nil || len(resp.Payload) != len(smallPayload) {
+		t.Fatalf("read small echo failed: %v", err)
+	}
+
+	// 2. Send frame exceeding limit: 128KB -> should be closed with 1009
+	largePayload := make([]byte, 128*1024)
+	_ = ws.WriteFrame(conn, ws.MaskFrame(ws.NewBinaryFrame(largePayload)))
+
+	reply, err := ws.ReadFrame(conn)
+	if err == nil && reply.Header.OpCode == ws.OpClose {
+		code, _ := ws.ParseCloseFrameData(reply.Payload)
+		if code != ws.StatusMessageTooBig {
+			t.Errorf("expected close code 1009 (StatusMessageTooBig), got %v", code)
+		}
+	}
+}
+
+func TestWebSocketLargeFrameAbortedAssemblyCleanup(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	upgrader := &websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = upgrader.UpgradeEvent(w, r, websocket.EventHandler{
+			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+				_ = c.WriteMessage(op, msg)
+			},
+		})
+	})
+
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+
+	// Send frame header indicating 1MB payload, but only send 10KB of payload then abrupt close
+	f := ws.MaskFrame(ws.Frame{
+		Header: ws.Header{
+			Fin:    true,
+			OpCode: ws.OpBinary,
+			Masked: true,
+			Length: 1024 * 1024,
+		},
+		Payload: make([]byte, 10*1024),
+	})
+	_ = ws.WriteFrame(conn, f)
+
+	// Abruptly close socket without finishing the remaining 1014KB
+	_ = conn.Close()
+
+	// Give server time to clean up
+	time.Sleep(50 * time.Millisecond)
+
+	// Now connect a new client and ensure server is healthy and pool is functional
+	conn2, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatalf("dial 2 failed: %v", err)
+	}
+	defer conn2.Close()
+
+	hello := []byte("server is healthy after aborted assembly")
+	if err := wsutil.WriteClientText(conn2, hello); err != nil {
+		t.Fatalf("write to conn2 failed: %v", err)
+	}
+	echo, err := wsutil.ReadServerText(conn2)
+	if err != nil {
+		t.Fatalf("read from conn2 failed: %v", err)
+	}
+	if string(echo) != string(hello) {
+		t.Fatalf("echo mismatch: %q vs %q", string(echo), string(hello))
+	}
+}

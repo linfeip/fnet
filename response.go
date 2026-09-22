@@ -54,6 +54,17 @@ type WSFrameHandler interface {
 	OnFrame(h ws.Header, payload []byte)
 }
 
+// WSFrameAssembler is an optional interface extending WSFrameHandler to stream
+// large frames directly into a dedicated buffer, avoiding multiple inBuf appends
+// and intermediate copies.
+type WSFrameAssembler interface {
+	WSFrameHandler
+	StartFrame(h ws.Header, initial []byte) bool
+	FeedFrame(chunk []byte) (consumed int, complete bool, err error)
+	IsAssembling() bool
+	AbortFrame()
+}
+
 // WSAttacher is implemented by http.ResponseWriter (and hijacked net.Conn) in fnet
 // to transition the connection from the HTTP request goroutine into the Poller-driven
 // zero-goroutine WebSocket state.

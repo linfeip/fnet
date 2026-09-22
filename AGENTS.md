@@ -1,0 +1,51 @@
+# AGENTS.md
+
+fnet 是 Go 的 HTTP/HTTPS 与 WebSocket 引擎。目标是**单进程同时撑住 100 万条连接**，并且压测走的就是线上 API：`ListenAndServe`、`http.Handler`、`websocket.Upgrader`。
+
+每次改动同时过两关：百万连接里绝大多数空闲时，内存和 goroutine 仍然撑得住；同一份二进制上，真实流量仍然可用。回显或扇出更快、但超时、TLS、保活、半包、慢连接或 RFC 行为没了，算回退。
+
+## 版本控制规则
+
+**不允许自动提交和推送代码。**
+
+- 禁止在未被明确要求时执行 `git commit`、`git push`、`git tag`、`git merge`、`git rebase` 等写操作。
+- 完成修改后把改动留在工作区，向用户说明改了什么，由用户自己决定是否提交。
+- 只有用户在当次对话中明确说"提交"/"push"/"打标签"时才执行对应命令，且仅执行本次被要求的那一步，不要顺带推送。
+- 只读命令（`git status`、`git diff`、`git log`、`git show` 等）不受限制。
+- 同样禁止自动创建 PR、自动合并分支或以任何方式把改动发布到远端。
+
+## 容量
+
+空闲连接只挂在 poller 上，并占连接表里的一个槽。它不持有 goroutine，也不持有 worker。读缓冲放在 reactor 上共享。
+
+`conn` 上多一个字段、或每条连接多一个 goroutine、map、常驻缓冲，都先按 1e6 算清字节和 goroutine，再改，并在说明里写出这笔账。
+
+Linux `epoll` 承担百万连接。`kqueue` 与 `WSAPoll` 保持行为正确且能编译。平台差异只留在 poller、socket、writev 的实现文件里。
+
+## 热路径
+
+`subReactor` 只做就绪、解析和移交。`ServeHTTP` 与 WebSocket 业务回调进 worker pool；同一连接经 `SubmitConn` 进同一分片，保持 FIFO。
+
+稳定态的 accept、read、write 复用 reactor 缓冲、对象池和 `writev`。
+
+慢客户端、半包请求、阻塞的 handler 只拖住自己的连接，同一 reactor 上的其他 fd 继续收事件。用户 handler 的 panic 留在 worker 里。
+
+要留到本次调用之外的 payload，先拷贝再返回。
+
+## 真实流量
+
+同一进程里这些情况同时成立，而不是各做一条压测专用路径：
+
+- 近乎全部连接空闲，少数在推送或请求（IM、推送、扇出），旁边还有普通 HTTP。
+- HTTP/1.1：keep-alive、Read/Write/Idle 超时、分块、慢速头部（上限 `maxHeaderBuffer`）、对端突然断开。
+- HTTPS 走 worker 上的 TLS。事件驱动 WebSocket 目前挂不到 TLS 连接上（`ErrWSAttachUnsupported`）。明文压测代表不了这条路径。
+- WebSocket 遵守 RFC 6455：掩码、Ping/Pong/Close、Origin、子协议、分片。百万连接用事件驱动，空闲时 0 goroutine。阻塞 `ReadMessage` 留给请求-响应式用法。
+- 瞬时大量建连，以及成批断开。
+
+## 改完
+
+动到 poller、连接、池、HTTP 或 WebSocket 时：
+
+1. 点名保住的场景：空闲百万、慢连接、keep-alive、TLS、WebSocket 控制帧，或建连风暴。
+2. 若增加每连接状态，或把工作放进 reactor，写明 1e6 下的代价，以及 reactor 为何仍然只做移交。
+3. `go test ./...` 通过。现有测试把「慢连接堵住 reactor」和「半包卡死 reactor」当失败；碰到的场景没有测试就补上。
