@@ -2070,20 +2070,14 @@ func TestWebSocket_BatchCoalescing(t *testing.T) {
 	}
 }
 
-func TestWebSocketGlobalPendingBudgetBackpressure(t *testing.T) {
+func TestWebSocketGlobalPendingBytesAccounting(t *testing.T) {
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
-	// Set small global budget to trigger global backpressure
-	origBudget := websocket.DefaultGlobalPendingBudget
-	websocket.SetGlobalPendingBudget(128 * 1024) // 128KB
-	defer websocket.SetGlobalPendingBudget(origBudget)
-
 	var receivedCount atomic.Int32
+	var peakGlobal atomic.Int64
 	upgrader := &websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
-		// Single connection threshold high so global threshold triggers first
-		MaxPendingMessageBytes: 1024 * 1024,
 	}
 
 	mux := http.NewServeMux()
@@ -2091,7 +2085,14 @@ func TestWebSocketGlobalPendingBudgetBackpressure(t *testing.T) {
 		_, err := upgrader.UpgradeEvent(w, r, websocket.EventHandler{
 			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
 				receivedCount.Add(1)
-				time.Sleep(15 * time.Millisecond) // slow business to keep queue occupied
+				cur := websocket.GlobalPendingBytes()
+				for {
+					peak := peakGlobal.Load()
+					if cur <= peak || peakGlobal.CompareAndSwap(peak, cur) {
+						break
+					}
+				}
+				time.Sleep(10 * time.Millisecond) // slow business to keep queue occupied
 				_ = c.WriteMessage(op, msg[:10])
 			},
 		})
@@ -2115,7 +2116,6 @@ func TestWebSocketGlobalPendingBudgetBackpressure(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Send 4 messages of 64KB (4 * 64KB = 256KB > 128KB global budget)
 	const numMessages = 4
 	const msgSize = 64 * 1024
 	payload := make([]byte, msgSize)
@@ -2140,5 +2140,8 @@ func TestWebSocketGlobalPendingBudgetBackpressure(t *testing.T) {
 
 	if receivedCount.Load() != numMessages {
 		t.Fatalf("expected %d messages, got %d", numMessages, receivedCount.Load())
+	}
+	if peakGlobal.Load() == 0 {
+		t.Fatalf("expected peak global pending bytes > 0, got %d", peakGlobal.Load())
 	}
 }

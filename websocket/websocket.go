@@ -187,7 +187,6 @@ type wsHandlerBridge struct {
 	maxPendingBytes int64
 	lowPendingBytes int64
 	readPaused      atomic.Bool
-	globalPaused    atomic.Bool
 	maxMessageSize  int64
 }
 
@@ -229,26 +228,6 @@ func (b *wsHandlerBridge) resumeReadConn() {
 	if b.readPaused.CompareAndSwap(true, false) {
 		if rp, ok := b.conn.conn.(reasonReadPauser); ok {
 			rp.ResumeReadReason(fnet.PauseReasonInbound)
-		} else if rp, ok := b.conn.conn.(readPauser); ok {
-			rp.ResumeRead()
-		}
-	}
-}
-
-func (b *wsHandlerBridge) pauseReadGlobal() {
-	if b.globalPaused.CompareAndSwap(false, true) {
-		if rp, ok := b.conn.conn.(reasonReadPauser); ok {
-			rp.PauseReadReason(fnet.PauseReasonGlobal)
-		} else if rp, ok := b.conn.conn.(readPauser); ok {
-			rp.PauseRead()
-		}
-	}
-}
-
-func (b *wsHandlerBridge) resumeReadGlobal() {
-	if b.globalPaused.CompareAndSwap(true, false) {
-		if rp, ok := b.conn.conn.(reasonReadPauser); ok {
-			rp.ResumeReadReason(fnet.PauseReasonGlobal)
 		} else if rp, ok := b.conn.conn.(readPauser); ok {
 			rp.ResumeRead()
 		}
@@ -346,8 +325,7 @@ func (b *wsHandlerBridge) enqueueTaskOwned(op OpCode, payload []byte, pooled *po
 		return
 	}
 	payloadLen := int64(len(payload))
-	curGlobal := globalPendingBytes.Add(payloadLen)
-	budget := globalPendingBudget.Load()
+	globalPendingBytes.Add(payloadLen)
 
 	b.queue = append(b.queue, wsTask{
 		op:           op,
@@ -360,9 +338,6 @@ func (b *wsHandlerBridge) enqueueTaskOwned(op OpCode, payload []byte, pooled *po
 		if curConn > b.maxPendingBytes {
 			b.pauseReadConn()
 		}
-	}
-	if budget > 0 && curGlobal > budget {
-		b.pauseReadGlobal()
 	}
 	if !b.running {
 		b.running = true
@@ -377,18 +352,13 @@ func (b *wsHandlerBridge) decrementPending(size int64) {
 	if size <= 0 {
 		return
 	}
-	curGlobal := globalPendingBytes.Add(-size)
-	budget := globalPendingBudget.Load()
-	lowGlobal := budget / 2
+	globalPendingBytes.Add(-size)
 
 	if b.maxPendingBytes > 0 {
 		curConn := b.pendingBytes.Add(-size)
 		if curConn <= b.lowPendingBytes && b.readPaused.Load() {
 			b.resumeReadConn()
 		}
-	}
-	if budget > 0 && curGlobal <= lowGlobal && b.globalPaused.Load() {
-		b.resumeReadGlobal()
 	}
 }
 
@@ -401,13 +371,6 @@ func (b *wsHandlerBridge) schedule(task func()) {
 }
 
 func (b *wsHandlerBridge) processQueue() {
-	if b.conn != nil {
-		b.conn.beginWriteBatch()
-		defer func() {
-			_ = b.conn.endWriteBatch()
-		}()
-	}
-
 	for {
 		b.queueMu.Lock()
 		if len(b.queue) == 0 || b.closed {
@@ -419,6 +382,11 @@ func (b *wsHandlerBridge) processQueue() {
 		// Batch drain: swap active queue with local batch slice to minimize lock duration
 		b.batch, b.queue = b.queue, b.batch[:0]
 		b.queueMu.Unlock()
+
+		batchSize := len(b.batch)
+		if batchSize > 1 && b.conn != nil {
+			b.conn.beginWriteBatch()
+		}
 
 		for i := range b.batch {
 			task := b.batch[i]
@@ -439,6 +407,9 @@ func (b *wsHandlerBridge) processQueue() {
 			b.decrementPending(int64(len(task.payload)))
 		}
 
+		if batchSize > 1 && b.conn != nil {
+			_ = b.conn.endWriteBatch()
+		}
 		b.batch = b.batch[:0]
 	}
 }
@@ -493,7 +464,6 @@ func (b *wsHandlerBridge) markClosed() {
 
 	b.AbortFrame()
 	b.resumeReadConn()
-	b.resumeReadGlobal()
 }
 
 func checkClosePayload(payload []byte) (ws.StatusCode, bool) {
@@ -613,7 +583,6 @@ func (b *wsHandlerBridge) OnClose(err error) {
 
 	b.AbortFrame()
 	b.resumeReadConn()
-	b.resumeReadGlobal()
 
 	b.closeOnce.Do(func() {
 		if b.handler.OnClose != nil {
@@ -1029,9 +998,12 @@ func (c *Conn) writeFrameLocked(op OpCode, payload []byte) error {
 	if c.batching {
 		frameLen := hLen + len(toWrite)
 		if c.batchBlock == nil {
-			bufSize := 16 * 1024
+			bufSize := 4 * 1024
 			if frameLen > bufSize {
-				bufSize = 64 * 1024
+				bufSize = 16 * 1024
+				if frameLen > bufSize {
+					bufSize = 64 * 1024
+				}
 			}
 			c.batchBuf, c.batchBlock = getPayloadBuffer(bufSize)
 			c.batchBuf = c.batchBuf[:0]
@@ -1058,7 +1030,11 @@ func (c *Conn) writeFrameLocked(op OpCode, payload []byte) error {
 					return nil
 				}
 				putPayloadBuffer(c.batchBlock)
-				c.batchBuf, c.batchBlock = getPayloadBuffer(64 * 1024)
+				bufSize := 16 * 1024
+				if frameLen > bufSize {
+					bufSize = 64 * 1024
+				}
+				c.batchBuf, c.batchBlock = getPayloadBuffer(bufSize)
 				c.batchBuf = c.batchBuf[:0]
 			}
 		}
