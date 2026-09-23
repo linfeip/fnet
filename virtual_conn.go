@@ -17,7 +17,18 @@ import (
 // ErrWriteBufferFull is returned when outbound queue exceeds maxOutboundBufferSize.
 var ErrWriteBufferFull = errors.New("fnet: outbound write buffer full")
 
-const maxOutboundBufferSize = 16 * 1024 * 1024 // 16MB per connection safety cap against slowloris
+// Pause reasons for multi-source backpressure (inbound task queue, outbound write buffer, global budget).
+const (
+	PauseReasonInbound  uint32 = 1 << 0
+	PauseReasonOutbound uint32 = 1 << 1
+	PauseReasonGlobal   uint32 = 1 << 2
+)
+
+const (
+	maxOutboundBufferSize = 16 * 1024 * 1024 // 16MB per connection safety cap against slowloris
+	outboundHighWatermark = 64 * 1024        // 64KB backpressure threshold: pause reads when outBuf exceeds this
+	outboundLowWatermark  = 16 * 1024        // 16KB backpressure threshold: resume reads when outBuf falls below this
+)
 
 // VirtualConn is a concurrency-safe net.Conn adapter. The reactor feeds
 // inbound socket bytes via FeedInput; a worker goroutine may block in Read
@@ -183,26 +194,30 @@ func (vc *VirtualConn) SetDirectWritev(fn func([][]byte) (int, error)) {
 	vc.wmu.Unlock()
 }
 
-// PauseRead pauses event-driven reading on the connection for backpressure.
+// PauseRead pauses event-driven reading on the connection for inbound backpressure.
 func (vc *VirtualConn) PauseRead() {
+	vc.PauseReadReason(PauseReasonInbound)
+}
+
+// ResumeRead resumes event-driven reading on the connection and wakes the reactor.
+func (vc *VirtualConn) ResumeRead() {
+	vc.ResumeReadReason(PauseReasonInbound)
+}
+
+// PauseReadReason pauses event-driven reading for a specific reason bitmask.
+func (vc *VirtualConn) PauseReadReason(reason uint32) {
 	if vc.c != nil {
-		vc.c.readPaused.Store(true)
+		vc.c.pauseRead(reason)
 	}
 	if vc.cb != nil && vc.cb.pauseRead != nil {
 		vc.cb.pauseRead()
 	}
 }
 
-// ResumeRead resumes event-driven reading on the connection and wakes the reactor.
-func (vc *VirtualConn) ResumeRead() {
+// ResumeReadReason resumes event-driven reading for a specific reason bitmask.
+func (vc *VirtualConn) ResumeReadReason(reason uint32) {
 	if vc.c != nil {
-		if vc.c.readPaused.CompareAndSwap(true, false) {
-			if vc.c.reactor != nil {
-				vc.c.reactor.enqueue(func() {
-					vc.c.reactor.handleRead(vc.c)
-				})
-			}
-		}
+		vc.c.resumeRead(reason)
 	}
 	if vc.cb != nil && vc.cb.resumeRead != nil {
 		vc.cb.resumeRead()
@@ -619,6 +634,9 @@ func (vc *VirtualConn) Write(b []byte) (int, error) {
 		vc.wmu.Unlock()
 		return 0, ErrWriteBufferFull
 	}
+	if unread+len(b) > outboundHighWatermark {
+		vc.PauseReadReason(PauseReasonOutbound)
+	}
 	vc.ensureOutCapLocked(len(b))
 	vc.outBuf = append(vc.outBuf, b...)
 	vc.wmu.Unlock()
@@ -667,6 +685,9 @@ func (vc *VirtualConn) WriteVector(iovs [][]byte) (int, error) {
 		vc.wmu.Unlock()
 		return written, ErrWriteBufferFull
 	}
+	if unread+remLen > outboundHighWatermark {
+		vc.PauseReadReason(PauseReasonOutbound)
+	}
 
 	vc.ensureOutCapLocked(remLen)
 	skip := written
@@ -698,7 +719,11 @@ func (vc *VirtualConn) flushOut() (pending bool, err error) {
 		}
 		if werr != nil {
 			if isWouldBlock(werr) {
-				return vc.outReadOff < len(vc.outBuf), nil
+				rem := len(vc.outBuf) - vc.outReadOff
+				if rem <= outboundLowWatermark {
+					vc.ResumeReadReason(PauseReasonOutbound)
+				}
+				return rem > 0, nil
 			}
 			vc.writeErr = werr
 			return false, werr
@@ -708,6 +733,7 @@ func (vc *VirtualConn) flushOut() (pending bool, err error) {
 		}
 	}
 	vc.releaseOutLocked()
+	vc.ResumeReadReason(PauseReasonOutbound)
 	return false, nil
 }
 
@@ -725,7 +751,11 @@ func (vc *VirtualConn) DrainWrite(dst []byte) (n int, remaining bool) {
 	vc.outReadOff += n
 	if vc.outReadOff >= len(vc.outBuf) {
 		vc.releaseOutLocked()
+		vc.ResumeReadReason(PauseReasonOutbound)
 		return n, false
+	}
+	if len(vc.outBuf)-vc.outReadOff <= outboundLowWatermark {
+		vc.ResumeReadReason(PauseReasonOutbound)
 	}
 	return n, true
 }

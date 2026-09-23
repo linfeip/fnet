@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -552,5 +553,44 @@ func TestVirtualConn_OutboundSlabPool(t *testing.T) {
 	n, rem = vc.DrainWrite(buf2)
 	if n != len(unshiftData) || rem || !bytes.Equal(buf2, unshiftData) {
 		t.Fatalf("DrainWrite after unshift: n=%d rem=%v got %q", n, rem, buf2)
+	}
+}
+
+func TestVirtualConn_OutboundBackpressure(t *testing.T) {
+	vc := NewVirtualConn(nil, nil)
+	var paused, resumed atomic.Bool
+	vc.SetPauseReadCallback(func() {
+		paused.Store(true)
+	})
+	vc.SetResumeReadCallback(func() {
+		resumed.Store(true)
+	})
+
+	// Writing 32KB (below 64KB high watermark) should not trigger pause
+	_, err := vc.Write(make([]byte, 32*1024))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if paused.Load() {
+		t.Fatal("unexpected pause below watermark")
+	}
+
+	// Writing another 40KB (total 72KB > 64KB high watermark) should trigger pause
+	_, err = vc.Write(make([]byte, 40*1024))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !paused.Load() {
+		t.Fatal("expected pause above 64KB watermark")
+	}
+
+	// Drain 60KB (remaining 12KB <= 16KB low watermark) should trigger resume
+	drainBuf := make([]byte, 60*1024)
+	n, _ := vc.DrainWrite(drainBuf)
+	if n != len(drainBuf) {
+		t.Fatalf("drained %d want %d", n, len(drainBuf))
+	}
+	if !resumed.Load() {
+		t.Fatal("expected resume below 16KB low watermark")
 	}
 }

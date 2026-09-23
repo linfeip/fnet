@@ -215,9 +215,9 @@ type conn struct {
 
 	state           atomic.Int32
 	closed          atomic.Bool
-	writeArmed      atomic.Bool // write interest registered with the poller
-	closeAfterFlush atomic.Bool // close once the outbound queue drains
-	readPaused      atomic.Bool // reading paused for backpressure
+	writeArmed      atomic.Bool   // write interest registered with the poller
+	closeAfterFlush atomic.Bool   // close once the outbound queue drains
+	readPaused      atomic.Uint32 // bitmask of pause reasons (inbound, outbound, global)
 
 	mu        sync.Mutex
 	wsHandler WSHandler
@@ -565,12 +565,50 @@ func (r *subReactor) armWrite(c *conn) {
 	}
 }
 
+func (c *conn) pauseRead(reason uint32) {
+	if reason == 0 {
+		reason = PauseReasonInbound
+	}
+	for {
+		old := c.readPaused.Load()
+		if old&reason == reason {
+			return
+		}
+		if c.readPaused.CompareAndSwap(old, old|reason) {
+			return
+		}
+	}
+}
+
+func (c *conn) resumeRead(reason uint32) {
+	if reason == 0 {
+		reason = PauseReasonInbound
+	}
+	for {
+		old := c.readPaused.Load()
+		if old&reason == 0 {
+			return
+		}
+		next := old &^ reason
+		if c.readPaused.CompareAndSwap(old, next) {
+			if old != 0 && next == 0 {
+				if c.reactor != nil {
+					c.reactor.enqueue(func() {
+						c.reactor.handleRead(c)
+					})
+				}
+			}
+			return
+		}
+	}
+}
+
 func (r *subReactor) handleRead(c *conn) {
 	if c.closeAfterFlush.Load() {
 		r.discardRead(c)
 		return
 	}
-	if c.readPaused.Load() {
+	if c.readPaused.Load() != 0 {
 		return
 	}
 	buf := r.rbuf
@@ -832,7 +870,7 @@ func (s *Server) dispatchWSFrames(c *conn, data []byte) (int, error) {
 			ws.Cipher(payload, h.Mask, 0)
 		}
 		off = end
-		if !s.handleWSFrame(c, h, payload) {
+		if !s.handleWSFrame(c, h, payload, handler) {
 			return off, nil
 		}
 	}
@@ -862,7 +900,7 @@ func checkClosePayload(payload []byte) (ws.StatusCode, bool) {
 
 // handleWSFrame processes one frame on the reactor. Returns false if the
 // connection is closed or closing.
-func (s *Server) handleWSFrame(c *conn, h ws.Header, payload []byte) bool {
+func (s *Server) handleWSFrame(c *conn, h ws.Header, payload []byte, handler WSHandler) bool {
 	if c.closed.Load() || c.closeAfterFlush.Load() {
 		return false
 	}
@@ -914,9 +952,6 @@ func (s *Server) handleWSFrame(c *conn, h ws.Header, payload []byte) bool {
 		return true
 	}
 
-	c.mu.Lock()
-	handler := c.wsHandler
-	c.mu.Unlock()
 	if handler != nil {
 		if fh, ok := handler.(WSFrameHandler); ok {
 			fh.OnFrame(h, payload)

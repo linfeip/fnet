@@ -300,6 +300,11 @@ func (p *WorkerPool) tryOffload(task func(), myShardID int) bool {
 		targetIdx := (start + uint32(i) + 1) & uint32(p.shardMask)
 		target := p.shards[targetIdx]
 
+		// Fast path: avoid lock if target queue is full
+		if len(target.tasks) >= cap(target.tasks) {
+			continue
+		}
+
 		target.mu.RLock()
 		if !target.closed {
 			select {
