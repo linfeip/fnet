@@ -17,11 +17,10 @@ import (
 // ErrWriteBufferFull is returned when outbound queue exceeds maxOutboundBufferSize.
 var ErrWriteBufferFull = errors.New("fnet: outbound write buffer full")
 
-// Pause reasons for multi-source backpressure (inbound task queue, outbound write buffer, global budget).
+// Pause reasons for multi-source backpressure (inbound task queue, outbound write buffer).
 const (
 	PauseReasonInbound  uint32 = 1 << 0
 	PauseReasonOutbound uint32 = 1 << 1
-	PauseReasonGlobal   uint32 = 1 << 2
 )
 
 const (
@@ -810,6 +809,11 @@ func (vc *VirtualConn) Close() error {
 		vc.inCond.Broadcast()
 	}
 	vc.mu.Unlock()
+
+	vc.wmu.Lock()
+	vc.releaseOutLocked()
+	vc.ResumeReadReason(PauseReasonOutbound)
+	vc.wmu.Unlock()
 
 	vc.notifyClose()
 	return nil

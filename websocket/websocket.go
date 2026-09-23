@@ -46,30 +46,6 @@ const DefaultMaxPendingMessageBytes int64 = 64 * 1024
 // to resume reads after backpressure.
 const DefaultLowPendingMessageBytes int64 = 16 * 1024
 
-// DefaultGlobalPendingBudget is the default global limit (256MB) on queued inbound
-// WebSocket task payload bytes across all connections to prevent memory exhaustion.
-const DefaultGlobalPendingBudget int64 = 256 * 1024 * 1024
-
-var (
-	globalPendingBytes  atomic.Int64
-	globalPendingBudget atomic.Int64
-)
-
-func init() {
-	globalPendingBudget.Store(DefaultGlobalPendingBudget)
-}
-
-// SetGlobalPendingBudget sets the process-wide queued payload budget in bytes.
-// A non-positive value disables the global budget check.
-func SetGlobalPendingBudget(bytes int64) {
-	globalPendingBudget.Store(bytes)
-}
-
-// GlobalPendingBytes returns the current total queued payload bytes across all WebSocket connections.
-func GlobalPendingBytes() int64 {
-	return globalPendingBytes.Load()
-}
-
 // DefaultCompressionThreshold is the minimum payload size in bytes to trigger compression.
 const DefaultCompressionThreshold = 128
 
@@ -180,6 +156,7 @@ type wsHandlerBridge struct {
 	batch           []wsTask
 	running         bool
 	closed          bool
+	inBatch         bool
 	closeOnce       sync.Once
 
 	asm             *wsAssembler
@@ -188,9 +165,16 @@ type wsHandlerBridge struct {
 	lowPendingBytes int64
 	readPaused      atomic.Bool
 	maxMessageSize  int64
+
+	batchInBlock *pooledBuffer
+	batchInBuf   []byte
+	batchTasks   []wsTask
 }
 
-var _ fnet.WSFrameAssembler = (*wsHandlerBridge)(nil)
+var (
+	_ fnet.WSFrameAssembler = (*wsHandlerBridge)(nil)
+	_ fnet.WSBatchHandler   = (*wsHandlerBridge)(nil)
+)
 
 func (b *wsHandlerBridge) OnOpen() {
 	if b.handler.OnOpen != nil {
@@ -214,7 +198,7 @@ type reasonReadPauser interface {
 	ResumeReadReason(reason uint32)
 }
 
-func (b *wsHandlerBridge) pauseReadConn() {
+func (b *wsHandlerBridge) pauseRead() {
 	if b.readPaused.CompareAndSwap(false, true) {
 		if rp, ok := b.conn.conn.(reasonReadPauser); ok {
 			rp.PauseReadReason(fnet.PauseReasonInbound)
@@ -224,7 +208,7 @@ func (b *wsHandlerBridge) pauseReadConn() {
 	}
 }
 
-func (b *wsHandlerBridge) resumeReadConn() {
+func (b *wsHandlerBridge) resumeRead() {
 	if b.readPaused.CompareAndSwap(true, false) {
 		if rp, ok := b.conn.conn.(reasonReadPauser); ok {
 			rp.ResumeReadReason(fnet.PauseReasonInbound)
@@ -232,6 +216,120 @@ func (b *wsHandlerBridge) resumeReadConn() {
 			rp.ResumeRead()
 		}
 	}
+}
+
+func (b *wsHandlerBridge) BeginBatch(estimatedBytes int) {
+	b.inBatch = true
+	b.batchTasks = b.batchTasks[:0]
+	if estimatedBytes > 0 {
+		bufSize := 4096
+		if estimatedBytes <= 1024+14 {
+			bufSize = 1024
+		} else if estimatedBytes <= 4096+14 {
+			bufSize = 4096
+		} else if estimatedBytes <= 16384+14 {
+			bufSize = 16 * 1024
+		} else {
+			bufSize = 64 * 1024
+		}
+		b.batchInBuf, b.batchInBlock = getPayloadBuffer(bufSize)
+		b.batchInBuf = b.batchInBuf[:0]
+	} else {
+		b.batchInBlock = nil
+		b.batchInBuf = nil
+	}
+}
+
+func (b *wsHandlerBridge) enqueueBatchTask(op OpCode, payload []byte, isCompressed bool) {
+	if len(payload) == 0 {
+		b.batchTasks = append(b.batchTasks, wsTask{
+			op:           op,
+			isCompressed: isCompressed,
+		})
+		return
+	}
+	if b.batchInBlock == nil {
+		bufSize := 4096
+		if len(payload) > 16384 {
+			bufSize = 64 * 1024
+		} else if len(payload) > 4096 {
+			bufSize = 16 * 1024
+		}
+		b.batchInBuf, b.batchInBlock = getPayloadBuffer(bufSize)
+		b.batchInBuf = b.batchInBuf[:0]
+	} else if len(b.batchInBuf)+len(payload) > cap(b.batchInBlock.buf) {
+		if len(b.batchTasks) > 0 {
+			b.batchTasks[len(b.batchTasks)-1].pooled = b.batchInBlock
+		} else {
+			putPayloadBuffer(b.batchInBlock)
+		}
+		bufSize := 16 * 1024
+		if len(payload) > bufSize {
+			bufSize = 64 * 1024
+		}
+		b.batchInBuf, b.batchInBlock = getPayloadBuffer(bufSize)
+		b.batchInBuf = b.batchInBuf[:0]
+	}
+
+	start := len(b.batchInBuf)
+	b.batchInBuf = append(b.batchInBuf, payload...)
+	framePayload := b.batchInBuf[start:len(b.batchInBuf)]
+
+	b.batchTasks = append(b.batchTasks, wsTask{
+		op:           op,
+		payload:      framePayload,
+		isCompressed: isCompressed,
+	})
+}
+
+func (b *wsHandlerBridge) EndBatch() {
+	b.inBatch = false
+	if b.batchInBlock != nil {
+		if len(b.batchTasks) > 0 {
+			b.batchTasks[len(b.batchTasks)-1].pooled = b.batchInBlock
+		} else {
+			putPayloadBuffer(b.batchInBlock)
+		}
+		b.batchInBlock = nil
+		b.batchInBuf = nil
+	}
+
+	totalBytes := int64(0)
+	for i := range b.batchTasks {
+		totalBytes += int64(len(b.batchTasks[i].payload))
+	}
+
+	b.queueMu.Lock()
+	if b.closed {
+		b.queueMu.Unlock()
+		for i := range b.batchTasks {
+			if b.batchTasks[i].pooled != nil {
+				putPayloadBuffer(b.batchTasks[i].pooled)
+			}
+		}
+		b.batchTasks = b.batchTasks[:0]
+		return
+	}
+
+	if len(b.batchTasks) > 0 {
+		b.queue = append(b.queue, b.batchTasks...)
+		b.batchTasks = b.batchTasks[:0]
+	}
+
+	if b.maxPendingBytes > 0 && totalBytes > 0 {
+		cur := b.pendingBytes.Add(totalBytes)
+		if cur > b.maxPendingBytes {
+			b.pauseRead()
+		}
+	}
+
+	if !b.running && len(b.queue) > 0 {
+		b.running = true
+		b.queueMu.Unlock()
+		b.schedule(b.processQueue)
+		return
+	}
+	b.queueMu.Unlock()
 }
 
 func (b *wsHandlerBridge) IsAssembling() bool {
@@ -324,9 +422,6 @@ func (b *wsHandlerBridge) enqueueTaskOwned(op OpCode, payload []byte, pooled *po
 		}
 		return
 	}
-	payloadLen := int64(len(payload))
-	globalPendingBytes.Add(payloadLen)
-
 	b.queue = append(b.queue, wsTask{
 		op:           op,
 		payload:      payload,
@@ -334,32 +429,18 @@ func (b *wsHandlerBridge) enqueueTaskOwned(op OpCode, payload []byte, pooled *po
 		isCompressed: isCompressed,
 	})
 	if b.maxPendingBytes > 0 {
-		curConn := b.pendingBytes.Add(payloadLen)
-		if curConn > b.maxPendingBytes {
-			b.pauseReadConn()
+		cur := b.pendingBytes.Add(int64(len(payload)))
+		if cur > b.maxPendingBytes {
+			b.pauseRead()
 		}
 	}
-	if !b.running {
+	if !b.inBatch && !b.running {
 		b.running = true
 		b.queueMu.Unlock()
 		b.schedule(b.processQueue)
 		return
 	}
 	b.queueMu.Unlock()
-}
-
-func (b *wsHandlerBridge) decrementPending(size int64) {
-	if size <= 0 {
-		return
-	}
-	globalPendingBytes.Add(-size)
-
-	if b.maxPendingBytes > 0 {
-		curConn := b.pendingBytes.Add(-size)
-		if curConn <= b.lowPendingBytes && b.readPaused.Load() {
-			b.resumeReadConn()
-		}
-	}
 }
 
 func (b *wsHandlerBridge) schedule(task func()) {
@@ -388,15 +469,16 @@ func (b *wsHandlerBridge) processQueue() {
 			b.conn.beginWriteBatch()
 		}
 
+		var batchBytes int64
 		for i := range b.batch {
 			task := b.batch[i]
 			b.batch[i] = wsTask{} // Clear pointer for GC
+			batchBytes += int64(len(task.payload))
 
 			if b.closed {
 				if task.pooled != nil {
 					putPayloadBuffer(task.pooled)
 				}
-				b.decrementPending(int64(len(task.payload)))
 				continue
 			}
 
@@ -404,7 +486,13 @@ func (b *wsHandlerBridge) processQueue() {
 			if task.pooled != nil {
 				putPayloadBuffer(task.pooled)
 			}
-			b.decrementPending(int64(len(task.payload)))
+		}
+
+		if b.maxPendingBytes > 0 && batchBytes > 0 {
+			cur := b.pendingBytes.Add(-batchBytes)
+			if cur <= b.lowPendingBytes && b.readPaused.Load() {
+				b.resumeRead()
+			}
 		}
 
 		if batchSize > 1 && b.conn != nil {
@@ -444,26 +532,32 @@ func (b *wsHandlerBridge) executeTask(task wsTask) {
 }
 
 func (b *wsHandlerBridge) markClosed() {
+	if b.batchInBlock != nil {
+		putPayloadBuffer(b.batchInBlock)
+		b.batchInBlock = nil
+		b.batchInBuf = nil
+	}
+	for i := range b.batchTasks {
+		if b.batchTasks[i].pooled != nil {
+			putPayloadBuffer(b.batchTasks[i].pooled)
+		}
+	}
+	b.batchTasks = b.batchTasks[:0]
+
 	b.queueMu.Lock()
 	b.closed = true
-	var droppedBytes int64
 	for i := range b.queue {
 		if b.queue[i].pooled != nil {
 			putPayloadBuffer(b.queue[i].pooled)
 		}
-		droppedBytes += int64(len(b.queue[i].payload))
 		b.queue[i] = wsTask{}
 	}
 	b.queue = b.queue[:0]
 	b.pendingBytes.Store(0)
 	b.queueMu.Unlock()
 
-	if droppedBytes > 0 {
-		globalPendingBytes.Add(-droppedBytes)
-	}
-
 	b.AbortFrame()
-	b.resumeReadConn()
+	b.resumeRead()
 }
 
 func checkClosePayload(payload []byte) (ws.StatusCode, bool) {
@@ -527,7 +621,11 @@ func (b *wsHandlerBridge) OnFrame(h ws.Header, payload []byte) {
 
 		// Single complete frame
 		isComp := b.conn.compressed && h.Rsv1()
-		b.enqueueTask(OpCode(h.OpCode), payload, isComp)
+		if b.inBatch {
+			b.enqueueBatchTask(OpCode(h.OpCode), payload, isComp)
+		} else {
+			b.enqueueTask(OpCode(h.OpCode), payload, isComp)
+		}
 		return
 	}
 
@@ -563,26 +661,32 @@ func (b *wsHandlerBridge) OnFrame(h ws.Header, payload []byte) {
 }
 
 func (b *wsHandlerBridge) OnClose(err error) {
+	if b.batchInBlock != nil {
+		putPayloadBuffer(b.batchInBlock)
+		b.batchInBlock = nil
+		b.batchInBuf = nil
+	}
+	for i := range b.batchTasks {
+		if b.batchTasks[i].pooled != nil {
+			putPayloadBuffer(b.batchTasks[i].pooled)
+		}
+	}
+	b.batchTasks = b.batchTasks[:0]
+
 	b.queueMu.Lock()
 	b.closed = true
-	var droppedBytes int64
 	for i := range b.queue {
 		if b.queue[i].pooled != nil {
 			putPayloadBuffer(b.queue[i].pooled)
 		}
-		droppedBytes += int64(len(b.queue[i].payload))
 		b.queue[i] = wsTask{}
 	}
 	b.queue = b.queue[:0]
 	b.pendingBytes.Store(0)
 	b.queueMu.Unlock()
 
-	if droppedBytes > 0 {
-		globalPendingBytes.Add(-droppedBytes)
-	}
-
 	b.AbortFrame()
-	b.resumeReadConn()
+	b.resumeRead()
 
 	b.closeOnce.Do(func() {
 		if b.handler.OnClose != nil {
@@ -997,46 +1101,38 @@ func (c *Conn) writeFrameLocked(op OpCode, payload []byte) error {
 
 	if c.batching {
 		frameLen := hLen + len(toWrite)
-		if c.batchBlock == nil {
-			bufSize := 4 * 1024
-			if frameLen > bufSize {
-				bufSize = 16 * 1024
-				if frameLen > bufSize {
-					bufSize = 64 * 1024
-				}
-			}
-			c.batchBuf, c.batchBlock = getPayloadBuffer(bufSize)
-			c.batchBuf = c.batchBuf[:0]
-		}
-		if len(c.batchBuf)+frameLen > cap(c.batchBuf) {
+		if frameLen > 64*1024 {
 			if len(c.batchBuf) > 0 {
 				if _, err := c.conn.Write(c.batchBuf); err != nil {
 					return err
 				}
 				c.batchBuf = c.batchBuf[:0]
 			}
-			if frameLen > cap(c.batchBuf) {
-				if frameLen > 64*1024 {
-					if vw, ok := c.conn.(VectorWriter); ok {
-						return writeVectorDirect(vw, hBuf[:hLen], toWrite)
-					}
-					if _, err := c.conn.Write(hBuf[:hLen]); err != nil {
-						return err
-					}
-					if len(toWrite) > 0 {
-						_, err := c.conn.Write(toWrite)
-						return err
-					}
-					return nil
-				}
-				putPayloadBuffer(c.batchBlock)
-				bufSize := 16 * 1024
-				if frameLen > bufSize {
-					bufSize = 64 * 1024
-				}
-				c.batchBuf, c.batchBlock = getPayloadBuffer(bufSize)
-				c.batchBuf = c.batchBuf[:0]
+			if vw, ok := c.conn.(VectorWriter); ok {
+				return writeVectorDirect(vw, hBuf[:hLen], toWrite)
 			}
+			if _, err := c.conn.Write(hBuf[:hLen]); err != nil {
+				return err
+			}
+			if len(toWrite) > 0 {
+				_, err := c.conn.Write(toWrite)
+				return err
+			}
+			return nil
+		}
+		if c.batchBlock != nil && len(c.batchBuf)+frameLen > cap(c.batchBlock.buf) {
+			if _, err := c.conn.Write(c.batchBuf); err != nil {
+				return err
+			}
+			c.batchBuf = c.batchBuf[:0]
+		}
+		if c.batchBlock == nil {
+			bufSize := 16 * 1024
+			if frameLen > bufSize {
+				bufSize = 64 * 1024
+			}
+			c.batchBuf, c.batchBlock = getPayloadBuffer(bufSize)
+			c.batchBuf = c.batchBuf[:0]
 		}
 		c.batchBuf = append(c.batchBuf, hBuf[:hLen]...)
 		c.batchBuf = append(c.batchBuf, toWrite...)

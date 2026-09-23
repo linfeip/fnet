@@ -64,11 +64,12 @@ func defaultShards() int {
 //   - Non-blocking reactor offload: never blocks the I/O reactor event loop under heavy load.
 //   - Panic protection: user handler panics are caught and do not kill worker threads or the process.
 type WorkerPool struct {
-	shards    []*workerShard
-	shardMask uint64
-	round     atomic.Uint64
-	closed    atomic.Bool
-	wg        sync.WaitGroup
+	shards            []*workerShard
+	shardMask         uint64
+	round             atomic.Uint64
+	closed            atomic.Bool
+	globalIdleWorkers atomic.Int32
+	wg                sync.WaitGroup
 }
 
 type workerShard struct {
@@ -252,7 +253,7 @@ func (p *WorkerPool) trySteal(myShardID int) func() {
 
 // tryOffloadToIdle attempts to push a task to another shard that has idle workers waiting.
 func (p *WorkerPool) tryOffloadToIdle(task func(), myShardID int) bool {
-	if p.closed.Load() {
+	if p.closed.Load() || p.globalIdleWorkers.Load() == 0 {
 		return false
 	}
 	numShards := len(p.shards)
@@ -362,9 +363,9 @@ func (s *workerShard) submit(task func()) {
 
 	s.mu.RUnlock()
 
-	// 3. This shard is at capacity (all workers busy). If other shards have idle workers,
-	// offload to them immediately so idle CPU cores take the work rather than letting tasks stall.
-	if s.pool.tryOffloadToIdle(task, s.id) {
+	// 3. This shard is at capacity. If other shards have idle workers, offload to them immediately.
+	// Fast O(1) check: if globalIdleWorkers is 0, skip the 63-shard loop entirely!
+	if s.pool.globalIdleWorkers.Load() > 0 && s.pool.tryOffloadToIdle(task, s.id) {
 		return
 	}
 
@@ -470,9 +471,11 @@ func (s *workerShard) workerLoop(firstTask func()) {
 
 		// Enter idle wait state
 		s.idleWorkers.Add(1)
+		s.pool.globalIdleWorkers.Add(1)
 		select {
 		case task, ok := <-s.tasks:
 			s.idleWorkers.Add(-1)
+			s.pool.globalIdleWorkers.Add(-1)
 			if !ok {
 				return
 			}
@@ -480,6 +483,7 @@ func (s *workerShard) workerLoop(firstTask func()) {
 
 		case <-timer.C:
 			s.idleWorkers.Add(-1)
+			s.pool.globalIdleWorkers.Add(-1)
 			return
 		}
 	}

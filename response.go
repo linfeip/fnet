@@ -65,6 +65,14 @@ type WSFrameAssembler interface {
 	AbortFrame()
 }
 
+// WSBatchHandler is an optional interface extending WSHandler for handlers that
+// support batching multiple frames parsed from a single read into one dispatch round.
+type WSBatchHandler interface {
+	WSHandler
+	BeginBatch(estimatedBytes int)
+	EndBatch()
+}
+
 // WSAttacher is implemented by http.ResponseWriter (and hijacked net.Conn) in fnet
 // to transition the connection from the HTTP request goroutine into the Poller-driven
 // zero-goroutine WebSocket state.

@@ -217,7 +217,7 @@ type conn struct {
 	closed          atomic.Bool
 	writeArmed      atomic.Bool   // write interest registered with the poller
 	closeAfterFlush atomic.Bool   // close once the outbound queue drains
-	readPaused      atomic.Uint32 // bitmask of pause reasons (inbound, outbound, global)
+	readPaused      atomic.Uint32 // bitmask of pause reasons (inbound, outbound)
 
 	mu        sync.Mutex
 	wsHandler WSHandler
@@ -843,6 +843,11 @@ func (s *Server) dispatchWSFrames(c *conn, data []byte) (int, error) {
 	handler := c.wsHandler
 	c.mu.Unlock()
 	asm, hasAsm := handler.(WSFrameAssembler)
+	batchHandler, hasBatch := handler.(WSBatchHandler)
+	if hasBatch {
+		batchHandler.BeginBatch(len(data))
+		defer batchHandler.EndBatch()
+	}
 
 	off := 0
 	for off < len(data) {

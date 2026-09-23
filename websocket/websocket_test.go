@@ -2068,80 +2068,25 @@ func TestWebSocket_BatchCoalescing(t *testing.T) {
 			t.Fatalf("burst %d: got %q want %q", i, string(msg), expected)
 		}
 	}
-}
 
-func TestWebSocketGlobalPendingBytesAccounting(t *testing.T) {
-	port := getFreePort(t)
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-
-	var receivedCount atomic.Int32
-	var peakGlobal atomic.Int64
-	upgrader := &websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+	// 3. Test multi-frame packet (benchcli-uwscpp style batchFrame in single TCP write)
+	var multiBuf bytes.Buffer
+	for i := 0; i < burstCount; i++ {
+		payload := []byte(fmt.Sprintf("multi_msg_%d", i))
+		f := ws.MaskFrame(ws.NewTextFrame(payload))
+		_ = ws.WriteFrame(&multiBuf, f)
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		_, err := upgrader.UpgradeEvent(w, r, websocket.EventHandler{
-			OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
-				receivedCount.Add(1)
-				cur := websocket.GlobalPendingBytes()
-				for {
-					peak := peakGlobal.Load()
-					if cur <= peak || peakGlobal.CompareAndSwap(peak, cur) {
-						break
-					}
-				}
-				time.Sleep(10 * time.Millisecond) // slow business to keep queue occupied
-				_ = c.WriteMessage(op, msg[:10])
-			},
-		})
+	if _, err := conn.Write(multiBuf.Bytes()); err != nil {
+		t.Fatalf("write multiBuf failed: %v", err)
+	}
+	for i := 0; i < burstCount; i++ {
+		msg, err := wsutil.ReadServerText(conn)
 		if err != nil {
-			t.Errorf("UpgradeEvent error: %v", err)
+			t.Fatalf("read multi %d failed: %v", i, err)
 		}
-	})
-
-	srv := &fnet.Server{Addr: addr, Handler: mux}
-	go func() { _ = srv.ListenAndServe() }()
-	defer srv.Close()
-
-	time.Sleep(50 * time.Millisecond)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	conn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
-	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
-	defer conn.Close()
-
-	const numMessages = 4
-	const msgSize = 64 * 1024
-	payload := make([]byte, msgSize)
-
-	for i := 0; i < numMessages; i++ {
-		payload[0] = byte(i)
-		f := ws.MaskFrame(ws.NewBinaryFrame(payload))
-		if err := ws.WriteFrame(conn, f); err != nil {
-			t.Fatalf("write frame %d: %v", i, err)
+		expected := fmt.Sprintf("multi_msg_%d", i)
+		if string(msg) != expected {
+			t.Fatalf("multi %d: got %q want %q", i, string(msg), expected)
 		}
-	}
-
-	for i := 0; i < numMessages; i++ {
-		resp, err := ws.ReadFrame(conn)
-		if err != nil {
-			t.Fatalf("read reply %d: %v", i, err)
-		}
-		if len(resp.Payload) < 1 || resp.Payload[0] != byte(i) {
-			t.Fatalf("reply %d invalid: %v", i, resp.Payload)
-		}
-	}
-
-	if receivedCount.Load() != numMessages {
-		t.Fatalf("expected %d messages, got %d", numMessages, receivedCount.Load())
-	}
-	if peakGlobal.Load() == 0 {
-		t.Fatalf("expected peak global pending bytes > 0, got %d", peakGlobal.Load())
 	}
 }
