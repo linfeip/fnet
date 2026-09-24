@@ -4,153 +4,34 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
-	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"runtime"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestVirtualConnReadWrite(t *testing.T) {
-	vc := NewVirtualConn(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
-		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2})
-
-	var got []byte
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 64)
-		n, err := vc.Read(buf)
-		if err != nil {
-			t.Errorf("Read: %v", err)
-			return
-		}
-		got = append([]byte(nil), buf[:n]...)
-	}()
-
-	time.Sleep(20 * time.Millisecond)
-	vc.FeedInput([]byte("hello"))
-	wg.Wait()
-	if string(got) != "hello" {
-		t.Fatalf("got %q want hello", got)
-	}
-
-	n, err := vc.Write([]byte("world"))
-	if err != nil || n != 5 {
-		t.Fatalf("Write: n=%d err=%v", n, err)
-	}
-	out := make([]byte, 16)
-	n, rem := vc.DrainWrite(out)
-	if n != 5 || rem || string(out[:n]) != "world" {
-		t.Fatalf("DrainWrite: n=%d rem=%v data=%q", n, rem, out[:n])
-	}
-}
-
-func TestVirtualConnEOF(t *testing.T) {
-	vc := NewVirtualConn(nil, nil)
-	vc.FeedInput([]byte("ab"))
-	vc.FeedEOF()
-
-	buf := make([]byte, 8)
-	n, err := vc.Read(buf)
-	if err != nil || string(buf[:n]) != "ab" {
-		t.Fatalf("first read: n=%d err=%v data=%q", n, err, buf[:n])
-	}
-	n, err = vc.Read(buf)
-	if err != io.EOF || n != 0 {
-		t.Fatalf("second read: n=%d err=%v", n, err)
-	}
-}
-
-func TestVirtualConnCloseUnblocksRead(t *testing.T) {
-	vc := NewVirtualConn(nil, nil)
-	done := make(chan error, 1)
-	go func() {
-		buf := make([]byte, 8)
-		_, err := vc.Read(buf)
-		done <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	_ = vc.Close()
-	select {
-	case err := <-done:
-		if err != io.EOF {
-			t.Fatalf("want EOF, got %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Read did not unblock")
-	}
-}
-
-func TestVirtualConnReadDeadline(t *testing.T) {
-	vc := NewVirtualConn(nil, nil)
-	_ = vc.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
-	buf := make([]byte, 8)
-	_, err := vc.Read(buf)
-	if !errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("expected os.ErrDeadlineExceeded, got %v", err)
-	}
-}
-
-func TestVirtualConnWriteBufferLimit(t *testing.T) {
-	vc := NewVirtualConn(nil, nil)
-	// direct write not available, so all writes buffer in outBuf
-	chunk := make([]byte, 1024*1024) // 1MB
-	for i := 0; i < 16; i++ {
-		_, err := vc.Write(chunk)
-		if err != nil {
-			t.Fatalf("unexpected write error at %d: %v", i, err)
-		}
-	}
-	// 17th MB should exceed maxOutboundBufferSize (16MB)
-	_, err := vc.Write(chunk)
-	if !errors.Is(err, ErrWriteBufferFull) {
-		t.Fatalf("expected ErrWriteBufferFull, got %v", err)
-	}
-}
-
-func TestHTTPParseOverVirtualConn(t *testing.T) {
-	vc := NewVirtualConn(
-		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 80},
-		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345},
-	)
-
+func TestHTTPParseAndRespond(t *testing.T) {
 	raw := "GET /hello?x=1 HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\nContent-Length: 0\r\n\r\n"
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		vc.FeedInput([]byte(raw))
-	}()
-
-	req, err := http.ReadRequest(bufio.NewReader(vc))
+	req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(raw)))
 	if err != nil {
 		t.Fatalf("ReadRequest: %v", err)
 	}
-	if req.Method != http.MethodGet || req.URL.Path != "/hello" {
-		t.Fatalf("unexpected request: %s %s", req.Method, req.URL)
-	}
-	if req.Host != "example.com" {
-		t.Fatalf("host=%q", req.Host)
+	if req.Method != http.MethodGet || req.URL.Path != "/hello" || req.Host != "example.com" {
+		t.Fatalf("unexpected request: %s %s host=%q", req.Method, req.URL, req.Host)
 	}
 
-	w := newResponseWriter(vc)
+	var out bytes.Buffer
+	w := newResponseWriter(&bufferConn{buf: &out}, nil, nil)
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, "ok")
 	_ = w.finish()
-
-	out := make([]byte, 512)
-	n, _ := vc.DrainWrite(out)
-	resp := string(out[:n])
-	if !strings.Contains(resp, "HTTP/1.1 200") || !strings.Contains(resp, "ok") {
-		t.Fatalf("bad response:\n%s", resp)
+	resp := out.String()
+	if !strings.Contains(resp, "HTTP/1.1 200") || !strings.HasSuffix(resp, "\r\n\r\nok") {
+		t.Fatalf("bad response: %q", resp)
 	}
 }
 
@@ -193,7 +74,7 @@ func TestServerHTTP(t *testing.T) {
 }
 
 func TestServerHTTPS(t *testing.T) {
-	cert, err := generateTestCertificate()
+	cert, err := testCertificate()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,26 +128,10 @@ func TestServerHTTPS(t *testing.T) {
 	}
 }
 
-func TestPollerSmoke(t *testing.T) {
-	p, err := NewPoller()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close()
-	events, err := p.Wait(10 * time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if events == nil {
-		events = []Event{}
-	}
-	_ = fmt.Sprintf("%d", len(events))
-}
-
 func TestResponseWriterChunked(t *testing.T) {
 	var buf bytes.Buffer
 	rw := &bufferConn{buf: &buf}
-	w := newResponseWriter(rw)
+	w := newResponseWriter(rw, nil, nil)
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = w.Write([]byte("hi"))
@@ -291,6 +156,7 @@ func (c *bufferConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *bufferConn) SetWriteDeadline(time.Time) error { return nil }
 
 func TestZeroGoroutinesOnIdleConnections(t *testing.T) {
+	skipOnPumpEmulation(t)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "pong")
@@ -506,91 +372,5 @@ func TestServerCustomWorkerPoolPanicRecoveryAndGracefulClose(t *testing.T) {
 		// Success: server closed cleanly without deadlocking on s.wg
 	case <-time.After(2 * time.Second):
 		t.Fatal("server.Close() deadlocked on WaitGroup after custom WorkerPool panic")
-	}
-}
-
-func TestVirtualConn_OutboundSlabPool(t *testing.T) {
-	vc := NewVirtualConn(nil, nil)
-
-	// Direct write is not configured, so writes buffer into outBuf with pooled outBlock
-	msg1 := []byte("hello world 1")
-	msg2 := []byte("hello world 2")
-
-	n1, err1 := vc.Write(msg1)
-	if err1 != nil || n1 != len(msg1) {
-		t.Fatalf("Write 1: n=%d err=%v", n1, err1)
-	}
-	n2, err2 := vc.Write(msg2)
-	if err2 != nil || n2 != len(msg2) {
-		t.Fatalf("Write 2: n=%d err=%v", n2, err2)
-	}
-
-	if !vc.PendingWrite() {
-		t.Fatal("expected PendingWrite to be true")
-	}
-
-	buf := make([]byte, len(msg1)+len(msg2))
-	n, rem := vc.DrainWrite(buf)
-	if n != len(buf) || rem {
-		t.Fatalf("DrainWrite: n=%d rem=%v want %d", n, rem, len(buf))
-	}
-	expected := append(msg1, msg2...)
-	if !bytes.Equal(buf, expected) {
-		t.Fatalf("got %q want %q", buf, expected)
-	}
-
-	if vc.PendingWrite() {
-		t.Fatal("expected PendingWrite to be false after full drain")
-	}
-
-	// Verify unshift functionality with pooled buffer
-	unshiftData := []byte("unshifted prefix")
-	vc.UnshiftWrite(unshiftData)
-	if !vc.PendingWrite() {
-		t.Fatal("expected PendingWrite after UnshiftWrite")
-	}
-	buf2 := make([]byte, len(unshiftData))
-	n, rem = vc.DrainWrite(buf2)
-	if n != len(unshiftData) || rem || !bytes.Equal(buf2, unshiftData) {
-		t.Fatalf("DrainWrite after unshift: n=%d rem=%v got %q", n, rem, buf2)
-	}
-}
-
-func TestVirtualConn_OutboundBackpressure(t *testing.T) {
-	vc := NewVirtualConn(nil, nil)
-	var paused, resumed atomic.Bool
-	vc.SetPauseReadCallback(func() {
-		paused.Store(true)
-	})
-	vc.SetResumeReadCallback(func() {
-		resumed.Store(true)
-	})
-
-	// Writing 32KB (below 64KB high watermark) should not trigger pause
-	_, err := vc.Write(make([]byte, 32*1024))
-	if err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if paused.Load() {
-		t.Fatal("unexpected pause below watermark")
-	}
-
-	// Writing another 40KB (total 72KB > 64KB high watermark) should trigger pause
-	_, err = vc.Write(make([]byte, 40*1024))
-	if err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if !paused.Load() {
-		t.Fatal("expected pause above 64KB watermark")
-	}
-
-	// Drain 60KB (remaining 12KB <= 16KB low watermark) should trigger resume
-	drainBuf := make([]byte, 60*1024)
-	n, _ := vc.DrainWrite(drainBuf)
-	if n != len(drainBuf) {
-		t.Fatalf("drained %d want %d", n, len(drainBuf))
-	}
-	if !resumed.Load() {
-		t.Fatal("expected resume below 16KB low watermark")
 	}
 }

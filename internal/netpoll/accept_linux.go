@@ -1,10 +1,8 @@
 //go:build linux
 
-package fnet
+package netpoll
 
-import (
-	"golang.org/x/sys/unix"
-)
+import "golang.org/x/sys/unix"
 
 func sysAccept(fd int) (int, unix.Sockaddr, error) {
 	return unix.Accept4(fd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)

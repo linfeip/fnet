@@ -1,6 +1,7 @@
 package fnet
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -1517,7 +1518,7 @@ func TestHTTPDefaultHandlerIsServeMux(t *testing.T) {
 
 func TestResponseWriterContentLengthAuto(t *testing.T) {
 	var buf bytes.Buffer
-	w := newResponseWriter(&bufferConn{buf: &buf})
+	w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
 	_, _ = io.WriteString(w, "hello")
 	if err := w.finish(); err != nil {
 		t.Fatalf("finish: %v", err)
@@ -1533,7 +1534,7 @@ func TestResponseWriterContentLengthAuto(t *testing.T) {
 
 func TestResponseWriterSwitchesToChunkedPastBuffer(t *testing.T) {
 	var buf bytes.Buffer
-	w := newResponseWriter(&bufferConn{buf: &buf})
+	w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
 
 	// Stay inside the 64 KiB buffer, then cross it: the writer must abandon
 	// Content-Length and flush what it had as chunks.
@@ -1574,7 +1575,7 @@ func TestResponseWriterBodylessStatuses(t *testing.T) {
 	for _, status := range []int{http.StatusNoContent, http.StatusNotModified, http.StatusContinue} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			var buf bytes.Buffer
-			w := newResponseWriter(&bufferConn{buf: &buf})
+			w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
 			w.WriteHeader(status)
 			if _, err := io.WriteString(w, "must-be-dropped"); err != nil {
 				t.Fatalf("write: %v", err)
@@ -1598,8 +1599,8 @@ func TestResponseWriterBodylessStatuses(t *testing.T) {
 
 func TestResponseWriterHeadKeepsContentLength(t *testing.T) {
 	var buf bytes.Buffer
-	w := newResponseWriter(&bufferConn{buf: &buf})
-	w.SetHead(true)
+	w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
+	w.isHead = true
 	if _, err := io.WriteString(w, "hello world"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -1617,11 +1618,11 @@ func TestResponseWriterHeadKeepsContentLength(t *testing.T) {
 
 func TestResponseWriterWriteAfterHijack(t *testing.T) {
 	var buf bytes.Buffer
-	w := newResponseWriter(&bufferConn{buf: &buf})
+	w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
 	if _, _, err := w.Hijack(); err != nil {
 		t.Fatalf("Hijack: %v", err)
 	}
-	if !w.Hijacked() {
+	if !w.hijacked {
 		t.Fatal("Hijacked() = false after Hijack()")
 	}
 	if _, err := w.Write([]byte("x")); err == nil {
@@ -1638,8 +1639,8 @@ func TestResponseWriterWriteAfterHijack(t *testing.T) {
 func TestResponseWriterCloseHeader(t *testing.T) {
 	for _, closeConn := range []bool{false, true} {
 		var buf bytes.Buffer
-		w := newResponseWriter(&bufferConn{buf: &buf})
-		w.SetClose(closeConn)
+		w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
+		w.closeConn = closeConn
 		_ = w.finish()
 		want := "Connection: keep-alive\r\n"
 		if closeConn {
@@ -1869,15 +1870,15 @@ func TestHTTPMultipleSetCookieHeaders(t *testing.T) {
 			SameSite: http.SameSiteStrictMode,
 		})
 		http.SetCookie(w, &http.Cookie{
-			Name:     "theme",
-			Value:    "dark",
-			Path:     "/ui",
-			MaxAge:   3600,
+			Name:   "theme",
+			Value:  "dark",
+			Path:   "/ui",
+			MaxAge: 3600,
 		})
 		http.SetCookie(w, &http.Cookie{
-			Name:     "pref",
-			Value:    "lang=zh",
-			Path:     "/",
+			Name:  "pref",
+			Value: "lang=zh",
+			Path:  "/",
 		})
 		_, _ = io.WriteString(w, "cookie-test")
 	})
@@ -1946,4 +1947,237 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + fmt.Sprintf("...(%d bytes total)", len(s))
+}
+
+// TestHTTPClientHalfCloseStillAnswered: a client may send its request and shut
+// down its write side (half-close); the response must still arrive.
+func TestHTTPClientHalfCloseStillAnswered(t *testing.T) {
+	addr := startHTTPFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond) // the FIN lands while the handler runs
+		_, _ = io.WriteString(w, "still-here")
+	})
+	c, err := net.DialTimeout("tcp", addr, testDialTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, _ = io.WriteString(c, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(testIOTimeout))
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("no response after half-close: %v", err)
+	}
+	if got := readBody(t, resp); got != "still-here" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
+// TestHTTPLargeUnreadBodyClosesConnection: a handler that ignores a large body
+// must not make the server read it all to keep the connection alive.
+func TestHTTPLargeUnreadBodyClosesConnection(t *testing.T) {
+	addr := startHTTPFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ignored")
+	})
+	c := dialRaw(t, addr)
+	defer c.close()
+	const size = 4 << 20
+	c.write(fmt.Sprintf("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", size))
+	go func() { _, _ = c.c.Write(make([]byte, size)) }()
+	resp := c.readResponse("POST")
+	if got := readBody(t, resp); got != "ignored" {
+		t.Fatalf("body = %q", got)
+	}
+	_ = c.c.SetReadDeadline(time.Now().Add(testIOTimeout))
+	if _, err := c.br.ReadByte(); err == nil || isTimeout(err) {
+		t.Fatalf("connection stayed open behind a %d-byte unread body (err=%v)", size, err)
+	}
+}
+
+// TestHTTP10LargeResponseNotChunked: HTTP/1.0 has no chunked encoding, so a
+// body too large to buffer is delimited by closing the connection.
+func TestHTTP10LargeResponseNotChunked(t *testing.T) {
+	payload := strings.Repeat("z", 200<<10)
+	addr := startHTTPFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, payload)
+	})
+	out := rawExchange(t, addr, "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+	head, body, _ := strings.Cut(out, "\r\n\r\n")
+	if strings.Contains(head, "Transfer-Encoding") || !strings.Contains(head, "Connection: close") {
+		t.Fatalf("bad HTTP/1.0 framing:\n%s", head)
+	}
+	if body != payload {
+		t.Fatalf("body length %d, want %d", len(body), len(payload))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Timeouts on the event loop and 100-continue
+// ---------------------------------------------------------------------------
+
+// expectClosed fails unless the server closes c within limit.
+func expectClosed(t *testing.T, c *rawConn, limit time.Duration, what string) {
+	t.Helper()
+	start := time.Now()
+	_ = c.c.SetReadDeadline(time.Now().Add(limit))
+	if _, err := c.br.ReadByte(); err == nil || isTimeout(err) {
+		t.Fatalf("%s: connection still open after %v (err=%v)", what, time.Since(start), err)
+	}
+}
+
+func TestHTTPIdleTimeoutClosesPlaintextKeepAlive(t *testing.T) {
+	addr := startServer(t, &Server{
+		IdleTimeout: 300 * time.Millisecond,
+		Handler:     http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "ok") }),
+	})
+	c := dialRaw(t, addr)
+	defer c.close()
+	for i := 0; i < 3; i++ { // requests inside the idle window keep the connection
+		c.write("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+		if got := readBody(t, c.readResponse("GET")); got != "ok" {
+			t.Fatalf("request %d: body = %q", i, got)
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	expectClosed(t, c, 2*time.Second, "idle keep-alive")
+}
+
+// A header dripped byte by byte keeps the connection busy but must still be
+// complete within ReadHeaderTimeout of its first byte (slow-loris).
+func TestHTTPHeaderTimeoutBoundsSlowHeader(t *testing.T) {
+	var reached atomic.Int32
+	addr := startServer(t, &Server{
+		ReadHeaderTimeout: 300 * time.Millisecond,
+		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached.Add(1) }),
+	})
+	c := dialRaw(t, addr)
+	defer c.close()
+	go func() {
+		for _, b := range []byte("GET / HTTP/1.1\r\nHost: x\r\nX-Slow: " + strings.Repeat("a", 100)) {
+			if _, err := c.c.Write([]byte{b}); err != nil {
+				return
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+	expectClosed(t, c, 2*time.Second, "slow header")
+	if reached.Load() != 0 {
+		t.Fatal("handler ran for an incomplete header")
+	}
+}
+
+func TestHTTPHeaderTimeoutClosesSilentConnection(t *testing.T) {
+	addr := startServer(t, &Server{
+		ReadHeaderTimeout: 300 * time.Millisecond,
+		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
+	})
+	c := dialRaw(t, addr)
+	defer c.close()
+	expectClosed(t, c, 2*time.Second, "connection that never sends")
+}
+
+// A slow request header does not affect the next request's clock: the
+// deadline starts at each request's first byte.
+func TestHTTPHeaderTimeoutPerRequest(t *testing.T) {
+	addr := startServer(t, &Server{
+		ReadHeaderTimeout: 400 * time.Millisecond,
+		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "ok") }),
+	})
+	c := dialRaw(t, addr)
+	defer c.close()
+	for i := 0; i < 3; i++ {
+		time.Sleep(250 * time.Millisecond) // idle, then a header split over 200ms
+		c.write("GET / HTTP/1.1\r\n")
+		time.Sleep(200 * time.Millisecond)
+		c.write("Host: x\r\n\r\n")
+		if got := readBody(t, c.readResponse("GET")); got != "ok" {
+			t.Fatalf("request %d: body = %q", i, got)
+		}
+	}
+}
+
+// Like curl, the client waits for "100 Continue" before sending the body.
+func TestHTTPExpectContinueSendsInterimResponse(t *testing.T) {
+	addr := startHTTPFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_, _ = io.WriteString(w, "got="+string(b))
+	})
+	c := dialRaw(t, addr)
+	defer c.close()
+	c.write("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")
+	_ = c.c.SetReadDeadline(time.Now().Add(testIOTimeout))
+	status, err := c.br.ReadString('\n')
+	if err != nil || status != "HTTP/1.1 100 Continue\r\n" {
+		t.Fatalf("interim status %q (%v)", status, err)
+	}
+	if blank, _ := c.br.ReadString('\n'); blank != "\r\n" {
+		t.Fatalf("interim response not terminated: %q", blank)
+	}
+	c.write("hello")
+	if got := readBody(t, c.readResponse("POST")); got != "got=hello" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
+// A handler that answers from the headers alone sends no 100, and the
+// connection closes: the client may or may not send the body now.
+func TestHTTPExpectContinueUnreadBodyCloses(t *testing.T) {
+	addr := startHTTPFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "too large", http.StatusRequestEntityTooLarge)
+	})
+	c := dialRaw(t, addr)
+	defer c.close()
+	c.write("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")
+	resp := c.readResponse("POST")
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d (a 100 Continue leaked?)", resp.StatusCode)
+	}
+	_ = readBody(t, resp)
+	expectClosed(t, c, 2*time.Second, "unread expect-continue body")
+}
+
+// net/http's client waits ExpectContinueTimeout for the 100 before sending
+// the body; the server must not make it wait that long.
+func TestHTTPExpectContinueWithGoClient(t *testing.T) {
+	addr := startHTTPFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_, _ = w.Write(b)
+	})
+	client := &http.Client{Transport: &http.Transport{ExpectContinueTimeout: 5 * time.Second}}
+	defer client.CloseIdleConnections()
+	body := strings.Repeat("x", 4096)
+	req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/", strings.NewReader(body))
+	req.Header.Set("Expect", "100-continue")
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readBody(t, resp); got != body {
+		t.Fatalf("echoed %d bytes", len(got))
+	}
+	if el := time.Since(start); el > 2*time.Second {
+		t.Fatalf("request took %v: the client waited for a 100 Continue that never came", el)
+	}
+}
+
+// A handler may close a body the client declared but never sends: the response
+// still goes out, and the leftover body cannot hold the worker forever.
+func TestHTTPBodyNeverSentDoesNotHoldWorker(t *testing.T) {
+	addr := startServer(t, &Server{
+		ReadHeaderTimeout: 300 * time.Millisecond, // also bounds draining leftovers
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = r.Body.Close()
+			_, _ = io.WriteString(w, "done")
+		}),
+	})
+	c := dialRaw(t, addr)
+	defer c.close()
+	c.write("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nonly-10-by")
+	if got := readBody(t, c.readResponse("POST")); got != "done" {
+		t.Fatalf("body = %q", got)
+	}
+	expectClosed(t, c, 2*time.Second, "connection with a body that never arrives")
 }

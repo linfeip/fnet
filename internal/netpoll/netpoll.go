@@ -1,0 +1,45 @@
+// Package netpoll is the platform layer: readiness polling (epoll, kqueue, or
+// the Windows emulation) and the raw non-blocking socket calls around it.
+// Everything above this package is platform independent.
+package netpoll
+
+import (
+	"errors"
+	"syscall"
+	"time"
+)
+
+// Event is one readiness notification. Errors and hang-ups are reported as
+// Readable: the next Read surfaces them as an error or EOF.
+type Event struct {
+	Fd       int
+	Readable bool
+	Writable bool
+}
+
+// Poller is an edge-triggered readiness multiplexer. Registration methods are
+// safe to call from any goroutine and take effect at once, even while another
+// goroutine is blocked in Wait.
+type Poller interface {
+	// Add registers fd for read readiness.
+	Add(fd int) error
+	// EnableWrite adds write readiness to an fd registered with Add.
+	EnableWrite(fd int) error
+	// DisableWrite drops write readiness, keeping read readiness.
+	DisableWrite(fd int) error
+	// Wait blocks until events arrive, Wake is called, or timeout elapses
+	// (timeout < 0 waits forever). The returned slice is reused by the next Wait.
+	Wait(timeout time.Duration) ([]Event, error)
+	// Wake interrupts a blocked Wait.
+	Wake() error
+	// Close releases the poller.
+	Close() error
+}
+
+// NewPoller creates the platform-native poller.
+func NewPoller() (Poller, error) { return newPoller() }
+
+// IsAgain reports whether err means the operation would block.
+func IsAgain(err error) bool {
+	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)
+}

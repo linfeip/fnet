@@ -33,11 +33,11 @@ fnet 是 Go 的 HTTP/HTTPS 与 WebSocket 引擎。目标是**单进程同时撑�
 
 `conn` 上多一个字段、或每条连接多一个 goroutine、map、常驻缓冲，都先按 1e6 算清字节和 goroutine，再改，并在说明里写出这笔账。
 
-Linux `epoll` 承担百万连接。`kqueue` 与 `WSAPoll` 保持行为正确且能编译。平台差异只留在 poller、socket、writev 的实现文件里。
+Linux `epoll` 承担百万连接。`kqueue` 与 `WSAPoll` 保持行为正确且能编译。平台差异只留在 `internal/netpoll` 的 poller、socket、writev 实现文件里。
 
 ## 热路径
 
-`subReactor` 只做就绪、解析和移交。`ServeHTTP` 与 WebSocket 业务回调进 worker pool；同一连接经 `SubmitConn` 进同一分片，保持 FIFO。
+事件循环（`internal/reactor` 的 `Loop`）只做就绪、解析和移交。`ServeHTTP` 与 WebSocket 业务回调进 worker pool；同一连接经 `SubmitConn` 进同一分片，保持 FIFO。
 
 稳定态的 accept、read、write 复用 reactor 缓冲、对象池和 `writev`。
 
@@ -51,7 +51,7 @@ Linux `epoll` 承担百万连接。`kqueue` 与 `WSAPoll` 保持行为正确且�
 
 - 近乎全部连接空闲，少数在推送或请求（IM、推送、扇出），旁边还有普通 HTTP。
 - HTTP/1.1：keep-alive、Read/Write/Idle 超时、分块、慢速头部（上限 `maxHeaderBuffer`）、对端突然断开。
-- HTTPS 走 worker 上的 TLS。事件驱动 WebSocket 目前挂不到 TLS 连接上（`ErrWSAttachUnsupported`）。明文压测代表不了这条路径。
+- HTTPS 走 worker 上的 TLS。事件驱动 WebSocket 目前挂不到 TLS 连接上（`Unwrap` 返回 nil，回退为每连接一个 goroutine）。明文压测代表不了这条路径。
 - WebSocket 遵守 RFC 6455：掩码、Ping/Pong/Close、Origin、子协议、分片。百万连接用事件驱动，空闲时 0 goroutine。阻塞 `ReadMessage` 留给请求-响应式用法。
 - 瞬时大量建连，以及成批断开。
 - 业务 handler 是真实业务：会查库、会调下游、会慢、会返回大响应、偶尔会 panic。不假设 handler 是立即返回的回显。

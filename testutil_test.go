@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -197,4 +198,23 @@ func isTimeout(err error) bool {
 	}
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// testCertificate returns a self-signed localhost certificate.
+func testCertificate() (tls.Certificate, error) {
+	certPEM, keyPEM, err := GenerateSelfSignedCertPEM()
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+// skipOnPumpEmulation skips tests that count goroutines or bytes per idle
+// connection: the Windows emulation in internal/netpoll parks a read-pump
+// goroutine on every socket, which the native epoll/kqueue pollers do not.
+func skipOnPumpEmulation(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows socket emulation holds a pump goroutine per connection")
+	}
 }

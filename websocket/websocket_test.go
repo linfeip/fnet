@@ -296,6 +296,7 @@ func TestWebSocketSubprotocol(t *testing.T) {
 }
 
 func TestWebSocketZeroGoroutinesOnIdleConnections(t *testing.T) {
+	skipOnPumpEmulation(t)
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
@@ -595,6 +596,7 @@ func BenchmarkWebSocketEventDrivenEcho(b *testing.B) {
 }
 
 func TestWebSocketIdleMemoryFootprint(t *testing.T) {
+	skipOnPumpEmulation(t)
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
@@ -2089,4 +2091,122 @@ func TestWebSocket_BatchCoalescing(t *testing.T) {
 			t.Fatalf("multi %d: got %q want %q", i, string(msg), expected)
 		}
 	}
+}
+
+// skipOnPumpEmulation skips tests that count goroutines or bytes per idle
+// connection: the Windows emulation in internal/netpoll parks a read-pump
+// goroutine on every socket, which the native epoll/kqueue pollers do not.
+func skipOnPumpEmulation(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows socket emulation holds a pump goroutine per connection")
+	}
+}
+
+// Messages that arrive before the client's Close frame are all delivered, in
+// order, and OnClose runs after them.
+func TestWebSocketMessagesBeforeCloseAreDelivered(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		got      []string
+		atClose  = -1
+		closedCh = make(chan struct{})
+	)
+	upgrader := &websocket.Upgrader{
+		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+			time.Sleep(20 * time.Millisecond) // slow business logic
+			mu.Lock()
+			got = append(got, string(msg))
+			mu.Unlock()
+		},
+		OnClose: func(c *websocket.Conn, err error) {
+			mu.Lock()
+			atClose = len(got)
+			mu.Unlock()
+			close(closedCh)
+		},
+	}
+	addr := startWSServer(t, upgrader)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	var burst bytes.Buffer
+	for i := 0; i < 5; i++ {
+		_ = ws.WriteFrame(&burst, ws.MaskFrame(ws.NewTextFrame([]byte(fmt.Sprintf("m%d", i)))))
+	}
+	_ = ws.WriteFrame(&burst, ws.MaskFrame(ws.NewCloseFrame(ws.NewCloseFrameBody(ws.StatusNormalClosure, ""))))
+	if _, err := conn.Write(burst.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-closedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnClose not called")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(got, ",") != "m0,m1,m2,m3,m4" || atClose != 5 {
+		t.Fatalf("delivered %v, OnClose after %d messages", got, atClose)
+	}
+}
+
+// A panicking OnMessage closes its connection with 1011; the server lives on.
+func TestWebSocketOnMessagePanicClosesWith1011(t *testing.T) {
+	upgrader := &websocket.Upgrader{
+		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+			if string(msg) == "boom" {
+				panic("handler bug")
+			}
+			_ = c.WriteMessage(op, msg)
+		},
+	}
+	addr := startWSServer(t, upgrader)
+
+	dial := func() net.Conn {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/ws")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		return conn
+	}
+
+	bad := dial()
+	defer bad.Close()
+	_ = wsutil.WriteClientText(bad, []byte("boom"))
+	f, err := ws.ReadFrame(bad)
+	if err != nil || f.Header.OpCode != ws.OpClose {
+		t.Fatalf("want a Close frame, got %+v %v", f.Header, err)
+	}
+	if code, _ := ws.ParseCloseFrameData(f.Payload); code != ws.StatusInternalServerError {
+		t.Fatalf("close status %d, want 1011", code)
+	}
+
+	good := dial()
+	defer good.Close()
+	_ = wsutil.WriteClientText(good, []byte("hi"))
+	if msg, err := wsutil.ReadServerText(good); err != nil || string(msg) != "hi" {
+		t.Fatalf("echo after panic: %q %v", msg, err)
+	}
+}
+
+func startWSServer(t *testing.T, u *websocket.Upgrader) string {
+	t.Helper()
+	addr := fmt.Sprintf("127.0.0.1:%d", getFreePort(t))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) { _, _ = u.Upgrade(w, r) })
+	srv := &fnet.Server{Addr: addr, Handler: mux}
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() { _ = srv.Close() })
+	time.Sleep(50 * time.Millisecond)
+	return addr
 }

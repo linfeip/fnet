@@ -293,6 +293,7 @@ func TestWebSocketWorkerPool_StrictPerConnOrdering(t *testing.T) {
 }
 
 func TestWebSocket1MScaleSimulation(t *testing.T) {
+	skipOnPumpEmulation(t)
 	// Simulate connection lifecycle and worker pool behavior for high-concurrency systems.
 	// 1. 100 idle connections should produce 0 worker goroutines and negligible heap overhead.
 	// 2. Active burst on a subset of connections dispatches through worker pool without unbounded growth.
@@ -402,4 +403,3 @@ func TestWebSocketWorkerPool_AdaptPool(t *testing.T) {
 		t.Fatalf("expected simpleSubmit to run, count=%d, executed=%v", count.Load(), executed.Load())
 	}
 }
-

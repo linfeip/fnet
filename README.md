@@ -4,7 +4,7 @@ English | [中文](README.zh-CN.md)
 
 A production-grade, ultra-high-performance HTTP/HTTPS and WebSocket engine for Go, engineered for **million-level concurrent connections (1M Conns)** with minimal memory footprint and extreme CPU efficiency.
 
-I/O is driven by native multi-reactor pollers (**epoll** on Linux, **kqueue** on macOS, **WSAPoll** on Windows). It adheres strictly to RFC 6455 and Go's standard `net/http` contracts without compromising on real-world business requirements.
+I/O is driven by native multi-reactor pollers (**epoll** on Linux, **kqueue** on macOS; Windows runs an emulation for development). It adheres strictly to RFC 6455 and Go's standard `net/http` contracts without compromising on real-world business requirements.
 
 ---
 
@@ -20,27 +20,30 @@ I/O is driven by native multi-reactor pollers (**epoll** on Linux, **kqueue** on
 
 ## 🏗️ Architecture
 
-fnet employs a hybrid high-performance architecture: **Multi-Reactor Event-Driven I/O + VirtualConn Bridge + Sharded Concurrent Worker Pool**. It combines the near-zero resource cost of reactor-driven millions of concurrent connections with full compatibility for standard Go blocking business logic.
+Four layers, each doing one job:
+
+| Layer | Package | Responsibility |
+|---|---|---|
+| Platform | `internal/netpoll` | epoll / kqueue / Windows emulation, raw non-blocking socket calls. The only platform-specific code. |
+| Reactor | `internal/reactor` | Acceptor, event loops, connection table, per-connection input/output buffering, backpressure, close. Moves bytes only. |
+| Server + HTTP | `fnet` | `Server` lifecycle and listeners; HTTP/1.x: decide when a request is ready, run `ServeHTTP` on a worker, keep-alive, TLS, hijack. |
+| WebSocket | `websocket` | Handshake, RFC 6455 framing and control frames, permessage-deflate, event-driven message queue. |
+
+Protocols plug into the reactor through one interface, `reactor.Handler` (`OnData` / `OnClose`, run on the event loop). A connection's input is either delivered to its handler on the loop (idle, zero goroutines) or *detached* to a blocking reader on a worker (`net.Conn` semantics for `net/http` and TLS), and handed back with `Attach`.
 
 ```text
 Client
   |
   v
-Main Reactor (accept)
-  |
-  v
-Sub-Reactor (epoll / kqueue) ---- idle connection stays here, 0 goroutines
-  |
-  +-- HTTP: header complete (\r\n\r\n) --> Worker Pool --> ServeHTTP
-  |
-  +-- WebSocket: full frame --> unmask --> buffer pool --> Worker Pool --> OnMessage
-  |                 |
-  |                 +-- queued bytes too high --> pause read
-  |
-  v
-Write: writev to the socket
-  |
-  +-- kernel buffer full --> queue, reactor flushes on writable
+Acceptor (accept4) --> Event loop (epoll / kqueue) ---- idle connection waits here, 0 goroutines
+                          |
+                          +-- HTTP: header complete --> Detach --> worker: ServeHTTP --> Attach (back to idle)
+                          |
+                          +-- WebSocket: frames parsed on the loop --> pooled message --> worker: OnMessage
+                          |                  |
+                          |                  +-- too many queued bytes --> pause reading
+                          v
+                    Output: direct (writev) write; kernel buffer full --> queued, flushed by the loop
 ```
 
 ---
@@ -48,36 +51,38 @@ Write: writev to the socket
 ## Core Design Principles
 
 ### 1. 1M Conns "Zero-Goroutine While Idle"
-* **Idle Connections**: Live sockets wait directly on the reactor's epoll/kqueue set, taking only a single pointer slot in the global chunked connection table. Idle connections hold **0 goroutines, 0 workers, and 0 read/write buffers**.
-* **Lock-Free Chunked Table**: 2048-entry atomic pointer chunks allow $O(1)$ concurrent lookups for 1M+ active connections without global lock contention during scaling.
+* **Idle Connections**: Live sockets wait on the event loop's epoll/kqueue set and take one pointer slot in the chunked connection table plus one `reactor.Conn` (256 B). Idle connections hold **no goroutine, no worker, and no read/write buffer**; the 64 KiB read buffer belongs to the event loop.
+* **Lock-Free Chunked Table**: 2048-entry atomic pointer chunks give $O(1)$ lookups without global lock contention while growing.
 
-### 2. High-Performance HTTP & Streaming
-* **Immediate Header Dispatch**: Sub-reactors continuously receive TCP streams and immediately dispatch the connection to the worker pool upon detecting a complete header (`\r\n\r\n`), without waiting for the body to finish downloading.
-* **Large File & `io.Copy` Streaming**: `VirtualConn` provides true `net.Conn` semantics. In handlers, `io.Copy(dst, req.Body)` streams data directly to disk as chunks arrive, maintaining a constant memory footprint of ~32KB regardless of whether the file is 100MB or 1GB.
+### 2. HTTP
+* **Dispatch On A Complete Header**: The event loop dispatches a connection to the worker pool as soon as a complete header (`\r\n\r\n`) is buffered, without waiting for the body. Headers that never finish are capped at 64 KiB.
+* **Streaming Bodies**: While a worker owns the connection it reads with ordinary blocking `net.Conn` semantics, so `io.Copy(dst, req.Body)` streams with constant memory.
+* **Back To Idle**: After a plaintext response the connection returns to the event loop and the worker goroutine is released; a pipelined request that is already buffered keeps the worker. A client half-close (request, then FIN) still gets its response.
+* **Timeouts Without Goroutines**: While the event loop holds a connection, a per-loop timing wheel enforces the header deadline (`ReadHeaderTimeout`, default 30s, counted from accept or from a request's first byte, so a slow-loris drip cannot extend it) and the keep-alive idle deadline (`IdleTimeout`, default 2 min). A closing connection whose peer stops taking output is dropped after 30s without progress, or at the write deadline.
+* **`Expect: 100-continue`**: answered with `100 Continue` when the handler first reads the body; a handler that replies without reading it gets the connection closed afterwards.
 
-### 3. WebSocket Throughput & Large Frame Optimization
-* **Zero-Allocation In-Place Framing**: Headers are decoded directly on the reactor's 64KB shared read buffer. Client payloads are unmasked in place using **SIMD (AVX2 / NEON)** vector instructions.
-* **Tiered Slab Buffer Pool**: Comprehensive buffer pools cover sizes from 128B up to 16MB. Frames within 16MB require **0 heap allocations**.
-* **Streaming Frame Assembler**: Large frames (>64KB) stream directly into dedicated slab buffers, completely avoiding repeated `append` reallocations. Buffer ownership is handed off to tasks and automatically returned upon callback exit with zero user burden.
-* **Silent Backpressure**: If queued, unprocessed payload bytes exceed the threshold (default 4MB), `PauseRead` automatically suspends socket reads, using TCP sliding windows to throttle sender throughput and eliminate OOM risks.
+### 3. WebSocket
+* **Parsing On The Loop, Business On Workers**: Frames are parsed and unmasked on the event loop, Ping/Close are answered there, and each complete message is copied into a pooled buffer and queued. `OnMessage` runs on the worker pool, one call at a time per connection, in order; `OnClose` follows the messages that arrived before the close.
+* **Tiered Buffer Pool**: Pooled buffers from 128 B to 16 MiB; a large frame streams into its message buffer as bytes arrive, so memory follows what was received, not what a header claims.
+* **Backpressure**: When a connection's queued message bytes exceed the threshold (default 64 KiB), reading pauses and TCP flow control slows the sender.
 
-### 4. Direct Output & Vector I/O (`writev`)
-* **Fast-Path Direct Writes**: Senders prioritize direct non-blocking writes to the socket. As long as the kernel send buffer is not saturated, output bypasses the reactor entirely with 0 dispatch overhead.
-* **Scatter-Gather Framing**: Stack-formatted 2~10 byte headers and payload slices are merged into single `writev` syscalls, eliminating user-space frame assembly buffer copies.
+### 4. Output
+* **Direct Writes**: Writers go straight to the socket; only what the kernel does not accept is queued (up to 16 MiB per connection) and flushed by the event loop. Queued output above 64 KiB pauses reading until it drains.
+* **`writev`**: Frame or response headers and payloads leave in a single `writev` call without an intermediate copy.
 
 ---
 
 ## Features
 
 - **Standard `net/http` API**: Direct drop-in for `http.Handler` / `http.ServeMux` via `fnet.ListenAndServe` and `fnet.ListenAndServeTLS`.
-- **Multi-Reactor Architecture**: Main poller handles non-blocking accepts (`accept4` on Linux), distributing sockets across worker sub-reactors matching CPU cores.
+- **Multi-Reactor Architecture**: One acceptor (`accept4` on Linux) distributes sockets round-robin across event loops matching CPU cores.
 - **Dual WebSocket Modes**:
   - **Event-Driven**: Zero goroutines while idle; frame parsing happens in the reactor, and business callbacks (`OnMessage`) are automatically offloaded to a high-performance sharded worker pool to keep the I/O event loop unblocked.
   - **Blocking/Goroutine**: Full `net.Conn` stream compatibility for traditional request-response and blocking loops.
 - **Built-in High-Concurrency Worker Pool**: Zero external dependencies, multi-shard lock-free design, per-connection strict FIFO ordering, and automatic idle worker reclamation for 1M+ connections. Both HTTP business requests (`ServeHTTP`) and WebSocket messages (`OnMessage`) are processed by default on the worker pool, completely freeing the I/O Reactor threads.
 - **Vector I/O (`writev`)**: Stack-allocated header framing merged with payload into single syscall writes to eliminate intermediate buffer copies.
 - **Aggressive Memory Optimization**: Chunked lock-free connection tables, pooled response writers, lazy address resolution, and auto-compacting buffers.
-- **Cross-Platform**: Linux (`epoll`), macOS/Darwin (`kqueue`), Windows (`WSAPoll`).
+- **Cross-Platform**: Linux (`epoll`), macOS/Darwin (`kqueue`). Windows runs a development emulation on top of the `net` package (one pump goroutine per socket).
 
 ---
 

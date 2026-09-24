@@ -1148,3 +1148,24 @@ func TestHTTPSClientAbruptDisconnect(t *testing.T) {
 		t.Fatalf("got body %q, want healthy", got)
 	}
 }
+
+// A TLS client that stalls mid-handshake is bounded by ReadHeaderTimeout even
+// without a ReadTimeout.
+func TestHTTPSHeaderTimeoutBoundsStalledHandshake(t *testing.T) {
+	ca := newTestCA(t)
+	addr := startServer(t, &Server{
+		TLSConfig:         &tls.Config{Certificates: []tls.Certificate{ca.serverCert(t)}},
+		ReadHeaderTimeout: 300 * time.Millisecond,
+		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
+	})
+	c, err := net.DialTimeout("tcp", addr, testDialTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, _ = c.Write([]byte{0x16, 0x03, 0x01}) // the start of a ClientHello, then nothing
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil || isTimeout(err) {
+		t.Fatalf("stalled handshake still open (err=%v)", err)
+	}
+}

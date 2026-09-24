@@ -120,6 +120,9 @@ func TestHTTPWorkerPool_SlowBusinessDoesNotBlockReactor(t *testing.T) {
 }
 
 func TestHTTPWorkerPool_KeepAliveIdleZeroGoroutines(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows socket emulation holds a pump goroutine per connection")
+	}
 	// Scenario:
 	// Establish 100 Keep-Alive HTTP connections. Each connection sends an initial HTTP request,
 	// receives the response, and then stays open in idle keep-alive state.
@@ -578,5 +581,3 @@ func TestWorkerPool_AdaptPool(t *testing.T) {
 		t.Fatal("expected nil for nil submit function")
 	}
 }
-
-

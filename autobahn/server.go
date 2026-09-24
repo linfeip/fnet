@@ -37,7 +37,7 @@ func main() {
 
 	go func() {
 		log.Printf("[Event-Driven] WebSocket echo server listening on ws://0.0.0.0:%d", *eventPort)
-		if err := eventSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := eventSrv.ListenAndServe(); err != nil && err != fnet.ErrServerClosed {
 			log.Fatalf("event server error: %v", err)
 		}
 	}()
@@ -64,7 +64,7 @@ func main() {
 
 	go func() {
 		log.Printf("[Goroutine]    WebSocket echo server listening on ws://0.0.0.0:%d", *goroutinePort)
-		if err := goroutineSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := goroutineSrv.ListenAndServe(); err != nil && err != fnet.ErrServerClosed {
 			log.Fatalf("goroutine server error: %v", err)
 		}
 	}()
