@@ -7,9 +7,9 @@ import (
 
 	"github.com/gobwas/ws"
 
-	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/internal/bufpool"
 	"github.com/linfeip/fnet/internal/reactor"
+	"github.com/linfeip/fnet/pool"
 )
 
 // message is one complete, unmasked data message waiting for a worker.
@@ -267,19 +267,12 @@ func (e *eventConn) OnClose(_ *reactor.Conn, err error) {
 // ---------------------------------------------------------------------------
 
 func (e *eventConn) schedule() {
-	if e.submit == nil {
-		fnet.DefaultWorkerPool.SubmitConn(e.id, e.run)
-		return
+	if !pool.Dispatch(e.submit, e.id, e.run) {
+		_ = e.c.nc.Close() // the custom pool rejected the task
+		e.mu.Lock()
+		e.running = false
+		e.mu.Unlock()
 	}
-	defer func() {
-		if recover() != nil { // the custom pool rejected the task
-			_ = e.c.nc.Close()
-			e.mu.Lock()
-			e.running = false
-			e.mu.Unlock()
-		}
-	}()
-	e.submit(e.id, e.run)
 }
 
 // run drains the queue on a worker; at most one run is active per connection.

@@ -1,11 +1,8 @@
-// Package fnet serves HTTP/1.x, HTTPS and WebSocket from native event loops
-// (epoll, kqueue, or the Windows emulation) behind the standard http.Handler
-// API. Idle connections are parked on a poller and hold no goroutine.
-//
-// Layout: internal/netpoll is the platform layer, internal/reactor owns the
-// event loops and connections, this package runs HTTP on top of them, and
-// package websocket runs WebSocket on top of the same connections.
-package fnet
+// Package fhttp serves HTTP/1.x and HTTPS from fnet's event loops behind the
+// standard http.Handler API. Idle keep-alive connections are parked on a
+// poller and hold no goroutine; package websocket upgrades them onto the same
+// event loops.
+package fhttp
 
 import (
 	"crypto/tls"
@@ -21,7 +18,7 @@ import (
 )
 
 // ErrServerClosed is returned by the ListenAndServe methods after Close.
-var ErrServerClosed = errors.New("fnet: server closed")
+var ErrServerClosed = errors.New("fnet/fhttp: server closed")
 
 const (
 	// DefaultReadHeaderTimeout bounds the wait for a request header when neither
@@ -31,10 +28,6 @@ const (
 	// when IdleTimeout is not set.
 	DefaultIdleTimeout = 2 * time.Minute
 )
-
-// ErrWriteBufferFull is returned by a connection write when its outbound queue
-// (16 MiB) is full because the peer is not reading.
-var ErrWriteBufferFull = reactor.ErrWriteBufferFull
 
 // Server serves HTTP/1.x over native event loops. A single Server runs one
 // accept loop and NumPollers event loops however many addresses it listens on.
@@ -54,8 +47,7 @@ type Server struct {
 	ReadHeaderTimeout time.Duration
 	// ReadTimeout bounds reading each request, header and body.
 	ReadTimeout time.Duration
-	// WriteTimeout bounds writing each response, including flushing it when
-	// the connection closes.
+	// WriteTimeout bounds writing each response.
 	WriteTimeout time.Duration
 	// IdleTimeout bounds the wait for the next request on a keep-alive
 	// connection. Plaintext idle connections wait on the poller and hold no
@@ -71,8 +63,8 @@ type Server struct {
 	Listen func(network, addr string) (net.Listener, error)
 
 	// WorkerPool runs request handlers, keyed by connection for affinity
-	// (e.g. pool.SubmitConn, or fnet.AdaptPool(ants.Submit)). It is called on
-	// an event loop and must not block. Defaults to DefaultWorkerPool.
+	// (e.g. p.SubmitConn for a *pool.Pool p, or pool.Adapt(ants.Submit)). It
+	// is called on an event loop and must not block. Defaults to pool.Default().
 	WorkerPool func(connID uint64, task func())
 
 	mu     sync.Mutex

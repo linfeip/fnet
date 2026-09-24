@@ -466,3 +466,23 @@ func TestEngineDrainKeepsGoingWhilePeerReads(t *testing.T) {
 		t.Fatalf("OnClose err = %v, want nil", err)
 	}
 }
+
+// tls.Conn.Close sets the write deadline to "now" before closing the
+// connection; output already queued must still be flushed.
+func TestEngineDrainIgnoresPassedWriteDeadline(t *testing.T) {
+	payload := bytes.Repeat([]byte("z"), 4<<20)
+	addr := startEngine(t, &funcHandler{data: func(c *Conn, b []byte) int {
+		_, _ = c.Write(payload)
+		_ = c.SetWriteDeadline(time.Now())
+		_ = c.Close()
+		return len(b)
+	}})
+	c := dial(t, addr)
+	_, _ = c.Write([]byte("go"))
+	time.Sleep(100 * time.Millisecond) // let the server queue and close first
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	all, err := io.ReadAll(c)
+	if err != nil || len(all) != len(payload) {
+		t.Fatalf("read %d of %d bytes (%v)", len(all), len(payload), err)
+	}
+}

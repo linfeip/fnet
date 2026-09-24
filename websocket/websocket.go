@@ -78,9 +78,9 @@ type Upgrader struct {
 	// until they drain to a quarter of it: 0 means 64 KiB, negative disables.
 	MaxPendingMessageBytes int64
 
-	// WorkerPool runs OnMessage, keyed by connection (e.g. pool.SubmitConn, or
-	// fnet.AdaptPool(ants.Submit)). It is called on an event loop and must not
-	// block. Defaults to fnet.DefaultWorkerPool.
+	// WorkerPool runs OnMessage, keyed by connection (e.g. p.SubmitConn for a
+	// *pool.Pool p, or pool.Adapt(ants.Submit)). It is called on an event loop
+	// and must not block. Defaults to pool.Default().
 	WorkerPool func(connID uint64, task func())
 
 	// Setting OnMessage makes Upgrade event-driven; see EventHandler.
@@ -130,7 +130,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error
 var nextConnID atomic.Uint64
 
 // UpgradeEvent upgrades the request and drives the connection with h. On an
-// fnet server the connection moves onto the event loop and the HTTP handler
+// fhttp server the connection moves onto the event loop and the HTTP handler
 // should return; it then holds no goroutine while idle. Where the loop cannot
 // read the stream (TLS, or another HTTP server) a goroutine delivers the same
 // callbacks.

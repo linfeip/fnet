@@ -20,14 +20,15 @@ I/O is driven by native multi-reactor pollers (**epoll** on Linux, **kqueue** on
 
 ## 🏗️ Architecture
 
-Four layers, each doing one job:
+Four layers, each doing one job, plus the worker pool that runs business code:
 
 | Layer | Package | Responsibility |
 |---|---|---|
 | Platform | `internal/netpoll` | epoll / kqueue / Windows emulation, raw non-blocking socket calls. The only platform-specific code. |
 | Reactor | `internal/reactor` | Acceptor, event loops, connection table, per-connection input/output buffering, backpressure, close. Moves bytes only. |
-| Server + HTTP | `fnet` | `Server` lifecycle and listeners; HTTP/1.x: decide when a request is ready, run `ServeHTTP` on a worker, keep-alive, TLS, hijack. |
+| Server + HTTP | `fhttp` | `Server` lifecycle and listeners; HTTP/1.x: decide when a request is ready, run `ServeHTTP` on a worker, keep-alive, TLS, hijack. |
 | WebSocket | `websocket` | Handshake, RFC 6455 framing and control frames, permessage-deflate, event-driven message queue. |
+| Worker pool | `pool` | Sharded goroutine pool that runs `ServeHTTP` and `OnMessage`; shared by `fhttp` and `websocket`, no networking code. |
 
 Protocols plug into the reactor through one interface, `reactor.Handler` (`OnData` / `OnClose`, run on the event loop). A connection's input is either delivered to its handler on the loop (idle, zero goroutines) or *detached* to a blocking reader on a worker (`net.Conn` semantics for `net/http` and TLS), and handed back with `Attach`.
 
@@ -58,7 +59,7 @@ Acceptor (accept4) --> Event loop (epoll / kqueue) ---- idle connection waits he
 * **Dispatch On A Complete Header**: The event loop dispatches a connection to the worker pool as soon as a complete header (`\r\n\r\n`) is buffered, without waiting for the body. Headers that never finish are capped at 64 KiB.
 * **Streaming Bodies**: While a worker owns the connection it reads with ordinary blocking `net.Conn` semantics, so `io.Copy(dst, req.Body)` streams with constant memory.
 * **Back To Idle**: After a plaintext response the connection returns to the event loop and the worker goroutine is released; a pipelined request that is already buffered keeps the worker. A client half-close (request, then FIN) still gets its response.
-* **Timeouts Without Goroutines**: While the event loop holds a connection, a per-loop timing wheel enforces the header deadline (`ReadHeaderTimeout`, default 30s, counted from accept or from a request's first byte, so a slow-loris drip cannot extend it) and the keep-alive idle deadline (`IdleTimeout`, default 2 min). A closing connection whose peer stops taking output is dropped after 30s without progress, or at the write deadline.
+* **Timeouts Without Goroutines**: While the event loop holds a connection, a per-loop timing wheel enforces the header deadline (`ReadHeaderTimeout`, default 30s, counted from accept or from a request's first byte, so a slow-loris drip cannot extend it) and the keep-alive idle deadline (`IdleTimeout`, default 2 min). A closing connection whose peer stops taking output is dropped after 30s without progress.
 * **`Expect: 100-continue`**: answered with `100 Continue` when the handler first reads the body; a handler that replies without reading it gets the connection closed afterwards.
 
 ### 3. WebSocket
@@ -74,7 +75,7 @@ Acceptor (accept4) --> Event loop (epoll / kqueue) ---- idle connection waits he
 
 ## Features
 
-- **Standard `net/http` API**: Direct drop-in for `http.Handler` / `http.ServeMux` via `fnet.ListenAndServe` and `fnet.ListenAndServeTLS`.
+- **Standard `net/http` API**: Direct drop-in for `http.Handler` / `http.ServeMux` via `fhttp.ListenAndServe` and `fhttp.ListenAndServeTLS`.
 - **Multi-Reactor Architecture**: One acceptor (`accept4` on Linux) distributes sockets round-robin across event loops matching CPU cores.
 - **Dual WebSocket Modes**:
   - **Event-Driven**: Zero goroutines while idle; frame parsing happens in the reactor, and business callbacks (`OnMessage`) are automatically offloaded to a high-performance sharded worker pool to keep the I/O event loop unblocked.
@@ -108,7 +109,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
 )
 
 func main() {
@@ -118,14 +119,14 @@ func main() {
 	})
 
 	// Plain HTTP
-	log.Fatal(fnet.ListenAndServe(":8080", mux))
+	log.Fatal(fhttp.ListenAndServe(":8080", mux))
 }
 ```
 
 Configuring HTTPS with timeouts:
 
 ```go
-srv := &fnet.Server{
+srv := &fhttp.Server{
 	Addr:         ":8443",
 	Handler:      mux,
 	ReadTimeout:  5 * time.Second,
@@ -148,7 +149,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/websocket"
 )
 
@@ -175,7 +176,7 @@ func main() {
 		// Returning here hands the socket to the event loop.
 	})
 
-	log.Fatal(fnet.ListenAndServe(":8081", mux))
+	log.Fatal(fhttp.ListenAndServe(":8081", mux))
 }
 ```
 

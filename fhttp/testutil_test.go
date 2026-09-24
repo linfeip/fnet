@@ -1,4 +1,4 @@
-package fnet
+package fhttp
 
 import (
 	"bufio"
@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/linfeip/fnet/internal/testcert"
 )
 
 // Shared helpers for the HTTP and HTTPS suites. Every server started here is
@@ -202,7 +204,7 @@ func isTimeout(err error) bool {
 
 // testCertificate returns a self-signed localhost certificate.
 func testCertificate() (tls.Certificate, error) {
-	certPEM, keyPEM, err := GenerateSelfSignedCertPEM()
+	certPEM, keyPEM, err := testcert.Generate()
 	if err != nil {
 		return tls.Certificate{}, err
 	}

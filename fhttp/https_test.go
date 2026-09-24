@@ -1,4 +1,4 @@
-package fnet
+package fhttp
 
 import (
 	"bytes"
@@ -23,6 +23,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/linfeip/fnet/internal/testcert"
 )
 
 // ---------------------------------------------------------------------------
@@ -755,7 +757,7 @@ func TestHTTPSTruncatedClientHello(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHTTPSListenAndServeTLSFromFiles(t *testing.T) {
-	certPEM, keyPEM, err := GenerateSelfSignedCertPEM()
+	certPEM, keyPEM, err := testcert.Generate()
 	if err != nil {
 		t.Fatalf("generate cert: %v", err)
 	}
@@ -805,7 +807,7 @@ func TestHTTPSListenAndServeTLSBadCertFiles(t *testing.T) {
 // TestHTTPSTLSConfigPreservedByListenAndServeTLS checks that the certificate
 // from the files is merged into an existing TLSConfig rather than replacing it.
 func TestHTTPSTLSConfigPreservedByListenAndServeTLS(t *testing.T) {
-	certPEM, keyPEM, err := GenerateSelfSignedCertPEM()
+	certPEM, keyPEM, err := testcert.Generate()
 	if err != nil {
 		t.Fatal(err)
 	}

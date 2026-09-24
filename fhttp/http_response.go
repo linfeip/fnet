@@ -1,4 +1,4 @@
-package fnet
+package fhttp
 
 import (
 	"bufio"
@@ -32,8 +32,8 @@ var (
 	crlf            = []byte("\r\n")
 	continue100     = []byte("HTTP/1.1 100 Continue\r\n\r\n")
 	lastChunk       = []byte("0\r\n\r\n")
-	errUnwrapped    = errors.New("fnet: connection was moved to the event loop")
-	errDoubleHijack = errors.New("fnet: connection already hijacked")
+	errUnwrapped    = errors.New("fnet/fhttp: connection was moved to the event loop")
+	errDoubleHijack = errors.New("fnet/fhttp: connection already hijacked")
 )
 
 // responseWriter implements http.ResponseWriter and http.Hijacker for one

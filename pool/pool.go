@@ -1,4 +1,7 @@
-package fnet
+// Package pool is the sharded worker pool that runs fnet's business code:
+// HTTP handlers and WebSocket OnMessage callbacks. It knows nothing about
+// networking; fhttp and websocket hand it tasks keyed by connection.
+package pool
 
 import (
 	"runtime"
@@ -7,8 +10,8 @@ import (
 	"time"
 )
 
-// WorkerPoolConfig defines configurations for WorkerPool.
-type WorkerPoolConfig struct {
+// Config configures a Pool. Zero fields take the defaults below.
+type Config struct {
 	// Shards specifies the number of independent worker shards.
 	// Defaults to next power of 2 of runtime.GOMAXPROCS(0)*4 (clamped between 16 and 256).
 	Shards int
@@ -52,7 +55,7 @@ func defaultShards() int {
 	return n
 }
 
-// WorkerPool is a high-concurrency, sharded, elastic goroutine worker pool
+// Pool is a high-concurrency, sharded, elastic goroutine worker pool
 // designed for massive scale (1M+ concurrent HTTP/WebSocket connections) without
 // any external dependencies.
 //
@@ -63,7 +66,7 @@ func defaultShards() int {
 //   - Lazy worker spawning & idle reaping: idle connections hold zero worker goroutines.
 //   - Non-blocking reactor offload: never blocks the I/O reactor event loop under heavy load.
 //   - Panic protection: user handler panics are caught and do not kill worker threads or the process.
-type WorkerPool struct {
+type Pool struct {
 	shards            []*workerShard
 	shardMask         uint64
 	round             atomic.Uint64
@@ -73,7 +76,7 @@ type WorkerPool struct {
 }
 
 type workerShard struct {
-	pool        *WorkerPool
+	pool        *Pool
 	id          int
 	mu          sync.RWMutex
 	closed      bool
@@ -85,9 +88,9 @@ type workerShard struct {
 	stealRound  atomic.Uint32
 }
 
-// NewWorkerPool creates a new high-concurrency sharded worker pool.
-func NewWorkerPool(cfgs ...WorkerPoolConfig) *WorkerPool {
-	var cfg WorkerPoolConfig
+// New creates a sharded worker pool.
+func New(cfgs ...Config) *Pool {
+	var cfg Config
 	if len(cfgs) > 0 {
 		cfg = cfgs[0]
 	}
@@ -114,7 +117,7 @@ func NewWorkerPool(cfgs ...WorkerPoolConfig) *WorkerPool {
 		idleTimeout = 5 * time.Second
 	}
 
-	p := &WorkerPool{
+	p := &Pool{
 		shards:    make([]*workerShard, numShards),
 		shardMask: uint64(numShards - 1),
 	}
@@ -135,7 +138,7 @@ func NewWorkerPool(cfgs ...WorkerPoolConfig) *WorkerPool {
 // Submit dispatches a task to the pool using power-of-two-choices load balancing.
 // It inspects two pseudo-random shards and assigns the task to the one with lower load
 // (more idle workers or fewer queued tasks), mitigating shard skew and hotspot buildup.
-func (p *WorkerPool) Submit(task func()) {
+func (p *Pool) Submit(task func()) {
 	if task == nil {
 		return
 	}
@@ -169,7 +172,7 @@ func (p *WorkerPool) Submit(task func()) {
 
 // SubmitConn dispatches a task with connection affinity based on connID (e.g. socket fd).
 // All tasks for the same connection hash to the same worker shard, maximizing CPU cache locality.
-func (p *WorkerPool) SubmitConn(connID uint64, task func()) {
+func (p *Pool) SubmitConn(connID uint64, task func()) {
 	if task == nil {
 		return
 	}
@@ -187,7 +190,7 @@ func (p *WorkerPool) SubmitConn(connID uint64, task func()) {
 }
 
 // Close gracefully closes the worker pool and waits for running tasks to complete.
-func (p *WorkerPool) Close() {
+func (p *Pool) Close() {
 	if p.closed.CompareAndSwap(false, true) {
 		for _, s := range p.shards {
 			s.mu.Lock()
@@ -200,7 +203,7 @@ func (p *WorkerPool) Close() {
 }
 
 // RunningWorkers returns the total number of currently active worker goroutines.
-func (p *WorkerPool) RunningWorkers() int {
+func (p *Pool) RunningWorkers() int {
 	var total int
 	for _, s := range p.shards {
 		total += int(s.curWorkers.Load())
@@ -209,7 +212,7 @@ func (p *WorkerPool) RunningWorkers() int {
 }
 
 // IdleWorkers returns the total number of currently idle worker goroutines waiting for tasks.
-func (p *WorkerPool) IdleWorkers() int {
+func (p *Pool) IdleWorkers() int {
 	var total int
 	for _, s := range p.shards {
 		total += int(s.idleWorkers.Load())
@@ -219,7 +222,7 @@ func (p *WorkerPool) IdleWorkers() int {
 
 // trySteal attempts to steal a task from another shard that has queued tasks.
 // Returns nil if no tasks could be stolen.
-func (p *WorkerPool) trySteal(myShardID int) func() {
+func (p *Pool) trySteal(myShardID int) func() {
 	if p.closed.Load() {
 		return nil
 	}
@@ -252,7 +255,7 @@ func (p *WorkerPool) trySteal(myShardID int) func() {
 }
 
 // tryOffloadToIdle attempts to push a task to another shard that has idle workers waiting.
-func (p *WorkerPool) tryOffloadToIdle(task func(), myShardID int) bool {
+func (p *Pool) tryOffloadToIdle(task func(), myShardID int) bool {
 	if p.closed.Load() || p.globalIdleWorkers.Load() == 0 {
 		return false
 	}
@@ -285,7 +288,7 @@ func (p *WorkerPool) tryOffloadToIdle(task func(), myShardID int) bool {
 }
 
 // tryOffload attempts to push a task to any other shard with spare capacity.
-func (p *WorkerPool) tryOffload(task func(), myShardID int) bool {
+func (p *Pool) tryOffload(task func(), myShardID int) bool {
 	if p.closed.Load() {
 		return false
 	}
@@ -496,24 +499,50 @@ func runSafe(fn func()) {
 	fn()
 }
 
-// SetDefaultWorkerPool replaces the globally shared default WorkerPool.
-func SetDefaultWorkerPool(p *WorkerPool) {
+// Default returns the process-wide pool used when no custom pool is
+// configured. It is created on first use.
+func Default() *Pool {
+	if p := defaultPool.Load(); p != nil {
+		return p
+	}
+	defaultOnce.Do(func() { defaultPool.CompareAndSwap(nil, New()) })
+	return defaultPool.Load()
+}
+
+// SetDefault replaces the default pool. The previous one is not closed.
+func SetDefault(p *Pool) {
 	if p != nil {
-		DefaultWorkerPool = p
+		defaultPool.Store(p)
 	}
 }
 
-// DefaultWorkerPool is the globally shared, highly scalable default WorkerPool.
-// Idle connections hold zero goroutines inside this pool.
-var DefaultWorkerPool = NewWorkerPool()
+var (
+	defaultOnce sync.Once
+	defaultPool atomic.Pointer[Pool]
+)
 
-// AdaptPool adapts a simple task submission function (such as ants.Submit, pool.Submit, or a custom scheduler)
-// to a connection-aware WorkerPool function by ignoring the connection ID.
-func AdaptPool(submit func(task func())) func(connID uint64, task func()) {
+// Adapt turns a plain submit function (ants.Submit, a custom scheduler) into
+// the connection-keyed form fhttp and websocket take, ignoring the key.
+func Adapt(submit func(task func())) func(connID uint64, task func()) {
 	if submit == nil {
 		return nil
 	}
-	return func(_ uint64, task func()) {
-		submit(task)
+	return func(_ uint64, task func()) { submit(task) }
+}
+
+// Dispatch runs task through submit, or through Default when submit is nil,
+// keyed by connID. It reports false when submit panicked, i.e. a custom pool
+// rejected the task; the caller should then give up on the connection.
+func Dispatch(submit func(connID uint64, task func()), connID uint64, task func()) (ok bool) {
+	if submit == nil {
+		Default().SubmitConn(connID, task)
+		return true
 	}
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	submit(connID, task)
+	return true
 }

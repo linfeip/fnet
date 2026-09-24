@@ -1,4 +1,4 @@
-package fnet
+package fhttp
 
 import (
 	"bufio"
@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/linfeip/fnet/internal/reactor"
+	"github.com/linfeip/fnet/pool"
 )
 
 const (
@@ -105,17 +106,9 @@ func (h *httpHandler) OnData(c *reactor.Conn, data []byte) int {
 func (h *httpHandler) OnClose(*reactor.Conn, error) {}
 
 func (h *httpHandler) dispatch(c *reactor.Conn) {
-	task := func() { h.serve(c) }
-	if h.submit == nil {
-		DefaultWorkerPool.SubmitConn(uint64(c.Fd()), task)
-		return
+	if !pool.Dispatch(h.submit, uint64(c.Fd()), func() { h.serve(c) }) {
+		_ = c.Close() // the custom pool rejected the task
 	}
-	defer func() {
-		if recover() != nil { // the custom pool rejected the task
-			_ = c.Close()
-		}
-	}()
-	h.submit(uint64(c.Fd()), task)
 }
 
 // after returns start+d, or the zero time (no deadline) when d <= 0.

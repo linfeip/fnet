@@ -9,7 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/websocket"
 )
 
@@ -30,14 +30,14 @@ func main() {
 	eventMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = eventUpgrader.Upgrade(w, r)
 	})
-	eventSrv := &fnet.Server{
+	eventSrv := &fhttp.Server{
 		Addr:    fmt.Sprintf(":%d", *eventPort),
 		Handler: eventMux,
 	}
 
 	go func() {
 		log.Printf("[Event-Driven] WebSocket echo server listening on ws://0.0.0.0:%d", *eventPort)
-		if err := eventSrv.ListenAndServe(); err != nil && err != fnet.ErrServerClosed {
+		if err := eventSrv.ListenAndServe(); err != nil && err != fhttp.ErrServerClosed {
 			log.Fatalf("event server error: %v", err)
 		}
 	}()
@@ -57,14 +57,14 @@ func main() {
 			return conn.WriteMessage(op, msg)
 		})
 	})
-	goroutineSrv := &fnet.Server{
+	goroutineSrv := &fhttp.Server{
 		Addr:    fmt.Sprintf(":%d", *goroutinePort),
 		Handler: goroutineMux,
 	}
 
 	go func() {
 		log.Printf("[Goroutine]    WebSocket echo server listening on ws://0.0.0.0:%d", *goroutinePort)
-		if err := goroutineSrv.ListenAndServe(); err != nil && err != fnet.ErrServerClosed {
+		if err := goroutineSrv.ListenAndServe(); err != nil && err != fhttp.ErrServerClosed {
 			log.Fatalf("goroutine server error: %v", err)
 		}
 	}()

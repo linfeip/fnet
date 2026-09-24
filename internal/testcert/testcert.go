@@ -1,4 +1,5 @@
-package fnet
+// Package testcert generates throwaway TLS certificates for tests and examples.
+package testcert
 
 import (
 	"crypto/ecdsa"
@@ -12,8 +13,9 @@ import (
 	"time"
 )
 
-// GenerateSelfSignedCertPEM returns PEM-encoded cert and key for examples.
-func GenerateSelfSignedCertPEM() (certPEM, keyPEM []byte, err error) {
+// Generate returns a PEM-encoded self-signed certificate and key for
+// localhost, 127.0.0.1 and ::1, valid for a year.
+func Generate() (certPEM, keyPEM []byte, err error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, err

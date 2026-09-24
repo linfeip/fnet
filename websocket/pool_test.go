@@ -13,107 +13,10 @@ import (
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
-	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
+	"github.com/linfeip/fnet/pool"
 	"github.com/linfeip/fnet/websocket"
 )
-
-func TestWorkerPool_SubmitAndDispatch(t *testing.T) {
-	pool := websocket.NewWorkerPool(websocket.WorkerPoolConfig{
-		Shards:             8,
-		MaxWorkersPerShard: 16,
-		QueueSizePerShard:  128,
-		IdleTimeout:        time.Second,
-	})
-	defer pool.Close()
-
-	const totalTasks = 1000
-	var counter atomic.Int64
-	var wg sync.WaitGroup
-	wg.Add(totalTasks)
-
-	for i := 0; i < totalTasks; i++ {
-		connID := uint64(i % 50)
-		pool.SubmitConn(connID, func() {
-			defer wg.Done()
-			counter.Add(1)
-		})
-	}
-
-	wg.Wait()
-	if counter.Load() != totalTasks {
-		t.Fatalf("expected counter %d, got %d", totalTasks, counter.Load())
-	}
-
-	// Test panic recovery inside worker pool: worker must survive
-	var panicHandled atomic.Bool
-	wg.Add(1)
-	pool.Submit(func() {
-		defer wg.Done()
-		panicHandled.Store(true)
-		panic("simulated business handler panic")
-	})
-	wg.Wait()
-
-	if !panicHandled.Load() {
-		t.Fatal("expected panic task to run")
-	}
-
-	// Submit another normal task to ensure pool is still healthy
-	var afterPanic atomic.Bool
-	wg.Add(1)
-	pool.Submit(func() {
-		defer wg.Done()
-		afterPanic.Store(true)
-	})
-	wg.Wait()
-
-	if !afterPanic.Load() {
-		t.Fatal("expected pool to execute tasks normally after panic")
-	}
-}
-
-func TestWorkerPool_IdleWorkerReclamation(t *testing.T) {
-	idleTimeout := 100 * time.Millisecond
-	pool := websocket.NewWorkerPool(websocket.WorkerPoolConfig{
-		Shards:             4,
-		MaxWorkersPerShard: 8,
-		QueueSizePerShard:  64,
-		IdleTimeout:        idleTimeout,
-	})
-	defer pool.Close()
-
-	// Initially zero running workers
-	if workers := pool.RunningWorkers(); workers != 0 {
-		t.Fatalf("expected 0 running workers initially, got %d", workers)
-	}
-
-	// Dispatch tasks to spawn workers
-	var wg sync.WaitGroup
-	const tasks = 50
-	wg.Add(tasks)
-	for i := 0; i < tasks; i++ {
-		pool.Submit(func() {
-			defer wg.Done()
-			time.Sleep(10 * time.Millisecond)
-		})
-	}
-	wg.Wait()
-
-	// Some workers must have been spawned
-	running := pool.RunningWorkers()
-	if running == 0 {
-		t.Fatal("expected running workers > 0 after executing tasks")
-	}
-
-	// Wait for idleTimeout to elapse
-	time.Sleep(idleTimeout * 3)
-
-	// All idle workers should have exited
-	remaining := pool.RunningWorkers()
-	if remaining != 0 {
-		t.Fatalf("expected all idle workers to be reaped (0 remaining), got %d", remaining)
-	}
-}
 
 func TestWebSocketDefaultWorkerPool_BlockingBusinessDoesNotBlockReactor(t *testing.T) {
 	// Scenario:
@@ -153,7 +56,7 @@ func TestWebSocketDefaultWorkerPool_BlockingBusinessDoesNotBlockReactor(t *testi
 		_, _ = upgrader.Upgrade(w, r)
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -252,7 +155,7 @@ func TestWebSocketWorkerPool_StrictPerConnOrdering(t *testing.T) {
 		_, _ = upgrader.Upgrade(w, r)
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -316,7 +219,7 @@ func TestWebSocket1MScaleSimulation(t *testing.T) {
 		_, _ = upgrader.Upgrade(w, r)
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -341,7 +244,7 @@ func TestWebSocket1MScaleSimulation(t *testing.T) {
 
 	// Step 1: Verify 100 idle connections hold almost zero extra goroutines
 	idleGoroutines := runtime.NumGoroutine()
-	poolWorkers := websocket.DefaultWorkerPool.RunningWorkers()
+	poolWorkers := pool.Default().RunningWorkers()
 	diff := (idleGoroutines - poolWorkers) - initialGoroutines
 	if diff > 15 {
 		t.Fatalf("Idle goroutine count grew excessively: initial=%d, idle=%d, workers=%d, diff=%d",
@@ -380,26 +283,4 @@ func TestWebSocket1MScaleSimulation(t *testing.T) {
 	}
 
 	t.Logf("Successfully verified %d burst messages dispatched cleanly through worker pool", expectedTotal)
-}
-
-func TestWebSocketWorkerPool_AdaptPool(t *testing.T) {
-	var count atomic.Int64
-	simpleSubmit := func(task func()) {
-		count.Add(1)
-		task()
-	}
-
-	adapted := websocket.AdaptPool(simpleSubmit)
-	if adapted == nil {
-		t.Fatal("expected non-nil adapted pool")
-	}
-
-	var executed atomic.Bool
-	adapted(8888, func() {
-		executed.Store(true)
-	})
-
-	if count.Load() != 1 || !executed.Load() {
-		t.Fatalf("expected simpleSubmit to run, count=%d, executed=%v", count.Load(), executed.Load())
-	}
 }

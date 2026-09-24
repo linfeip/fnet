@@ -20,14 +20,15 @@
 
 ## 🏗️ 整体架构
 
-四层，各管一件事：
+四层各管一件事，另有一个执行业务代码的 worker 池：
 
 | 层 | 包 | 职责 |
 |---|---|---|
 | 平台层 | `internal/netpoll` | epoll / kqueue / Windows 仿真，以及原始的非阻塞 socket 调用。唯一含平台差异的代码。 |
 | Reactor 层 | `internal/reactor` | accept、事件循环、连接表、每连接的输入/输出缓冲、背压、关闭。只搬运字节。 |
-| Server + HTTP | `fnet` | `Server` 生命周期与监听；HTTP/1.x：判断请求何时就绪、在 worker 上跑 `ServeHTTP`、keep-alive、TLS、Hijack。 |
+| Server + HTTP | `fhttp` | `Server` 生命周期与监听；HTTP/1.x：判断请求何时就绪、在 worker 上跑 `ServeHTTP`、keep-alive、TLS、Hijack。 |
 | WebSocket | `websocket` | 握手、RFC 6455 帧与控制帧、permessage-deflate、事件驱动消息队列。 |
+| Worker 池 | `pool` | 分片协程池，执行 `ServeHTTP` 与 `OnMessage`；`fhttp` 与 `websocket` 共用，不含网络代码。 |
 
 协议通过唯一的接口 `reactor.Handler`（`OnData` / `OnClose`，在事件循环上执行）挂到 reactor 上。连接的输入要么在事件循环上交给 handler（空闲态，0 协程），要么 *Detach* 给 worker 上的阻塞读者（为 `net/http` 与 TLS 提供 `net.Conn` 语义），用完再 `Attach` 交还。
 
@@ -58,7 +59,7 @@ Acceptor（accept4）--> 事件循环（epoll / kqueue）---- 空闲连接停在
 * **头部就绪即调度**：头部（`\r\n\r\n`）收齐即交给 WorkerPool，不等 Body。迟迟不结束的头部上限 64 KiB。
 * **流式 Body**：worker 持有连接期间按普通阻塞 `net.Conn` 语义读，`io.Copy(dst, req.Body)` 内存恒定。
 * **回到空闲**：明文响应写完后连接回到事件循环、释放 worker 协程；已缓冲的流水线请求则留在当前 worker。客户端半关闭（发完请求即 FIN）照样收到响应。
-* **超时不占协程**：连接在事件循环手里时，由每个事件循环的时间轮执行两个截止时间：请求头截止（`ReadHeaderTimeout`，默认 30s，从建连或该请求第一个字节算起，慢速滴灌无法续期）和 keep-alive 空闲截止（`IdleTimeout`，默认 2 分钟）。关闭时对端不再读走数据的连接，30s 无进展（或到写截止时间）即强制关闭。
+* **超时不占协程**：连接在事件循环手里时，由每个事件循环的时间轮执行两个截止时间：请求头截止（`ReadHeaderTimeout`，默认 30s，从建连或该请求第一个字节算起，慢速滴灌无法续期）和 keep-alive 空闲截止（`IdleTimeout`，默认 2 分钟）。关闭时对端不再读走数据的连接，30s 无进展即强制关闭。
 * **`Expect: 100-continue`**：handler 第一次读 body 时回 `100 Continue`；handler 不读 body 就回复的，回复后关闭连接。
 
 ### 3. WebSocket
@@ -74,7 +75,7 @@ Acceptor（accept4）--> 事件循环（epoll / kqueue）---- 空闲连接停在
 
 ## 特性
 
-- **标准 `net/http` 接口**：直接对接 `http.Handler` / `http.ServeMux`，支持 `fnet.ListenAndServe` 与 `fnet.ListenAndServeTLS`。
+- **标准 `net/http` 接口**：直接对接 `http.Handler` / `http.ServeMux`，支持 `fhttp.ListenAndServe` 与 `fhttp.ListenAndServeTLS`。
 - **Multi-Reactor 多核扩展架构**：一个 Acceptor（Linux 上用 `accept4`）把连接轮询分发到与 CPU 核数匹配的事件循环。
 - **双模 WebSocket 支持**：
   - **事件驱动模式（推荐）**：连接空闲时 0 协程常驻，Reactor 读事件触发解析，业务数据包自动投递到内置工作协程池执行，绝不卡死 IO Reactor 事件循环。
@@ -108,7 +109,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
 )
 
 func main() {
@@ -118,14 +119,14 @@ func main() {
 	})
 
 	// 启动普通 HTTP 服务
-	log.Fatal(fnet.ListenAndServe(":8080", mux))
+	log.Fatal(fhttp.ListenAndServe(":8080", mux))
 }
 ```
 
 配置 HTTPS 与超时参数：
 
 ```go
-srv := &fnet.Server{
+srv := &fhttp.Server{
 	Addr:         ":8443",
 	Handler:      mux,
 	ReadTimeout:  5 * time.Second,
@@ -148,7 +149,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/websocket"
 )
 
@@ -175,7 +176,7 @@ func main() {
 		// 返回后连接自动交由 Reactor 事件循环托管
 	})
 
-	log.Fatal(fnet.ListenAndServe(":8081", mux))
+	log.Fatal(fhttp.ListenAndServe(":8081", mux))
 }
 ```
 

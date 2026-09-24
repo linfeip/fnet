@@ -599,7 +599,9 @@ func (c *Conn) Close() error {
 
 // shutdown closes the connection once its queued output is flushed and records
 // err for OnClose. A peer that stops reading cannot hold the flush open: it
-// ends after drainStall without progress, or at the write deadline.
+// ends after drainStall without progress. Like a kernel send buffer after
+// close(2), the flush ignores the write deadline, which only governs Write
+// calls (tls.Conn.Close moves it to "now" before closing the connection).
 func (c *Conn) shutdown(err error) {
 	c.wmu.Lock()
 	if c.state.Load()&(stClosed|stDraining) != 0 {
@@ -625,13 +627,7 @@ func (c *Conn) shutdown(err error) {
 // drainDeadline is when a draining connection that makes no further progress
 // is dropped.
 func (c *Conn) drainDeadline() int64 {
-	d := time.Now().UnixNano() + int64(drainStall)
-	c.wmu.Lock()
-	if c.wdeadline > 0 && c.wdeadline < d {
-		d = c.wdeadline
-	}
-	c.wmu.Unlock()
-	return d
+	return time.Now().UnixNano() + int64(drainStall)
 }
 
 // abort tears the connection down immediately, dropping queued output. The fd

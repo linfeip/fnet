@@ -1,4 +1,4 @@
-package fnet_test
+package fhttp_test
 
 import (
 	"fmt"
@@ -11,7 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
+	"github.com/linfeip/fnet/pool"
 )
 
 func getFreePort(t *testing.T) int {
@@ -54,7 +55,7 @@ func TestHTTPWorkerPool_SlowBusinessDoesNotBlockReactor(t *testing.T) {
 		_, _ = w.Write([]byte("FAST_OK"))
 	})
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
@@ -140,13 +141,13 @@ func TestHTTPWorkerPool_KeepAliveIdleZeroGoroutines(t *testing.T) {
 	})
 
 	shortIdleTimeout := 100 * time.Millisecond
-	testPool := fnet.NewWorkerPool(fnet.WorkerPoolConfig{
+	testPool := pool.New(pool.Config{
 		Shards:      8,
 		IdleTimeout: shortIdleTimeout,
 	})
 	defer testPool.Close()
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:       addr,
 		Handler:    mux,
 		WorkerPool: testPool.SubmitConn,
@@ -272,7 +273,7 @@ func TestHTTPWorkerPool_CustomPool(t *testing.T) {
 		_, _ = w.Write([]byte("CUSTOM_POOL_OK"))
 	})
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:       addr,
 		Handler:    mux,
 		WorkerPool: customPool,
@@ -313,7 +314,7 @@ func TestHTTPWorkerPool_PanicRecovery(t *testing.T) {
 		_, _ = w.Write([]byte("HEALTHY"))
 	})
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
@@ -338,152 +339,9 @@ func TestHTTPWorkerPool_PanicRecovery(t *testing.T) {
 	}
 }
 
-func TestWorkerPool_DirectAPI(t *testing.T) {
-	pool := fnet.NewWorkerPool(fnet.WorkerPoolConfig{
-		Shards:             4,
-		MaxWorkersPerShard: 8,
-		QueueSizePerShard:  64,
-		IdleTimeout:        100 * time.Millisecond,
-	})
-	defer pool.Close()
-
-	const tasks = 200
-	var executed atomic.Int64
-	var wg sync.WaitGroup
-	wg.Add(tasks)
-
-	for i := 0; i < tasks; i++ {
-		connID := uint64(i % 16)
-		pool.SubmitConn(connID, func() {
-			defer wg.Done()
-			executed.Add(1)
-		})
-	}
-
-	wg.Wait()
-	if executed.Load() != tasks {
-		t.Fatalf("expected %d tasks, got %d", tasks, executed.Load())
-	}
-
-	// Verify worker reclamation
-	time.Sleep(300 * time.Millisecond)
-	if remaining := pool.RunningWorkers(); remaining != 0 {
-		t.Fatalf("expected 0 running workers after idle timeout, got %d", remaining)
-	}
-}
-
-func TestWorkerPool_WorkStealingUnderSkew(t *testing.T) {
-	// Scenario:
-	// A pool has 4 shards, each limited to 1 worker.
-	// Shard A receives a heavy task that blocks for 150ms.
-	// Subsequently, 10 fast tasks are also routed to the exact same shard.
-	// Without work-stealing, the 10 fast tasks are stuck behind the heavy task on Shard A for 150ms.
-	// With work-stealing, idle workers from Shard B, C, D immediately steal and complete the 10 fast tasks
-	// while Shard A's single worker is still busy sleeping!
-
-	pool := fnet.NewWorkerPool(fnet.WorkerPoolConfig{
-		Shards:             4,
-		MaxWorkersPerShard: 1, // Strict 1 worker per shard
-		QueueSizePerShard:  64,
-		IdleTimeout:        time.Second,
-	})
-	defer pool.Close()
-
-	// Pre-spawn workers on all 4 shards by dispatching warmup tasks
-	for i := 0; pool.RunningWorkers() < 4 && i < 100; i++ {
-		pool.Submit(func() {
-			time.Sleep(5 * time.Millisecond)
-		})
-		time.Sleep(2 * time.Millisecond)
-	}
-
-	// Ensure all 4 shards have their 1 worker running and now idle
-	time.Sleep(20 * time.Millisecond)
-	if workers := pool.RunningWorkers(); workers != 4 {
-		t.Fatalf("expected 4 running workers, got %d", workers)
-	}
-
-	const targetConnID = uint64(0)
-	var heavyTaskRunning atomic.Bool
-	var heavyTaskFinished atomic.Bool
-	heavyStarted := make(chan struct{})
-
-	// 1. Submit heavy task to targetConnID
-	pool.SubmitConn(targetConnID, func() {
-		heavyTaskRunning.Store(true)
-		close(heavyStarted)
-		time.Sleep(150 * time.Millisecond)
-		heavyTaskRunning.Store(false)
-		heavyTaskFinished.Store(true)
-	})
-
-	<-heavyStarted
-
-	// 2. Submit 10 fast tasks to the EXACT same connection/shard
-	const fastTaskCount = 10
-	var fastCompletedWhileHeavyRunning atomic.Int64
-	var fastWg sync.WaitGroup
-	fastWg.Add(fastTaskCount)
-
-	start := time.Now()
-	for i := 0; i < fastTaskCount; i++ {
-		pool.SubmitConn(targetConnID, func() {
-			defer fastWg.Done()
-			if heavyTaskRunning.Load() {
-				// Completed while heavy task is still running! Proof of work-stealing!
-				fastCompletedWhileHeavyRunning.Add(1)
-			}
-		})
-	}
-
-	fastWg.Wait()
-	fastDuration := time.Since(start)
-
-	// Verify that fast tasks finished well before the 150ms heavy task completed
-	if fastDuration >= 120*time.Millisecond {
-		t.Fatalf("Work-stealing failed: fast tasks took %v (expected < 100ms, stolen by other workers)", fastDuration)
-	}
-
-	if completed := fastCompletedWhileHeavyRunning.Load(); completed == 0 {
-		t.Fatalf("Expected fast tasks to be executed concurrently by stolen workers while heavy task was running, got %d", completed)
-	}
-
-	t.Logf("Work-stealing verified: %d/%d tasks stolen and completed in %v while heavy task was running",
-		fastCompletedWhileHeavyRunning.Load(), fastTaskCount, fastDuration)
-}
-
-func TestWorkerPool_PowerOfTwoChoicesBalance(t *testing.T) {
-	// Verify that Submit with Power-of-Two-Choices effectively balances tasks
-	pool := fnet.NewWorkerPool(fnet.WorkerPoolConfig{
-		Shards:             8,
-		MaxWorkersPerShard: 4,
-		QueueSizePerShard:  128,
-		IdleTimeout:        time.Second,
-	})
-	defer pool.Close()
-
-	const total = 400
-	var executed atomic.Int64
-	var wg sync.WaitGroup
-	wg.Add(total)
-
-	for i := 0; i < total; i++ {
-		pool.Submit(func() {
-			defer wg.Done()
-			executed.Add(1)
-			time.Sleep(time.Millisecond)
-		})
-	}
-
-	wg.Wait()
-	if executed.Load() != total {
-		t.Fatalf("expected %d, got %d", total, executed.Load())
-	}
-}
-
 func TestWorkerPool_ServerAndUpgraderCustomPool(t *testing.T) {
 	// Test passing custom *WorkerPool directly via Server.WorkerPool (SubmitConn)
-	customPool := fnet.NewWorkerPool(fnet.WorkerPoolConfig{
+	customPool := pool.New(pool.Config{
 		Shards:             4,
 		MaxWorkersPerShard: 8,
 		QueueSizePerShard:  64,
@@ -502,7 +360,7 @@ func TestWorkerPool_ServerAndUpgraderCustomPool(t *testing.T) {
 		_, _ = w.Write([]byte("CUSTOM_POOL_OK"))
 	})
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:       addr,
 		Handler:    mux,
 		WorkerPool: customPool.SubmitConn,
@@ -525,59 +383,5 @@ func TestWorkerPool_ServerAndUpgraderCustomPool(t *testing.T) {
 
 	if running := customPool.RunningWorkers(); running == 0 {
 		t.Fatalf("expected customPool to have active running workers, got %d", running)
-	}
-}
-
-func TestWorkerPool_ConcurrentCloseAndSubmit(t *testing.T) {
-	pool := fnet.NewWorkerPool(fnet.WorkerPoolConfig{
-		Shards:             4,
-		MaxWorkersPerShard: 8,
-		QueueSizePerShard:  16,
-		IdleTimeout:        100 * time.Millisecond,
-	})
-
-	const numSubmitters = 50
-	var wg sync.WaitGroup
-	wg.Add(numSubmitters)
-
-	for i := 0; i < numSubmitters; i++ {
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < 50; j++ {
-				pool.SubmitConn(uint64(id), func() {
-					time.Sleep(time.Microsecond)
-				})
-			}
-		}(i)
-	}
-
-	time.Sleep(time.Millisecond)
-	pool.Close()
-	wg.Wait()
-}
-
-func TestWorkerPool_AdaptPool(t *testing.T) {
-	var count atomic.Int64
-	legacySubmit := func(task func()) {
-		count.Add(1)
-		task()
-	}
-
-	adapted := fnet.AdaptPool(legacySubmit)
-	if adapted == nil {
-		t.Fatal("expected non-nil adapted pool")
-	}
-
-	var executed atomic.Bool
-	adapted(12345, func() {
-		executed.Store(true)
-	})
-
-	if count.Load() != 1 || !executed.Load() {
-		t.Fatalf("expected legacySubmit to execute task, count=%d, executed=%v", count.Load(), executed.Load())
-	}
-
-	if fnet.AdaptPool(nil) != nil {
-		t.Fatal("expected nil for nil submit function")
 	}
 }

@@ -6,7 +6,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/websocket"
 )
 
@@ -73,7 +73,7 @@ func main() {
 	fmt.Printf(" WS 接口:  ws://127.0.0.1%s/ws\n", addr)
 	fmt.Printf("==================================================\n")
 
-	if err := fnet.ListenAndServe(addr, mux); err != nil {
+	if err := fhttp.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }

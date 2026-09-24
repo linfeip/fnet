@@ -1,4 +1,4 @@
-package fnet
+package fhttp
 
 import (
 	"bufio"

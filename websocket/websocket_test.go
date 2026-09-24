@@ -16,7 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
+	"github.com/linfeip/fnet/internal/testcert"
 	"github.com/linfeip/fnet/websocket"
 
 	"github.com/gobwas/httphead"
@@ -54,7 +55,7 @@ func TestWebSocketEchoHTTP(t *testing.T) {
 		})
 	})
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
@@ -110,9 +111,9 @@ func TestWebSocketEchoHTTPS(t *testing.T) {
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
-	certPEM, keyPEM, err := fnet.GenerateSelfSignedCertPEM()
+	certPEM, keyPEM, err := testcert.Generate()
 	if err != nil {
-		t.Fatalf("GenerateSelfSignedCertPEM: %v", err)
+		t.Fatalf("testcert.Generate: %v", err)
 	}
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
@@ -139,7 +140,7 @@ func TestWebSocketEchoHTTPS(t *testing.T) {
 		}
 	})
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:    addr,
 		Handler: mux,
 		TLSConfig: &tls.Config{
@@ -201,7 +202,7 @@ func TestWebSocketOriginCheck(t *testing.T) {
 		defer conn.Close()
 	})
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
@@ -261,7 +262,7 @@ func TestWebSocketSubprotocol(t *testing.T) {
 		negotiatedProto.Store(&p)
 	})
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
@@ -317,7 +318,7 @@ func TestWebSocketZeroGoroutinesOnIdleConnections(t *testing.T) {
 		// Return immediately! Worker goroutine exits!
 	})
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
@@ -382,7 +383,7 @@ func TestWebSocketEventDrivenEcho(t *testing.T) {
 		}
 	})
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
@@ -449,7 +450,7 @@ func TestWebSocketEventDrivenPingPong(t *testing.T) {
 		}
 	})
 
-	srv := &fnet.Server{
+	srv := &fhttp.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
@@ -504,7 +505,7 @@ func BenchmarkWebSocketEcho(b *testing.B) {
 		})
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -557,7 +558,7 @@ func BenchmarkWebSocketEventDrivenEcho(b *testing.B) {
 		_, _ = upgrader.Upgrade(w, r)
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -611,7 +612,7 @@ func TestWebSocketIdleMemoryFootprint(t *testing.T) {
 		_, _ = upgrader.Upgrade(w, r)
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -698,7 +699,7 @@ func TestWebSocketCompressionBomb(t *testing.T) {
 			defer conn.Close()
 		})
 
-		srv := &fnet.Server{Addr: addr, Handler: mux}
+		srv := &fhttp.Server{Addr: addr, Handler: mux}
 		go func() { _ = srv.ListenAndServe() }()
 		defer srv.Close()
 
@@ -747,7 +748,7 @@ func TestWebSocketCompressionBomb(t *testing.T) {
 			}
 		})
 
-		srv := &fnet.Server{Addr: addr, Handler: mux}
+		srv := &fhttp.Server{Addr: addr, Handler: mux}
 		go func() { _ = srv.ListenAndServe() }()
 		defer srv.Close()
 
@@ -819,7 +820,7 @@ func TestWebSocketCompressionBomb(t *testing.T) {
 			close(doneCh)
 		})
 
-		srv := &fnet.Server{Addr: addr, Handler: mux}
+		srv := &fhttp.Server{Addr: addr, Handler: mux}
 		go func() { _ = srv.ListenAndServe() }()
 		defer srv.Close()
 
@@ -957,7 +958,7 @@ func TestWebSocketCompressionEcho(t *testing.T) {
 			}
 		})
 
-		srv := &fnet.Server{Addr: addr, Handler: mux}
+		srv := &fhttp.Server{Addr: addr, Handler: mux}
 		go func() { _ = srv.ListenAndServe() }()
 		defer srv.Close()
 
@@ -1044,7 +1045,7 @@ func TestWebSocketCompressionEcho(t *testing.T) {
 			_ = conn.WriteMessage(op, msg)
 		})
 
-		srv := &fnet.Server{Addr: addr, Handler: mux}
+		srv := &fhttp.Server{Addr: addr, Handler: mux}
 		go func() { _ = srv.ListenAndServe() }()
 		defer srv.Close()
 
@@ -1140,7 +1141,7 @@ func TestWebSocketCompressionBombDefenseWhenCompressionEnabled(t *testing.T) {
 			}
 		})
 
-		srv := &fnet.Server{Addr: addr, Handler: mux}
+		srv := &fhttp.Server{Addr: addr, Handler: mux}
 		go func() { _ = srv.ListenAndServe() }()
 		defer srv.Close()
 
@@ -1228,7 +1229,7 @@ func TestWebSocketCompressionBombDefenseWhenCompressionEnabled(t *testing.T) {
 			serverErrCh <- readErr
 		})
 
-		srv := &fnet.Server{Addr: addr, Handler: mux}
+		srv := &fhttp.Server{Addr: addr, Handler: mux}
 		go func() { _ = srv.ListenAndServe() }()
 		defer srv.Close()
 
@@ -1312,7 +1313,7 @@ func TestWebSocketCompressionBombDefenseWhenCompressionEnabled(t *testing.T) {
 			}
 		})
 
-		srv := &fnet.Server{Addr: addr, Handler: mux}
+		srv := &fhttp.Server{Addr: addr, Handler: mux}
 		go func() { _ = srv.ListenAndServe() }()
 		defer srv.Close()
 
@@ -1415,7 +1416,7 @@ func TestWebSocketAsyncDecompressionWorkerPool(t *testing.T) {
 		}
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -1497,7 +1498,7 @@ func TestWebSocketAsyncMessageOrderingFIFO(t *testing.T) {
 		}
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -1572,7 +1573,7 @@ func TestWebSocketAsyncDecompressionBombDoesNotBlockReactor(t *testing.T) {
 		_, _ = upgrader.Upgrade(w, r)
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -1675,7 +1676,7 @@ func TestWebSocketLargeFrames_StreamingAssemblyAndEcho(t *testing.T) {
 		}
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -1745,7 +1746,7 @@ func TestWebSocketLargeFrame_PipeliningWithSmallFrame(t *testing.T) {
 		}
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -1828,7 +1829,7 @@ func TestWebSocketSilentBackpressure(t *testing.T) {
 		}
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -1893,7 +1894,7 @@ func TestWebSocketMaxMessageSizeProtection(t *testing.T) {
 		}
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -1948,7 +1949,7 @@ func TestWebSocketLargeFrameAbortedAssemblyCleanup(t *testing.T) {
 		})
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -2022,7 +2023,7 @@ func TestWebSocket_BatchCoalescing(t *testing.T) {
 		})
 	})
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	defer srv.Close()
 
@@ -2204,7 +2205,7 @@ func startWSServer(t *testing.T, u *websocket.Upgrader) string {
 	addr := fmt.Sprintf("127.0.0.1:%d", getFreePort(t))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) { _, _ = u.Upgrade(w, r) })
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() { _ = srv.Close() })
 	time.Sleep(50 * time.Millisecond)

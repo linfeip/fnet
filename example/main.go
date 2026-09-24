@@ -10,7 +10,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
+	"github.com/linfeip/fnet/internal/testcert"
 )
 
 func main() {
@@ -37,7 +38,7 @@ func main() {
 
 	go func() {
 		log.Printf("HTTP listening on http://%s", httpAddr)
-		srv := &fnet.Server{Addr: httpAddr, Handler: mux}
+		srv := &fhttp.Server{Addr: httpAddr, Handler: mux}
 		if err := srv.ListenAndServe(); err != nil {
 			log.Fatalf("http server: %v", err)
 		}
@@ -49,7 +50,7 @@ func main() {
 	}
 
 	log.Printf("HTTPS listening on https://%s", httpsAddr)
-	httpsSrv := &fnet.Server{
+	httpsSrv := &fhttp.Server{
 		Addr:    httpsAddr,
 		Handler: mux,
 		TLSConfig: &tls.Config{
@@ -80,7 +81,7 @@ func ensureExampleCerts() (certFile, keyFile string, err error) {
 			return certFile, keyFile, nil
 		}
 	}
-	certPEM, keyPEM, err := fnet.GenerateSelfSignedCertPEM()
+	certPEM, keyPEM, err := testcert.Generate()
 	if err != nil {
 		return "", "", err
 	}

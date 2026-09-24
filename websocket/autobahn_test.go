@@ -15,7 +15,7 @@ import (
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsflate"
 	"github.com/gobwas/ws/wsutil"
-	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/websocket"
 )
 
@@ -52,7 +52,7 @@ func startAutobahnEchoServer(t *testing.T, eventDriven bool, compression bool) (
 		})
 	}
 
-	srv := &fnet.Server{Addr: addr, Handler: mux}
+	srv := &fhttp.Server{Addr: addr, Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 	time.Sleep(50 * time.Millisecond)
 
