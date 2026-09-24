@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -122,3 +123,30 @@ func Write(fd int, b []byte) (int, error) {
 
 // Close closes fd. Closing also removes it from any poller.
 func Close(fd int) error { return unix.Close(fd) }
+
+// SetKeepAlive applies ka to the TCP socket fd.
+func SetKeepAlive(fd int, ka KeepAlive) error {
+	if ka.Idle < 0 {
+		return unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_KEEPALIVE, 0)
+	}
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_KEEPALIVE, 1); err != nil {
+		return err
+	}
+	if ka.Idle > 0 {
+		if err := unix.SetsockoptInt(fd, unix.IPPROTO_TCP, tcpKeepIdle, seconds(ka.Idle)); err != nil {
+			return err
+		}
+	}
+	if ka.Interval > 0 {
+		if err := unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, seconds(ka.Interval)); err != nil {
+			return err
+		}
+	}
+	if ka.Count > 0 {
+		return unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPCNT, ka.Count)
+	}
+	return nil
+}
+
+// seconds rounds d up to whole seconds, the unit of the keep-alive options.
+func seconds(d time.Duration) int { return max(int((d+time.Second-1)/time.Second), 1) }

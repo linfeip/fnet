@@ -79,6 +79,7 @@ func (p *epollPoller) Wait(timeout time.Duration) ([]Event, error) {
 			Fd:       int(ev.Fd),
 			Readable: ev.Events&(unix.EPOLLIN|unix.EPOLLPRI|unix.EPOLLRDHUP|unix.EPOLLHUP|unix.EPOLLERR) != 0,
 			Writable: ev.Events&unix.EPOLLOUT != 0,
+			Hup:      ev.Events&(unix.EPOLLRDHUP|unix.EPOLLHUP|unix.EPOLLERR) != 0,
 		})
 	}
 	p.out = out

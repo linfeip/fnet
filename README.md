@@ -2,9 +2,9 @@
 
 English | [中文](README.zh-CN.md)
 
-A production-grade, ultra-high-performance HTTP/HTTPS and WebSocket engine for Go, engineered for **million-level concurrent connections (1M Conns)** with minimal memory footprint and extreme CPU efficiency.
+A production-grade, ultra-high-performance networking framework for Go — custom TCP protocols, HTTP/HTTPS and WebSocket — engineered for **million-level concurrent connections (1M Conns)** with minimal memory footprint and extreme CPU efficiency.
 
-I/O is driven by native multi-reactor pollers (**epoll** on Linux, **kqueue** on macOS; Windows runs an emulation for development). It adheres strictly to RFC 6455 and Go's standard `net/http` contracts without compromising on real-world business requirements.
+I/O is driven by native multi-reactor pollers. **Linux (epoll) is the production target**; macOS (kqueue) is supported for development, and Windows runs an emulation for development only. It adheres strictly to RFC 6455 and Go's standard `net/http` contracts without compromising on real-world business requirements, and serves your own TCP protocols (game servers, gateways, IM, RPC) with the same event loops.
 
 ---
 
@@ -14,21 +14,23 @@ I/O is driven by native multi-reactor pollers (**epoll** on Linux, **kqueue** on
 - 🔥 **High Throughput & Low CPU**: Multi-reactor pollers keep echo and fan-out workloads fast while using few cores.
 - ⚡ **Rapid Handshake**: Non-blocking `accept4` and a shared connection table keep mass connect storms cheap.
 - 🧵 **Zero-Goroutine Idle Connections**: Idle sockets stay on the poller and do not occupy goroutines or stacks.
+- 🎮 **Custom TCP Protocols**: `fnet.Server` frames your protocol on the event loop (`Split`, e.g. a Netty-style `LengthField`) and runs `OnMessage` on workers, one message at a time per connection, so handlers may block on databases.
 - 🛡️ **Full Standards & Business Compliance**: Complete RFC 6455 support (payload unmasking, Ping/Pong/Close control frames, Origin check, Subprotocols), full TLS/HTTPS support, and standard `http.Handler` compatibility.
 
 ---
 
 ## 🏗️ Architecture
 
-Four layers, each doing one job, plus the worker pool that runs business code:
+Layers that each do one job, plus the worker pool that runs business code:
 
 | Layer | Package | Responsibility |
 |---|---|---|
 | Platform | `internal/netpoll` | epoll / kqueue / Windows emulation, raw non-blocking socket calls. The only platform-specific code. |
 | Reactor | `internal/reactor` | Acceptor, event loops, connection table, per-connection input/output buffering, backpressure, close. Moves bytes only. |
-| Server + HTTP | `fhttp` | `Server` lifecycle and listeners; HTTP/1.x: decide when a request is ready, run `ServeHTTP` on a worker, keep-alive, TLS, hijack. |
+| TCP protocols | `fnet` | `Server` for message protocols: `Split` frames on the loop, `OnOpen` / `OnMessage` / `OnClose` on workers; backpressure, timeouts, half-close, graceful `Shutdown`. |
+| HTTP | `fhttp` | `Server` lifecycle and listeners; HTTP/1.x: decide when a request is ready, run `ServeHTTP` on a worker, keep-alive, TLS, hijack. |
 | WebSocket | `websocket` | Handshake, RFC 6455 framing and control frames, permessage-deflate, event-driven message queue. |
-| Worker pool | `pool` | Sharded goroutine pool that runs `ServeHTTP` and `OnMessage`; shared by `fhttp` and `websocket`, no networking code. |
+| Worker pool | `pool` | Sharded goroutine pool that runs `ServeHTTP` and `OnMessage`; shared by `fnet`, `fhttp` and `websocket`, no networking code. |
 
 Protocols plug into the reactor through one interface, `reactor.Handler` (`OnData` / `OnClose`, run on the event loop). A connection's input is either delivered to its handler on the loop (idle, zero goroutines) or *detached* to a blocking reader on a worker (`net.Conn` semantics for `net/http` and TLS), and handed back with `Attach`.
 
@@ -39,6 +41,8 @@ Client
 Acceptor (accept4) --> Event loop (epoll / kqueue) ---- idle connection waits here, 0 goroutines
                           |
                           +-- HTTP: header complete --> Detach --> worker: ServeHTTP --> Attach (back to idle)
+                          |
+                          +-- TCP: Split cuts messages on the loop --> pooled message --> worker: OnMessage
                           |
                           +-- WebSocket: frames parsed on the loop --> pooled message --> worker: OnMessage
                           |                  |
@@ -67,8 +71,14 @@ Acceptor (accept4) --> Event loop (epoll / kqueue) ---- idle connection waits he
 * **Tiered Buffer Pool**: Pooled buffers from 128 B to 16 MiB; a large frame streams into its message buffer as bytes arrive, so memory follows what was received, not what a header claims.
 * **Backpressure**: When a connection's queued message bytes exceed the threshold (default 64 KiB), reading pauses and TCP flow control slows the sender.
 
-### 4. Output
-* **Direct Writes**: Writers go straight to the socket; only what the kernel does not accept is queued (up to 16 MiB per connection) and flushed by the event loop. Queued output above 64 KiB pauses reading until it drains.
+### 4. TCP Message Protocols
+* **Framing On The Loop, Business On Workers**: `Split` (with `bufio.SplitFunc` semantics) runs on the event loop and only finds message boundaries; each complete message is copied into a pooled buffer. `OnOpen`, `OnMessage` and `OnClose` run on the worker pool, one call at a time per connection, in order. A partial message stays with the reactor (bounded by `MaxMessageSize`, default 1 MiB) and never holds a worker; a panicking or looping `Split` closes only its own connection.
+* **Backpressure Both Ways**: Received messages waiting for `OnMessage` above `MaxPendingMessageBytes` (64 KiB) pause reading. Output queued for a peer that does not read is capped by `MaxOutboundBytes` (16 MiB by default; broadcast-heavy servers set it near 256 KiB to drop stalled players in seconds); `Write` fails with `ErrWriteBufferFull` instead of growing.
+* **Timeouts Count Only The Peer**: `ReadTimeout` (30s) runs from a message's first byte, so trickling cannot extend it; `IdleTimeout` is a heartbeat timeout (off by default). Time spent in handlers or paused by backpressure never counts. TCP keep-alive (60s idle, then 4 probes 15s apart) drops peers that vanished without closing.
+* **Closing**: A peer that closes or half-closes still has the messages it sent handled and the replies flushed; `OnClose` gets `io.EOF`. A close from this side drops messages not handled yet. `Shutdown(ctx)` stops accepting, lets every connection finish what it received, and returns once every `OnClose` has run.
+
+### 5. Output
+* **Direct Writes**: Writers go straight to the socket; only what the kernel does not accept is queued (up to 16 MiB per connection by default) and flushed by the event loop. Queued output above 64 KiB pauses reading until it drains. A write into an empty queue is always taken whole, so a message is never cut short on the wire.
 * **`writev`**: Frame or response headers and payloads leave in a single `writev` call without an intermediate copy.
 
 ---
@@ -80,10 +90,10 @@ Acceptor (accept4) --> Event loop (epoll / kqueue) ---- idle connection waits he
 - **Dual WebSocket Modes**:
   - **Event-Driven**: Zero goroutines while idle; frame parsing happens in the reactor, and business callbacks (`OnMessage`) are automatically offloaded to a high-performance sharded worker pool to keep the I/O event loop unblocked.
   - **Blocking/Goroutine**: Full `net.Conn` stream compatibility for traditional request-response and blocking loops.
-- **Built-in High-Concurrency Worker Pool**: Zero external dependencies, multi-shard lock-free design, per-connection strict FIFO ordering, and automatic idle worker reclamation for 1M+ connections. Both HTTP business requests (`ServeHTTP`) and WebSocket messages (`OnMessage`) are processed by default on the worker pool, completely freeing the I/O Reactor threads.
+- **Built-in High-Concurrency Worker Pool**: Zero external dependencies, sharded queues with connection affinity and work stealing, and automatic idle worker reclamation for 1M+ connections. HTTP requests (`ServeHTTP`), WebSocket messages and TCP messages (`OnMessage`) run on the worker pool by default, completely freeing the I/O reactor threads; each connection runs its callbacks one at a time, in arrival order.
 - **Vector I/O (`writev`)**: Stack-allocated header framing merged with payload into single syscall writes to eliminate intermediate buffer copies.
 - **Aggressive Memory Optimization**: Chunked lock-free connection tables, pooled response writers, lazy address resolution, and auto-compacting buffers.
-- **Cross-Platform**: Linux (`epoll`), macOS/Darwin (`kqueue`). Windows runs a development emulation on top of the `net` package (one pump goroutine per socket).
+- **Platforms**: Linux (`epoll`) is what production runs on and what capacity and defaults are tuned for. macOS/Darwin (`kqueue`) behaves the same and is meant for development. Windows runs a development emulation on top of the `net` package (one pump goroutine per socket); it is not for production.
 
 ---
 
@@ -93,11 +103,49 @@ Acceptor (accept4) --> Event loop (epoll / kqueue) ---- idle connection waits he
 go get github.com/linfeip/fnet
 ```
 
-Requires Go 1.21+.
+Requires Go 1.26+ (the `go` directive in `go.mod`). Deploy on Linux; a million connections also need raised fd limits (`ulimit -n`, `fs.nr_open`, `fs.file-max`).
 
 ---
 
 ## Quickstart
+
+### Custom TCP Protocol
+
+A game server speaking `| len uint32 | payload |`:
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"log"
+	"time"
+
+	"github.com/linfeip/fnet"
+)
+
+func main() {
+	srv := &fnet.Server{
+		Addr:        ":7001",
+		Split:       fnet.LengthField{Size: 4, Strip: 4}.Split, // OnMessage gets the payload
+		IdleTimeout: 30 * time.Second,                          // heartbeat timeout
+		OnOpen:      func(c *fnet.Conn) { c.SetContext(newSession(c)) },
+		OnMessage: func(c *fnet.Conn, msg []byte) {
+			// A worker, one message at a time per connection: it may query a database.
+			reply := c.Context().(*session).handle(msg)
+			var hdr [4]byte
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(reply)))
+			if _, err := c.Writev([][]byte{hdr[:], reply}); err != nil {
+				c.Close()
+			}
+		},
+		OnClose: func(c *fnet.Conn, err error) { c.Context().(*session).save() },
+	}
+	log.Fatal(srv.ListenAndServe())
+}
+```
+
+`Split` answers one question on the event loop: is there a whole message at the start of the bytes received so far, and how long is it? `LengthField` covers length-prefixed headers the way Netty's `LengthFieldBasedFrameDecoder` does (`Offset`, `Size` 1/2/3/4/8, `Order`, `Adjust`, `Strip`), `bufio.ScanLines` covers line protocols, and any `bufio.SplitFunc` works. `msg` is only valid during `OnMessage`; decoding it (e.g. `proto.Unmarshal`) copies it. `Write` never blocks and may be called from any goroutine, e.g. a room broadcasting the same buffer to every player.
 
 ### HTTP & HTTPS
 
@@ -191,6 +239,7 @@ Run the bundled examples:
 ```bash
 go run ./example                 # HTTP on :8080 & HTTPS on :8443
 go run ./example/websocket       # High-concurrency echo WebSocket on :8081
+go run ./example/tcp -bots 3     # Chat-room game server on :7001 with three bots
 ```
 
 ---

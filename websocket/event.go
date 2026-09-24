@@ -222,9 +222,11 @@ func (e *eventConn) flush() {
 	}
 	e.queue = append(e.queue, e.batch...)
 	e.pending += size
-	pause := e.maxPending > 0 && e.pending > e.maxPending && !e.paused
-	if pause {
+	if e.maxPending > 0 && e.pending > e.maxPending && !e.paused {
+		// Under the lock, so a worker that drains the queue at once cannot
+		// resume before the pause lands and leave the connection unread.
 		e.paused = true
+		e.c.raw.PauseRead()
 	}
 	start := !e.running
 	e.running = true
@@ -233,9 +235,6 @@ func (e *eventConn) flush() {
 	e.batch = e.batch[:0]
 	if cap(e.batch) > idleQueueCap {
 		e.batch = nil
-	}
-	if pause {
-		e.c.raw.PauseRead()
 	}
 	if start {
 		e.schedule()
@@ -332,14 +331,11 @@ func (e *eventConn) run() {
 
 		e.mu.Lock()
 		e.pending -= size
-		resume := e.paused && e.pending <= e.lowPending
-		if resume {
+		if e.paused && e.pending <= e.lowPending {
 			e.paused = false
-		}
-		e.mu.Unlock()
-		if resume {
 			e.c.raw.ResumeRead()
 		}
+		e.mu.Unlock()
 	}
 }
 

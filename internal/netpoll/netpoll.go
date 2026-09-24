@@ -15,6 +15,11 @@ type Event struct {
 	Fd       int
 	Readable bool
 	Writable bool
+	// Hup reports that the peer finished sending or the socket failed: once
+	// the buffered bytes are read, Read returns EOF or the error. It rides on
+	// the same edge as the last data, so a reader must not stop at a short
+	// read or it never sees the end.
+	Hup bool
 }
 
 // Poller is an edge-triggered readiness multiplexer. Registration methods are
@@ -34,6 +39,16 @@ type Poller interface {
 	Wake() error
 	// Close releases the poller.
 	Close() error
+}
+
+// KeepAlive configures TCP keep-alive probes on a socket: Idle is the quiet
+// time before the first probe, Interval the time between unanswered probes, and
+// Count how many unanswered probes drop the peer. Zero fields keep the platform
+// defaults; a negative Idle turns keep-alive off.
+type KeepAlive struct {
+	Idle     time.Duration
+	Interval time.Duration
+	Count    int
 }
 
 // NewPoller creates the platform-native poller.

@@ -9,11 +9,8 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"runtime"
-	"sync"
 	"time"
 
-	"github.com/linfeip/fnet/internal/netpoll"
 	"github.com/linfeip/fnet/internal/reactor"
 )
 
@@ -27,6 +24,10 @@ const (
 	// DefaultIdleTimeout closes plaintext keep-alive connections idle this long
 	// when IdleTimeout is not set.
 	DefaultIdleTimeout = 2 * time.Minute
+	// DefaultKeepAlive is the TCP keep-alive idle time when KeepAlive is not
+	// set: a peer that vanished without closing is dropped about two minutes
+	// later.
+	DefaultKeepAlive = reactor.DefaultKeepAliveIdle
 )
 
 // Server serves HTTP/1.x over native event loops. A single Server runs one
@@ -55,6 +56,11 @@ type Server struct {
 	// TLS connection holds a worker goroutine, so there keep-alive is opt-in:
 	// 0 closes the connection after each response.
 	IdleTimeout time.Duration
+	// KeepAlive is the idle time before TCP keep-alive probes start, which
+	// find peers that vanished without closing (event-driven WebSocket
+	// connections have no idle timeout of their own). 0 means
+	// DefaultKeepAlive, negative turns probes off.
+	KeepAlive time.Duration
 	// NumPollers is the number of event loops. Defaults to runtime.GOMAXPROCS(0).
 	NumPollers int
 
@@ -67,9 +73,7 @@ type Server struct {
 	// is called on an event loop and must not block. Defaults to pool.Default().
 	WorkerPool func(connID uint64, task func())
 
-	mu     sync.Mutex
-	closed bool
-	engine *reactor.Engine
+	run reactor.Runner
 }
 
 // ListenAndServe listens on addr and serves HTTP with handler.
@@ -104,87 +108,17 @@ func (s *Server) ListenAndServeTLS(certFile, keyFile string) error {
 }
 
 func (s *Server) serve(tlsConfig *tls.Config) error {
-	if s.isClosed() {
-		return ErrServerClosed
-	}
-	listeners, err := s.listen()
-	if err != nil {
-		return err
-	}
-	loops := s.NumPollers
-	if loops <= 0 {
-		loops = runtime.GOMAXPROCS(0)
-	}
-	eng, err := reactor.New(loops, listeners, newHTTPHandler(s, tlsConfig))
-	if err != nil {
-		return err
-	}
-
-	// The sockets are already accepting, so Close may have run meanwhile.
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		eng.Close()
-		return ErrServerClosed
-	}
-	s.engine = eng
-	s.mu.Unlock()
-
-	if err := eng.Serve(); err != nil {
+	cfg := reactor.Config{Loops: s.NumPollers, KeepAlive: reactor.KeepAliveFor(s.KeepAlive)}
+	if err := s.run.Run(cfg, s.Addr, s.Addrs, s.Listen, newHTTPHandler(s, tlsConfig)); err != nil {
 		return err
 	}
 	return ErrServerClosed
 }
 
-func (s *Server) listen() ([]reactor.Listener, error) {
-	addrs := s.Addrs
-	if s.Addr != "" || len(addrs) == 0 {
-		addrs = append([]string{s.Addr}, addrs...)
-	}
-	var lns []reactor.Listener
-	for _, addr := range addrs {
-		var (
-			fd    int
-			laddr net.Addr
-			err   error
-		)
-		if s.Listen != nil {
-			var ln net.Listener
-			if ln, err = s.Listen("tcp", addr); err == nil {
-				fd, laddr, err = netpoll.FromListener(ln)
-			}
-		} else {
-			fd, laddr, err = netpoll.Listen("tcp", addr)
-		}
-		if err != nil {
-			for _, ln := range lns {
-				_ = netpoll.Close(ln.FD)
-			}
-			return nil, err
-		}
-		lns = append(lns, reactor.Listener{FD: fd, Addr: laddr})
-	}
-	return lns, nil
-}
-
-func (s *Server) isClosed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.closed
-}
-
 // Close closes the listeners and every connection immediately. Handlers that
 // are still running see their connection closed. Close is idempotent.
 func (s *Server) Close() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil
-	}
-	s.closed = true
-	eng := s.engine
-	s.mu.Unlock()
-	if eng != nil {
+	if eng := s.run.Stop(); eng != nil {
 		eng.Close()
 	}
 	return nil

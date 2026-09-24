@@ -2,9 +2,9 @@
 
 [English](README.md) | 中文
 
-面向工业级场景的高性能 HTTP/HTTPS 与 WebSocket 网络引擎，专为**百万级长连接（1M Connections）**、极致内存控制与超高 CPU 能效比设计。
+面向工业级场景的高性能 Go 网络框架：自定义 TCP 协议、HTTP/HTTPS 与 WebSocket，专为**百万级长连接（1M Connections）**、极致内存控制与超高 CPU 能效比设计。
 
-底层 I/O 由多 Reactor 原生事件轮询器驱动（**Linux 使用 epoll，macOS 使用 kqueue；Windows 为开发用的仿真实现**）。在完全遵循 RFC 6455 规范与 Go 标准库 `net/http` 契约的前提下，实现极高吞吐与极低长尾延迟，绝无牺牲业务功能的跑分妥协。
+底层 I/O 由多 Reactor 原生事件轮询器驱动。**生产环境以 Linux（epoll）为准**；macOS（kqueue）可用于开发，Windows 只是开发用的仿真实现。在完全遵循 RFC 6455 规范与 Go 标准库 `net/http` 契约的前提下，实现极高吞吐与极低长尾延迟，绝无牺牲业务功能的跑分妥协；游戏服、网关、IM、RPC 等自定义 TCP 协议也跑在同一套事件循环上。
 
 ---
 
@@ -14,21 +14,23 @@
 - 🔥 **高吞吐、低 CPU**：多 Reactor 轮询在回显与扇出场景下保持高吞吐，核心占用可控。
 - ⚡ **高效建连**：Linux 上使用 `accept4`，配合全局共享连接表，应对大规模瞬时建连。
 - 🧵 **空闲连接 0 协程常驻**：空闲套接字只挂在 Poller 上，不占用 Goroutine 栈和调度资源。
+- 🎮 **自定义 TCP 协议**：`fnet.Server` 在事件循环上按你的协议拆包（`Split`，如 Netty 式的 `LengthField`），`OnMessage` 在 worker 上执行，同一连接一次一条、保序，业务可以放心查库。
 - 🛡️ **严格符合业务规范与行业标准**：完整支持 RFC 6455（客户端掩码解密、Ping/Pong/Close 控制帧保活与协商、子协议与 Origin 鉴权）、完整兼容 TLS/HTTPS 与标准 `http.Handler`。
 
 ---
 
 ## 🏗️ 整体架构
 
-四层各管一件事，另有一个执行业务代码的 worker 池：
+各层各管一件事，另有一个执行业务代码的 worker 池：
 
 | 层 | 包 | 职责 |
 |---|---|---|
 | 平台层 | `internal/netpoll` | epoll / kqueue / Windows 仿真，以及原始的非阻塞 socket 调用。唯一含平台差异的代码。 |
 | Reactor 层 | `internal/reactor` | accept、事件循环、连接表、每连接的输入/输出缓冲、背压、关闭。只搬运字节。 |
-| Server + HTTP | `fhttp` | `Server` 生命周期与监听；HTTP/1.x：判断请求何时就绪、在 worker 上跑 `ServeHTTP`、keep-alive、TLS、Hijack。 |
+| TCP 协议 | `fnet` | 消息协议的 `Server`：`Split` 在事件循环上拆包，`OnOpen` / `OnMessage` / `OnClose` 在 worker 上执行；背压、超时、半关、优雅停机 `Shutdown`。 |
+| HTTP | `fhttp` | `Server` 生命周期与监听；HTTP/1.x：判断请求何时就绪、在 worker 上跑 `ServeHTTP`、keep-alive、TLS、Hijack。 |
 | WebSocket | `websocket` | 握手、RFC 6455 帧与控制帧、permessage-deflate、事件驱动消息队列。 |
-| Worker 池 | `pool` | 分片协程池，执行 `ServeHTTP` 与 `OnMessage`；`fhttp` 与 `websocket` 共用，不含网络代码。 |
+| Worker 池 | `pool` | 分片协程池，执行 `ServeHTTP` 与 `OnMessage`；`fnet`、`fhttp` 与 `websocket` 共用，不含网络代码。 |
 
 协议通过唯一的接口 `reactor.Handler`（`OnData` / `OnClose`，在事件循环上执行）挂到 reactor 上。连接的输入要么在事件循环上交给 handler（空闲态，0 协程），要么 *Detach* 给 worker 上的阻塞读者（为 `net/http` 与 TLS 提供 `net.Conn` 语义），用完再 `Attach` 交还。
 
@@ -39,6 +41,8 @@
 Acceptor（accept4）--> 事件循环（epoll / kqueue）---- 空闲连接停在这里，0 协程
                           |
                           +-- HTTP：头部收齐 --> Detach --> worker：ServeHTTP --> Attach（回到空闲）
+                          |
+                          +-- TCP：Split 在事件循环上拆包 --> 池化消息 --> worker：OnMessage
                           |
                           +-- WebSocket：在事件循环上解帧 --> 池化消息 --> worker：OnMessage
                           |                  |
@@ -67,8 +71,14 @@ Acceptor（accept4）--> 事件循环（epoll / kqueue）---- 空闲连接停在
 * **分级缓冲池**：128 B 至 16 MiB 的池化缓冲；大帧随字节到达流式写入消息缓冲，内存随实际收到的字节增长，而不是随帧头声称的长度。
 * **背压**：某连接排队的消息字节超过阈值（默认 64 KiB）即暂停读取，由 TCP 流控压制发送端。
 
-### 4. 写出
-* **直写优先**：写直接进 socket，内核没收下的部分才排队（每连接上限 16 MiB），由事件循环刷出。排队超过 64 KiB 时暂停读取，刷到阈值以下再恢复。
+### 4. TCP 消息协议
+* **事件循环拆包，业务进 worker**：`Split`（`bufio.SplitFunc` 语义）在事件循环上只找消息边界，完整消息拷贝进池化缓冲；`OnOpen`、`OnMessage`、`OnClose` 在 WorkerPool 上执行，同一连接一次一个、保序。半包留在 reactor 里（上限 `MaxMessageSize`，默认 1 MiB），不占 worker；`Split` panic 或原地打转只关掉它自己的连接。
+* **双向背压**：等待 `OnMessage` 的消息超过 `MaxPendingMessageBytes`（64 KiB）即暂停读取。对端不读时输出积压受 `MaxOutboundBytes` 限制（默认 16 MiB；广播为主的服务建议设 256 KiB 左右，几秒内就能发现卡住的玩家），超过后 `Write` 返回 `ErrWriteBufferFull`，不会无限增长。
+* **超时只计对端的慢**：`ReadTimeout`（30s）从一条消息的第一个字节算起，慢速滴灌无法续期；`IdleTimeout` 是心跳超时（默认关闭）。handler 处理的时间、因背压暂停读的时间都不计。TCP keep-alive（空闲 60s 后每 15s 探测、4 次无应答断开）回收不告而别的对端。
+* **关闭**：对端关闭或半关时，它发来的消息照常处理、回复刷出后再关，`OnClose` 收到 `io.EOF`；本端关闭丢弃尚未处理的消息。`Shutdown(ctx)` 停止 accept，让每个连接处理完已收到的消息，等所有 `OnClose` 执行完才返回。
+
+### 5. 写出
+* **直写优先**：写直接进 socket，内核没收下的部分才排队（每连接默认上限 16 MiB），由事件循环刷出。排队超过 64 KiB 时暂停读取，刷到阈值以下再恢复。写入空队列的一次写总是整条收下，消息不会在线上被截断。
 * **`writev`**：帧头/响应头与负载一次 `writev` 发出，无中间拷贝。
 
 ---
@@ -80,10 +90,10 @@ Acceptor（accept4）--> 事件循环（epoll / kqueue）---- 空闲连接停在
 - **双模 WebSocket 支持**：
   - **事件驱动模式（推荐）**：连接空闲时 0 协程常驻，Reactor 读事件触发解析，业务数据包自动投递到内置工作协程池执行，绝不卡死 IO Reactor 事件循环。
   - **阻塞协程模式**：兼容传统业务模型，保留独立 Goroutine 阻塞 `ReadMessage()` / `WriteMessage()`。
-- **内置高并发工作协程池**：零外部依赖，多分片架构，连接级严格保序（FIFO），空闲协程自动超时回收，完美支撑 100万+（1M）长连接。HTTP 业务请求（`ServeHTTP`）与 WebSocket 业务数据包（`OnMessage`）默认全部在业务协程池中调度执行，IO Reactor 彻底不阻塞。
+- **内置高并发工作协程池**：零外部依赖，多分片队列、按连接亲和分片并支持任务窃取，空闲协程自动超时回收，支撑 100万+（1M）长连接。HTTP 业务请求（`ServeHTTP`）、WebSocket 与 TCP 业务消息（`OnMessage`）默认全部在业务协程池中执行，IO Reactor 彻底不阻塞；同一连接的回调一次一个、按到达顺序执行。
 - **向量化写入 (writev)**：将帧头部与数据负载通过单次系统调用直达网卡，杜绝内存拼包拷贝。
 - **极致内存剪枝技术**：全局分块无锁连接表（O(1) 访问）、全链路 ResponseWriter 对象池化、紧凑延迟 IP 解析、缓冲区自动收缩。
-- **跨平台支持**：Linux (`epoll`)、macOS (`kqueue`)。Windows 为基于 `net` 包的开发用仿真（每个 socket 一个泵协程）。
+- **运行平台**：生产运行在 Linux (`epoll`) 上，容量和默认值都按 Linux 设计。macOS (`kqueue`) 行为一致，用于开发。Windows 为基于 `net` 包的开发用仿真（每个 socket 一个泵协程），不用于生产。
 
 ---
 
@@ -93,11 +103,49 @@ Acceptor（accept4）--> 事件循环（epoll / kqueue）---- 空闲连接停在
 go get github.com/linfeip/fnet
 ```
 
-需要 Go 1.21 及以上版本。
+需要 Go 1.26 及以上版本（即 `go.mod` 里的 `go` 指令）。请部署在 Linux 上；百万连接还需要调高 fd 上限（`ulimit -n`、`fs.nr_open`、`fs.file-max`）。
 
 ---
 
 ## 快速上手
+
+### 自定义 TCP 协议
+
+一个 `| len uint32 | payload |` 格式的游戏服：
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"log"
+	"time"
+
+	"github.com/linfeip/fnet"
+)
+
+func main() {
+	srv := &fnet.Server{
+		Addr:        ":7001",
+		Split:       fnet.LengthField{Size: 4, Strip: 4}.Split, // OnMessage 拿到的是包体
+		IdleTimeout: 30 * time.Second,                          // 心跳超时
+		OnOpen:      func(c *fnet.Conn) { c.SetContext(newSession(c)) },
+		OnMessage: func(c *fnet.Conn, msg []byte) {
+			// 在 worker 上执行，同一连接一次一条：可以查库、调下游
+			reply := c.Context().(*session).handle(msg)
+			var hdr [4]byte
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(reply)))
+			if _, err := c.Writev([][]byte{hdr[:], reply}); err != nil {
+				c.Close()
+			}
+		},
+		OnClose: func(c *fnet.Conn, err error) { c.Context().(*session).save() },
+	}
+	log.Fatal(srv.ListenAndServe())
+}
+```
+
+`Split` 在事件循环上只回答一个问题：目前收到的字节开头是不是一个完整的包、有多长。`LengthField` 按 Netty `LengthFieldBasedFrameDecoder` 的方式描述长度头（`Offset`、`Size` 1/2/3/4/8、`Order`、`Adjust`、`Strip`），`bufio.ScanLines` 对应按行的协议，任何 `bufio.SplitFunc` 都能用。`msg` 只在 `OnMessage` 调用期间有效，解码（如 `proto.Unmarshal`）本身就会拷贝。`Write` 从不阻塞、可在任意 goroutine 调用，比如房间 goroutine 把同一个缓冲广播给所有玩家。
 
 ### HTTP 与 HTTPS 服务
 
@@ -189,6 +237,7 @@ func main() {
 ```bash
 go run ./example                 # HTTP (:8080) 与 HTTPS (:8443) 示例
 go run ./example/websocket       # 高并发 WebSocket Echo 示例 (:8081)
+go run ./example/tcp -bots 3     # 聊天室游戏服示例 (:7001)，附带三个机器人
 ```
 
 ---

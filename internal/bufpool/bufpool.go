@@ -24,7 +24,7 @@ var tiers [maxShift - minShift + 1]sync.Pool
 
 func init() {
 	for i := range tiers {
-		size, tier := 1<<(minShift+i), int8(i) // per-iteration copies (go 1.21 loop semantics)
+		size, tier := 1<<(minShift+i), int8(i)
 		tiers[i].New = func() any { return &Buffer{B: make([]byte, size), tier: tier} }
 	}
 }

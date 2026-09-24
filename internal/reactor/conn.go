@@ -15,17 +15,19 @@ import (
 )
 
 // ErrWriteBufferFull is returned by Write when the connection's outbound queue
-// would exceed maxOutbound because the peer is not reading.
+// would exceed its cap (Config.MaxOutbound) because the peer is not reading.
 var ErrWriteBufferFull = errors.New("fnet: outbound write buffer full")
 
 // errHandlerOwned is returned by Read while the input is delivered to a Handler.
 var errHandlerOwned = errors.New("fnet: connection input is owned by its event handler")
 
 const (
-	maxOutbound   = 16 << 20 // per-connection cap on queued output
-	highWatermark = 64 << 10 // queued output above this pauses reading
-	lowWatermark  = 16 << 10 // ...and reading resumes once it drains below this
-	compactAfter  = 4 << 10
+	// DefaultMaxOutbound is the per-connection cap on queued output when
+	// Config.MaxOutbound is 0.
+	DefaultMaxOutbound = 16 << 20
+	highWatermark      = 64 << 10 // queued output above this pauses reading
+	lowWatermark       = 16 << 10 // ...and reading resumes once it drains below this
+	compactAfter       = 4 << 10
 )
 
 // Conn state bits.
@@ -48,6 +50,15 @@ type Handler interface {
 	OnData(c *Conn, data []byte) int
 	// OnClose is called exactly once when the connection is torn down.
 	OnClose(c *Conn, err error)
+}
+
+// EOFHandler is implemented by a Handler that serves half-closed connections.
+// When the peer finishes sending, OnEOF receives the input OnData left
+// unconsumed, instead of the connection being closed; output keeps flowing
+// until the handler closes the connection. OnEOF runs once, on the event loop,
+// and must not block.
+type EOFHandler interface {
+	OnEOF(c *Conn, rest []byte)
 }
 
 // Conn is one TCP connection owned by an event loop. Its input is in one of two
@@ -75,6 +86,7 @@ type Conn struct {
 	handler   Handler
 	detached  bool // a blocking reader owns the input
 	peerEOF   bool // the peer finished sending
+	eofDone   bool // an EOFHandler was told about peerEOF
 	in        []byte
 	inOff     int
 	inSince   int64 // unix nanos when the retained input started to accumulate
@@ -157,6 +169,13 @@ func (c *Conn) Attach(h Handler) {
 	if resume {
 		c.loop.post(task{kind: taskResume, c: c})
 	}
+}
+
+// Handler returns the connection's handler; nil once it is closed.
+func (c *Conn) Handler() Handler {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.handler
 }
 
 // Unread pushes b back in front of the buffered input.
@@ -337,7 +356,7 @@ func (c *Conn) offer() {
 
 // onPeerEOF records that the peer finished sending. A detached reader drains
 // the input and decides when to close (half-close); otherwise the handler is
-// done with the connection.
+// told.
 func (c *Conn) onPeerEOF() {
 	c.mu.Lock()
 	c.peerEOF = true
@@ -345,8 +364,30 @@ func (c *Conn) onPeerEOF() {
 	detached := c.detached
 	c.mu.Unlock()
 	if !detached {
-		c.abort(io.EOF)
+		c.handlerEOF()
 	}
+}
+
+// handlerEOF ends the input of a handler-owned connection. An EOFHandler gets
+// the unconsumed input, once, and decides when to close; for any other handler
+// the connection is done. Loop goroutine only.
+func (c *Conn) handlerEOF() {
+	c.mu.Lock()
+	eh, ok := c.handler.(EOFHandler)
+	if !ok {
+		c.mu.Unlock()
+		c.abort(io.EOF)
+		return
+	}
+	if c.eofDone || c.state.Load()&stClosed != 0 {
+		c.mu.Unlock()
+		return
+	}
+	c.eofDone = true
+	rest := c.in[c.inOff:]
+	c.in, c.inOff = nil, 0 // handed over: no more input will follow it
+	c.mu.Unlock()
+	eh.OnEOF(c, rest)
 }
 
 // handlerSawEOF reports whether the handler owns an input that has ended.
@@ -418,10 +459,12 @@ func (c *Conn) writableLocked() error {
 }
 
 // reserveLocked makes room for n more queued bytes and returns the slice to
-// fill, or ErrWriteBufferFull.
+// fill, or ErrWriteBufferFull. An empty queue takes any n: a write that the
+// kernel accepted in part always queues the rest, so a message is never cut
+// short on the wire, and one message larger than the cap still gets through.
 func (c *Conn) reserveLocked(n int) ([]byte, error) {
 	pending := c.outW - c.outR
-	if pending+n > maxOutbound {
+	if pending > 0 && pending+n > c.maxOutbound() {
 		return nil, ErrWriteBufferFull
 	}
 	if pending+n > highWatermark {
@@ -448,6 +491,13 @@ func (c *Conn) reserveLocked(n int) ([]byte, error) {
 	return buf[c.outW-n : c.outW], nil
 }
 
+func (c *Conn) maxOutbound() int {
+	if c.loop == nil {
+		return DefaultMaxOutbound
+	}
+	return c.loop.eng.maxOutbound
+}
+
 func (c *Conn) releaseOutLocked() {
 	bufpool.Put(c.out)
 	c.out = nil
@@ -455,7 +505,8 @@ func (c *Conn) releaseOutLocked() {
 }
 
 // Write implements net.Conn. It never blocks: bytes the kernel does not take
-// right away are queued (up to maxOutbound) and flushed by the event loop.
+// right away are queued (up to the engine's MaxOutbound) and flushed by the
+// event loop. b is not referenced after Write returns.
 func (c *Conn) Write(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil

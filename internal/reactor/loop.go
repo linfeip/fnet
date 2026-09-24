@@ -1,7 +1,6 @@
 package reactor
 
 import (
-	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -98,7 +97,7 @@ func (l *Loop) run() {
 				continue
 			}
 			if ev.Readable {
-				l.onReadable(c)
+				l.onReadable(c, ev.Hup)
 			}
 			if ev.Writable {
 				l.onWritable(c)
@@ -166,13 +165,17 @@ func (l *Loop) resume(c *Conn) {
 	}
 	c.offer()
 	if c.handlerSawEOF() {
-		c.abort(io.EOF)
+		c.handlerEOF()
 		return
 	}
-	l.onReadable(c)
+	l.onReadable(c, true) // edges that came while it was paused are gone
 }
 
-func (l *Loop) onReadable(c *Conn) {
+// onReadable reads c until its socket is drained. Readiness is edge-triggered,
+// so a short read means drained, except when the peer's EOF or an error came
+// with the same edge (hup), or no edge can be trusted (after a pause): then
+// read on until the socket reports it.
+func (l *Loop) onReadable(c *Conn, hup bool) {
 	for reads := 1; ; reads++ {
 		st := c.state.Load()
 		if st&(stClosed|stPaused) != 0 {
@@ -196,7 +199,7 @@ func (l *Loop) onReadable(c *Conn) {
 			}
 			return
 		}
-		if n < len(l.buf) {
+		if n < len(l.buf) && !hup {
 			// Edge-triggered: a short read drained the socket, and new data
 			// raises a new event, so skip the extra EAGAIN round trip.
 			return

@@ -105,11 +105,12 @@ func (p *kqueuePoller) Wait(timeout time.Duration) ([]Event, error) {
 		switch ev.Filter {
 		case unix.EVFILT_READ:
 			e.Readable = true
+			e.Hup = ev.Flags&unix.EV_EOF != 0
 		case unix.EVFILT_WRITE:
 			e.Writable = true
 		}
 		if ev.Flags&unix.EV_ERROR != 0 {
-			e.Readable = true
+			e.Readable, e.Hup = true, true
 		}
 		out = append(out, e)
 	}

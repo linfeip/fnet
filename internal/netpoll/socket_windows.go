@@ -279,6 +279,33 @@ func (s *sock) writePump() {
 	}
 }
 
+// KeepAliveInherited reports whether accepted sockets inherit their listener's
+// keep-alive settings. The emulation sets them on every accepted connection.
+const KeepAliveInherited = false
+
+// SetKeepAlive applies ka to an accepted connection. The count of unanswered
+// probes is left to Windows.
+func SetKeepAlive(fd int, ka KeepAlive) error {
+	s := lookup(fd)
+	if s == nil {
+		return net.ErrClosed
+	}
+	tc, ok := s.conn.(*net.TCPConn)
+	if !ok {
+		return nil // a listener: its connections are configured as they are accepted
+	}
+	if ka.Idle < 0 {
+		return tc.SetKeepAlive(false)
+	}
+	if err := tc.SetKeepAlive(true); err != nil {
+		return err
+	}
+	if ka.Idle > 0 {
+		return tc.SetKeepAlivePeriod(ka.Idle)
+	}
+	return nil
+}
+
 // Close closes the socket and releases its id.
 func Close(fd int) error {
 	socks.Lock()

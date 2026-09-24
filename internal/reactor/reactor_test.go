@@ -133,7 +133,7 @@ func TestConnUnread(t *testing.T) {
 func TestConnWriteBufferLimit(t *testing.T) {
 	c := detachedConn()
 	chunk := make([]byte, 1<<20)
-	for i := 0; i < maxOutbound>>20; i++ {
+	for i := 0; i < DefaultMaxOutbound>>20; i++ {
 		if _, err := c.Write(chunk); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
@@ -181,7 +181,7 @@ func startEngine(t *testing.T, h Handler) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := New(2, []Listener{{FD: fd, Addr: addr}}, h)
+	e, err := New(Config{Loops: 2}, []Listener{{FD: fd, Addr: addr}}, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +340,7 @@ func TestEngineCloseIsIdempotentBeforeServe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := New(1, []Listener{{FD: fd, Addr: addr}}, &funcHandler{})
+	e, err := New(Config{Loops: 1}, []Listener{{FD: fd, Addr: addr}}, &funcHandler{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,5 +484,143 @@ func TestEngineDrainIgnoresPassedWriteDeadline(t *testing.T) {
 	all, err := io.ReadAll(c)
 	if err != nil || len(all) != len(payload) {
 		t.Fatalf("read %d of %d bytes (%v)", len(all), len(payload), err)
+	}
+}
+
+// One write larger than the cap still goes out whole when nothing is queued,
+// so a message is never cut short on the wire; the cap then holds.
+func TestConnWriteLargerThanCapIntoEmptyQueue(t *testing.T) {
+	c := detachedConn()
+	big := make([]byte, DefaultMaxOutbound+1)
+	if n, err := c.Write(big); err != nil || n != len(big) {
+		t.Fatalf("Write(big) = %d, %v", n, err)
+	}
+	if _, err := c.Write([]byte("x")); !errors.Is(err, ErrWriteBufferFull) {
+		t.Fatalf("write over the cap: %v", err)
+	}
+}
+
+// Data and the peer's FIN often arrive on one edge; the EOF must still be seen
+// after the short read that drains the data.
+func TestEngineSeesEOFThatCameWithData(t *testing.T) {
+	closed := make(chan error, 64)
+	addr := startEngine(t, &funcHandler{
+		data:  func(_ *Conn, b []byte) int { return len(b) },
+		close: func(_ *Conn, err error) { closed <- err },
+	})
+	for i := 0; i < 50; i++ {
+		c := dial(t, addr)
+		_, _ = c.Write([]byte("last words"))
+		_ = c.(*net.TCPConn).CloseWrite()
+		select {
+		case err := <-closed:
+			if err != io.EOF {
+				t.Fatalf("OnClose err = %v, want io.EOF", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("round %d: the EOF was never seen", i)
+		}
+	}
+}
+
+type eofHandler struct {
+	funcHandler
+	eof func(c *Conn, rest []byte)
+}
+
+func (h *eofHandler) OnEOF(c *Conn, rest []byte) { h.eof(c, rest) }
+
+// An EOFHandler gets the input it left unconsumed, keeps writing after the
+// peer's EOF, and closes when it is done.
+func TestEngineEOFHandlerServesHalfClose(t *testing.T) {
+	addr := startEngine(t, &eofHandler{
+		funcHandler: funcHandler{data: func(*Conn, []byte) int { return 0 }},
+		eof: func(c *Conn, rest []byte) {
+			_, _ = c.Write(append([]byte("rest:"), rest...))
+			_ = c.Close()
+		},
+	})
+	c := dial(t, addr)
+	_, _ = c.Write([]byte("abc"))
+	time.Sleep(20 * time.Millisecond)
+	_, _ = c.Write([]byte("def"))
+	_ = c.(*net.TCPConn).CloseWrite()
+	all, err := io.ReadAll(c)
+	if err != nil || string(all) != "rest:abcdef" {
+		t.Fatalf("read %q (%v)", all, err)
+	}
+}
+
+func TestEngineStopAcceptKeepsConnections(t *testing.T) {
+	fd, addr, err := netpoll.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := New(Config{Loops: 1}, []Listener{{FD: fd, Addr: addr}}, &funcHandler{
+		data: func(c *Conn, b []byte) int {
+			_, _ = c.Write(b)
+			return len(b)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- e.Serve() }()
+	t.Cleanup(e.Close)
+
+	c := dial(t, addr.String())
+	buf := make([]byte, 5)
+	_, _ = c.Write([]byte("hi"))
+	if _, err := io.ReadFull(c, buf[:2]); err != nil {
+		t.Fatal(err)
+	}
+	e.StopAccept()
+	if err := <-served; err != nil {
+		t.Fatalf("Serve after StopAccept: %v", err)
+	}
+	_, _ = c.Write([]byte("again"))
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "again" {
+		t.Fatalf("echo after StopAccept: %q %v", buf, err)
+	}
+	if nc, err := net.DialTimeout("tcp", addr.String(), time.Second); err == nil {
+		_ = nc.Close()
+		t.Fatal("still accepting after StopAccept")
+	}
+	n := 0
+	e.ForEach(func(*Conn) { n++ })
+	if n != 1 {
+		t.Fatalf("ForEach saw %d connections, want 1", n)
+	}
+}
+
+func TestEngineMaxOutbound(t *testing.T) {
+	fd, addr, err := netpoll.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan [2]error, 1)
+	e, err := New(Config{Loops: 1, MaxOutbound: 64 << 10}, []Listener{{FD: fd, Addr: addr}}, &funcHandler{
+		data: func(c *Conn, b []byte) int {
+			_, err1 := c.Write(make([]byte, 32<<20)) // more than any kernel buffer takes
+			_, err2 := c.Write(make([]byte, 1024))
+			results <- [2]error{err1, err2}
+			return len(b)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = e.Serve() }()
+	t.Cleanup(e.Close)
+	c := dial(t, addr.String()) // and never read
+	_, _ = c.Write([]byte("go"))
+	select {
+	case errs := <-results:
+		if errs[0] != nil || !errors.Is(errs[1], ErrWriteBufferFull) {
+			t.Fatalf("writes returned %v, want nil then ErrWriteBufferFull", errs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not run")
 	}
 }
