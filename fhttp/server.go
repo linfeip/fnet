@@ -5,8 +5,10 @@
 package fhttp
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"time"
@@ -14,7 +16,8 @@ import (
 	"github.com/linfeip/fnet/internal/reactor"
 )
 
-// ErrServerClosed is returned by the ListenAndServe methods after Close.
+// ErrServerClosed is returned by the ListenAndServe methods after Close or
+// Shutdown.
 var ErrServerClosed = errors.New("fnet/fhttp: server closed")
 
 const (
@@ -24,6 +27,9 @@ const (
 	// DefaultIdleTimeout closes plaintext keep-alive connections idle this long
 	// when IdleTimeout is not set.
 	DefaultIdleTimeout = 2 * time.Minute
+	// DefaultMaxHeaderBytes bounds a request line and header when
+	// MaxHeaderBytes is not set.
+	DefaultMaxHeaderBytes = 64 << 10
 	// DefaultKeepAlive is the TCP keep-alive idle time when KeepAlive is not
 	// set: a peer that vanished without closing is dropped about two minutes
 	// later.
@@ -40,6 +46,7 @@ type Server struct {
 	// Handler serves requests. Defaults to http.DefaultServeMux.
 	Handler http.Handler
 	// TLSConfig enables HTTPS when non-nil (or when ListenAndServeTLS is used).
+	// fhttp speaks HTTP/1.1 only, so "h2" is left out of its NextProtos.
 	TLSConfig *tls.Config
 	// ReadHeaderTimeout bounds the wait for a request header: for a new
 	// connection from accept, for later requests from their first byte. It
@@ -51,11 +58,14 @@ type Server struct {
 	// WriteTimeout bounds writing each response.
 	WriteTimeout time.Duration
 	// IdleTimeout bounds the wait for the next request on a keep-alive
-	// connection. Plaintext idle connections wait on the poller and hold no
-	// goroutine: 0 means DefaultIdleTimeout, negative means no limit. An idle
-	// TLS connection holds a worker goroutine, so there keep-alive is opt-in:
-	// 0 closes the connection after each response.
+	// connection, which waits on the poller and holds no goroutine: 0 means
+	// DefaultIdleTimeout, negative means no limit. Under TLS keep-alive is
+	// opt-in, since an idle TLS connection keeps its TLS state (buffers of a
+	// few tens of KiB): there 0 closes the connection after each response.
 	IdleTimeout time.Duration
+	// MaxHeaderBytes bounds the request line and header; a larger one is
+	// refused with 431. 0 means DefaultMaxHeaderBytes.
+	MaxHeaderBytes int
 	// KeepAlive is the idle time before TCP keep-alive probes start, which
 	// find peers that vanished without closing (event-driven WebSocket
 	// connections have no idle timeout of their own). 0 means
@@ -64,14 +74,20 @@ type Server struct {
 	// NumPollers is the number of event loops. Defaults to runtime.GOMAXPROCS(0).
 	NumPollers int
 
-	// Listen optionally creates the listeners (e.g. for socket activation).
-	// By default sockets are opened with SO_REUSEADDR and SO_REUSEPORT.
+	// Listen optionally creates the listeners (e.g. for socket activation, or
+	// SO_REUSEPORT to run several servers on one port). By default they are
+	// opened like net.Listen.
 	Listen func(network, addr string) (net.Listener, error)
 
-	// WorkerPool runs request handlers, keyed by connection for affinity
-	// (e.g. p.SubmitConn for a *pool.Pool p, or pool.Adapt(ants.Submit)). It
-	// is called on an event loop and must not block. Defaults to pool.Default().
-	WorkerPool func(connID uint64, task func())
+	// WorkerPool runs request handlers (e.g. p.SubmitConn for a *pool.Pool p,
+	// or pool.Adapt(ants.Submit)). It is called on an event loop and must not
+	// block; an error refuses the request and closes its connection. Defaults
+	// to pool.Default().
+	WorkerPool func(connID uint64, task func()) error
+
+	// ErrorLog logs handler panics and invalid handler output, such as a
+	// malformed Content-Length. nil means the log package's standard logger.
+	ErrorLog *log.Logger
 
 	run reactor.Runner
 }
@@ -87,7 +103,7 @@ func ListenAndServeTLS(addr, certFile, keyFile string, handler http.Handler) err
 }
 
 // ListenAndServe serves HTTP, or HTTPS if TLSConfig is set. It blocks until
-// Close and then returns ErrServerClosed.
+// Close or Shutdown and then returns ErrServerClosed.
 func (s *Server) ListenAndServe() error {
 	return s.serve(s.TLSConfig)
 }
@@ -122,4 +138,38 @@ func (s *Server) Close() error {
 		eng.Close()
 	}
 	return nil
+}
+
+// Shutdown stops the server gracefully: it stops accepting, closes the
+// keep-alive connections waiting for a request, and lets every request in
+// progress finish, its response then closing the connection. It returns once
+// no HTTP connection is left, or, if ctx ends first, closes every connection
+// like Close and returns ctx.Err().
+//
+// Like net/http, Shutdown leaves hijacked and upgraded (WebSocket)
+// connections alone; Close drops them.
+func (s *Server) Shutdown(ctx context.Context) error {
+	eng := s.run.Stop()
+	if eng == nil {
+		return nil
+	}
+	h := eng.Handler().(*httpHandler)
+	h.shuttingDown.Store(true)
+	eng.StopAccept()
+	for wait := time.Millisecond; ; wait = min(2*wait, 500*time.Millisecond) {
+		if h.closeIdle(eng) == 0 && h.active.Load() == 0 {
+			others := 0
+			eng.ForEach(func(*reactor.Conn) { others++ })
+			if others == 0 {
+				eng.Close() // nothing is left for the event loops
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			eng.Close()
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
 }

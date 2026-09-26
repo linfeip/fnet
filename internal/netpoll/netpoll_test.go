@@ -95,6 +95,35 @@ func TestAcceptReadWrite(t *testing.T) {
 	}
 }
 
+// An IPv6 peer's address comes through accept intact.
+func TestAcceptIPv6PeerAddress(t *testing.T) {
+	lfd, laddr, err := Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback: %v", err)
+	}
+	defer Close(lfd)
+	client, err := net.Dial("tcp6", laddr.String())
+	if err != nil {
+		t.Skipf("no IPv6 loopback: %v", err)
+	}
+	defer client.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		fd, raddr, err := Accept(lfd)
+		if err == nil {
+			defer Close(fd)
+			if raddr.String() != client.LocalAddr().String() {
+				t.Fatalf("peer address %s, want %s", raddr, client.LocalAddr())
+			}
+			return
+		}
+		if !IsAgain(err) || time.Now().After(deadline) {
+			t.Fatalf("Accept: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestWakeInterruptsWait(t *testing.T) {
 	p, err := NewPoller()
 	if err != nil {
@@ -111,5 +140,24 @@ func TestWakeInterruptsWait(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("Wake did not interrupt Wait")
+	}
+}
+
+// A timeout below a millisecond still waits: epoll counts in whole
+// milliseconds, and cutting 0.3ms to 0 would make the event loop spin.
+func TestWaitShortTimeoutBlocks(t *testing.T) {
+	p, err := NewPoller()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	for range 5 {
+		start := time.Now()
+		if _, err := p.Wait(300 * time.Microsecond); err != nil {
+			t.Fatal(err)
+		}
+		if d := time.Since(start); d < 250*time.Microsecond {
+			t.Fatalf("Wait(300µs) returned after %v", d)
+		}
 	}
 }

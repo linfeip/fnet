@@ -1390,9 +1390,10 @@ func TestWebSocketAsyncDecompressionWorkerPool(t *testing.T) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	var workerPoolTaskCount atomic.Int64
-	customPool := func(connID uint64, task func()) {
+	customPool := func(connID uint64, task func()) error {
 		workerPoolTaskCount.Add(1)
 		go task()
+		return nil
 	}
 
 	var receivedCount atomic.Int64

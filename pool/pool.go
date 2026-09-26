@@ -1,502 +1,387 @@
-// Package pool is the sharded worker pool that runs fnet's business code:
-// HTTP handlers and WebSocket OnMessage callbacks. It knows nothing about
-// networking; fhttp and websocket hand it tasks keyed by connection.
+// Package pool runs fnet's business code: HTTP handlers and the WebSocket and
+// TCP callbacks. It knows nothing about networking. The servers hand it at
+// most one task per connection at a time (a connection runs its callbacks in
+// order on its own), so the pool only bounds concurrency, without ever
+// blocking the event loop that submits.
 package pool
 
 import (
+	"errors"
+	"log"
+	"math/bits"
+	"math/rand/v2"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sys/cpu"
 )
 
-// Config configures a Pool. Zero fields take the defaults below.
+// ErrClosed is returned by Submit and SubmitConn after Close.
+var ErrClosed = errors.New("fnet/pool: pool is closed")
+
+// minShardWorkers is the fewest workers a shard is given: a pool too small to
+// give each shard that many runs on fewer shards, down to one.
+const minShardWorkers = 256
+
+// Config configures a Pool. Zero fields take the defaults.
 type Config struct {
-	// Shards specifies the number of independent worker shards.
-	// Defaults to next power of 2 of runtime.GOMAXPROCS(0)*4 (clamped between 16 and 256).
-	Shards int
-
-	// MaxWorkersPerShard limits the maximum number of worker goroutines per shard.
-	// Defaults to 256 (e.g. 64 shards * 256 = 16384 total workers max).
-	MaxWorkersPerShard int
-
-	// QueueSizePerShard specifies the task channel buffer capacity per shard.
-	// Defaults to 2048 (e.g. 64 shards * 2048 = 131072 queue capacity).
-	QueueSizePerShard int
-
-	// IdleTimeout specifies how long an idle worker goroutine waits for new tasks before exiting.
-	// Defaults to 5 seconds. Idle workers exit to reclaim memory, allowing 1M idle connections
-	// to hold zero worker goroutines.
+	// MaxWorkers bounds the goroutines running tasks. The shards share it out
+	// equally, and a task whose shard has all of its part busy waits, in
+	// submission order, for one of them to finish. 0 means 1024 per
+	// GOMAXPROCS, and at least 4096.
+	MaxWorkers int
+	// IdleTimeout is how long a worker without a task waits for one before
+	// exiting (it exits within half as long again), so an idle pool holds no
+	// goroutine. 0 means 5s.
 	IdleTimeout time.Duration
 }
 
-func nextPowerOfTwo(n int) int {
-	if n <= 1 {
-		return 1
-	}
-	n--
-	n |= n >> 1
-	n |= n >> 2
-	n |= n >> 4
-	n |= n >> 8
-	n |= n >> 16
-	n++
-	return n
-}
-
-func defaultShards() int {
-	n := nextPowerOfTwo(runtime.GOMAXPROCS(0) * 4)
-	if n < 16 {
-		return 16
-	}
-	if n > 256 {
-		return 256
-	}
-	return n
-}
-
-// Pool is a high-concurrency, sharded, elastic goroutine worker pool
-// designed for massive scale (1M+ concurrent HTTP/WebSocket connections) without
-// any external dependencies.
+// Pool is a bounded, elastic goroutine pool. Workers start on demand, up to
+// MaxWorkers, and exit once idle for IdleTimeout; tasks beyond the bound queue
+// instead of spawning more goroutines. A panicking task is logged and does not
+// take its worker down. Submit never blocks.
 //
-// Key architectural features:
-//   - Zero external dependencies: pure Go standard library (sync, atomic, runtime).
-//   - Multi-shard queues: eliminates global lock and channel contention across CPU cores.
-//   - Connection affinity: tasks for the same connection hash to the same shard, improving CPU cache locality.
-//   - Lazy worker spawning & idle reaping: idle connections hold zero worker goroutines.
-//   - Non-blocking reactor offload: never blocks the I/O reactor event loop under heavy load.
-//   - Panic protection: user handler panics are caught and do not kill worker threads or the process.
+// The pool is split into shards, one per core or so, each with its own lock,
+// queue and workers, so that event loops and workers on different cores rarely
+// meet on a lock. SubmitConn keeps a connection on one shard; each shard is
+// given an equal part of MaxWorkers, at least minShardWorkers.
+//
+// A shard keeps as few workers as keep its queue moving: a worker that
+// finishes a task takes the next one without parking, a parked worker is woken
+// only for a task no other worker is coming for, and a new one is started only
+// when every worker the shard has is busy, one at a time. Under load the busy
+// workers carry the tasks; a burst, or tasks that block, bring in more. A
+// worker about to park first takes a task another shard has waiting, so no
+// shard's queue waits behind its own busy workers while others idle.
 type Pool struct {
-	shards            []*workerShard
-	shardMask         uint64
-	round             atomic.Uint64
-	closed            atomic.Bool
-	globalIdleWorkers atomic.Int32
-	wg                sync.WaitGroup
+	shards []shard
+	shift  uint // 64 - log2(len(shards)): an index is the top bits of a hash
 }
 
-type workerShard struct {
-	pool        *Pool
-	id          int
-	mu          sync.RWMutex
-	closed      bool
-	tasks       chan func()
-	maxWorkers  int32
-	curWorkers  atomic.Int32
-	idleWorkers atomic.Int32
-	idleTimeout time.Duration
-	stealRound  atomic.Uint32
+// shard is one independent part of a Pool. Every decision is made under mu: to
+// queue a task, to wake or start a worker for it, and to retire one. So a
+// queued task always has a worker coming for it (woken, starting, or busy and
+// about to look again), and none is ever waiting on a worker that left.
+type shard struct {
+	pool    *Pool
+	mu      sync.Mutex
+	queue   fifo      // tasks not taken yet; its length may be read without mu
+	idle    []*worker // parked workers, oldest first; the last one parked is woken first
+	running int       // live workers: busy, parked or on their way
+	waking  int       // workers woken or started that have not looked at the queue yet
+	max     int
+	closed  bool
+	reaping bool   // reaper is armed: it is while running > 0
+	tick    uint64 // reaper ticks so far
+
+	period time.Duration // between reaper ticks: half of IdleTimeout
+	reaper *time.Timer
+	done   sync.WaitGroup
+	_      cpu.CacheLinePad
 }
 
-// New creates a sharded worker pool.
-func New(cfgs ...Config) *Pool {
-	var cfg Config
-	if len(cfgs) > 0 {
-		cfg = cfgs[0]
-	}
+// worker is a parked goroutine's wake-up call: true to look for work, false to
+// exit. It gets at most one while parked.
+type worker struct {
+	wake chan bool
+	tick uint64 // the shard's tick when it parked
+}
 
-	numShards := cfg.Shards
-	if numShards <= 0 {
-		numShards = defaultShards()
-	} else {
-		numShards = nextPowerOfTwo(numShards)
-	}
-
-	maxWorkers := int32(cfg.MaxWorkersPerShard)
+// New creates a pool.
+func New(cfg Config) *Pool {
+	procs := runtime.GOMAXPROCS(0)
+	maxWorkers := cfg.MaxWorkers
 	if maxWorkers <= 0 {
-		maxWorkers = 256
+		maxWorkers = max(4096, 1024*procs)
 	}
-
-	queueSize := cfg.QueueSizePerShard
-	if queueSize <= 0 {
-		queueSize = 2048
-	}
-
 	idleTimeout := cfg.IdleTimeout
 	if idleTimeout <= 0 {
 		idleTimeout = 5 * time.Second
 	}
-
-	p := &Pool{
-		shards:    make([]*workerShard, numShards),
-		shardMask: uint64(numShards - 1),
-	}
-
-	for i := 0; i < numShards; i++ {
-		p.shards[i] = &workerShard{
-			pool:        p,
-			id:          i,
-			tasks:       make(chan func(), queueSize),
-			maxWorkers:  maxWorkers,
-			idleTimeout: idleTimeout,
+	// The largest power of two within both the core count (rounded up) and
+	// the number of full-sized shards the bound allows.
+	n := min(1<<bits.Len(uint(procs-1)), max(1, maxWorkers/minShardWorkers))
+	n = 1 << (bits.Len(uint(n)) - 1)
+	p := &Pool{shards: make([]shard, n), shift: uint(65 - bits.Len(uint(n)))}
+	for i := range p.shards {
+		s := &p.shards[i]
+		s.pool = p
+		s.max = maxWorkers / n
+		if i < maxWorkers%n {
+			s.max++
 		}
+		s.period = max(idleTimeout/2, time.Millisecond)
 	}
-
 	return p
 }
 
-// Submit dispatches a task to the pool using power-of-two-choices load balancing.
-// It inspects two pseudo-random shards and assigns the task to the one with lower load
-// (more idle workers or fewer queued tasks), mitigating shard skew and hotspot buildup.
-func (p *Pool) Submit(task func()) {
+// Submit runs task on a worker of a shard picked at random: a busy one that
+// finishes, a parked one, or a new one while the shard has room. It fails only
+// after Close.
+func (p *Pool) Submit(task func()) error {
+	return p.shards[rand.Uint64()>>p.shift].submit(task)
+}
+
+// SubmitConn is Submit for the servers' WorkerPool: the tasks of one
+// connection stay on one shard.
+func (p *Pool) SubmitConn(connID uint64, task func()) error {
+	// Fibonacci hashing spreads sequential ids (fds, counters) evenly.
+	return p.shards[connID*0x9e3779b97f4a7c15>>p.shift].submit(task)
+}
+
+func (s *shard) submit(task func()) error {
 	if task == nil {
-		return
+		return nil
 	}
-	if p.closed.Load() {
-		go runSafe(task)
-		return
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrClosed
 	}
-	r := p.round.Add(1)
-	idx1 := r & p.shardMask
-	idx2 := (r + 7) & p.shardMask
+	s.queue.push(task)
+	w, spawn := s.wakeLocked()
+	s.mu.Unlock()
+	s.start(w, spawn)
+	return nil
+}
 
-	s1 := p.shards[idx1]
-	s2 := p.shards[idx2]
-
-	var chosen *workerShard
-	i1 := s1.idleWorkers.Load()
-	i2 := s2.idleWorkers.Load()
-	if i1 > i2 {
-		chosen = s1
-	} else if i2 > i1 {
-		chosen = s2
-	} else {
-		if len(s1.tasks) <= len(s2.tasks) {
-			chosen = s1
-		} else {
-			chosen = s2
+// wakeLocked gets workers on their way to the queue: a parked worker for each
+// queued task no worker is coming for yet, or, with none parked, a new worker
+// while the shard has room, one at a time: a pool grows only while every
+// worker it has is busy. With every worker busy the first to finish looks at
+// the queue. The caller wakes or starts the worker with start, after
+// unlocking.
+func (s *shard) wakeLocked() (w *worker, spawn bool) {
+	switch {
+	case s.waking >= s.queue.len():
+	case len(s.idle) > 0:
+		w = s.idle[len(s.idle)-1]
+		s.idle[len(s.idle)-1] = nil
+		s.idle = s.idle[:len(s.idle)-1]
+		s.waking++
+	case s.waking == 0 && s.running < s.max:
+		s.running++
+		s.waking++
+		s.done.Add(1)
+		if !s.reaping {
+			s.reaping = true
+			if s.reaper == nil {
+				s.reaper = time.AfterFunc(s.period, s.reap)
+			} else {
+				s.reaper.Reset(s.period)
+			}
 		}
+		spawn = true
 	}
-	chosen.submit(task)
+	return w, spawn
 }
 
-// SubmitConn dispatches a task with connection affinity based on connID (e.g. socket fd).
-// All tasks for the same connection hash to the same worker shard, maximizing CPU cache locality.
-func (p *Pool) SubmitConn(connID uint64, task func()) {
-	if task == nil {
-		return
+func (s *shard) start(w *worker, spawn bool) {
+	switch {
+	case w != nil:
+		w.wake <- true // never blocks: a parked worker has nothing pending
+	case spawn:
+		go s.work()
 	}
-	if p.closed.Load() {
-		go runSafe(task)
-		return
-	}
-	// SplitMix64 / Murmur3 64-bit mixer for uniform bit distribution
-	h := connID
-	h ^= h >> 33
-	h *= 0xff51afd7ed558ccd
-	h ^= h >> 33
-	idx := h & p.shardMask
-	p.shards[idx].submit(task)
 }
 
-// Close gracefully closes the worker pool and waits for running tasks to complete.
-func (p *Pool) Close() {
-	if p.closed.CompareAndSwap(false, true) {
-		for _, s := range p.shards {
-			s.mu.Lock()
-			s.closed = true
-			close(s.tasks)
+func (s *shard) work() {
+	defer s.done.Done()
+	var w *worker
+	s.mu.Lock()
+	s.waking--
+	for {
+		task := s.queue.pop()
+		if task == nil && !s.closed {
+			// Nothing here: help a shard whose tasks wait before parking.
+			// Meanwhile this worker counts as on its way, so a task queued
+			// here now does not wake or start another.
+			s.waking++
 			s.mu.Unlock()
+			task = s.pool.steal(s)
+			s.mu.Lock()
+			s.waking--
+			if task == nil {
+				task = s.queue.pop() // queued here while it looked
+			}
 		}
-		p.wg.Wait()
-	}
-}
-
-// RunningWorkers returns the total number of currently active worker goroutines.
-func (p *Pool) RunningWorkers() int {
-	var total int
-	for _, s := range p.shards {
-		total += int(s.curWorkers.Load())
-	}
-	return total
-}
-
-// IdleWorkers returns the total number of currently idle worker goroutines waiting for tasks.
-func (p *Pool) IdleWorkers() int {
-	var total int
-	for _, s := range p.shards {
-		total += int(s.idleWorkers.Load())
-	}
-	return total
-}
-
-// trySteal attempts to steal a task from another shard that has queued tasks.
-// Returns nil if no tasks could be stolen.
-func (p *Pool) trySteal(myShardID int) func() {
-	if p.closed.Load() {
-		return nil
-	}
-	numShards := len(p.shards)
-	if numShards <= 1 {
-		return nil
-	}
-
-	myShard := p.shards[myShardID]
-	start := (uint32(myShardID) + myShard.stealRound.Add(1)) & uint32(p.shardMask)
-
-	for i := 0; i < numShards-1; i++ {
-		victimIdx := (start + uint32(i) + 1) & uint32(p.shardMask)
-		victim := p.shards[victimIdx]
-
-		// Fast path: avoid channel lock if queue is empty
-		if len(victim.tasks) == 0 {
+		if task != nil {
+			// Any still waiting here get a worker moving before this task
+			// runs, however long it takes.
+			next, spawn := s.wakeLocked()
+			s.mu.Unlock()
+			s.start(next, spawn)
+			runSafe(task)
+			s.mu.Lock()
 			continue
 		}
+		if s.closed {
+			s.running--
+			s.mu.Unlock()
+			return
+		}
+		if w == nil {
+			w = &worker{wake: make(chan bool, 1)}
+		}
+		w.tick = s.tick
+		s.idle = append(s.idle, w)
+		s.mu.Unlock()
+		if !<-w.wake {
+			return // retired: whoever said so counted it out
+		}
+		s.mu.Lock()
+		s.waking--
+	}
+}
 
-		select {
-		case task, ok := <-victim.tasks:
-			if ok {
-				return task
-			}
-		default:
+// steal takes a task queued in a shard other than from, if there is one.
+func (p *Pool) steal(from *shard) func() {
+	n := len(p.shards)
+	start := int(rand.Uint64() >> p.shift)
+	for i := range n {
+		v := &p.shards[(start+i)&(n-1)]
+		if v == from || v.queue.len() == 0 {
+			continue
+		}
+		v.mu.Lock()
+		task := v.queue.pop()
+		v.mu.Unlock()
+		if task != nil {
+			return task
 		}
 	}
 	return nil
 }
 
-// tryOffloadToIdle attempts to push a task to another shard that has idle workers waiting.
-func (p *Pool) tryOffloadToIdle(task func(), myShardID int) bool {
-	if p.closed.Load() || p.globalIdleWorkers.Load() == 0 {
-		return false
-	}
-	numShards := len(p.shards)
-	if numShards <= 1 {
-		return false
-	}
-
-	myShard := p.shards[myShardID]
-	start := (uint32(myShardID) + myShard.stealRound.Add(1)) & uint32(p.shardMask)
-
-	for i := 0; i < numShards-1; i++ {
-		targetIdx := (start + uint32(i) + 1) & uint32(p.shardMask)
-		target := p.shards[targetIdx]
-
-		if target.idleWorkers.Load() > 0 {
-			target.mu.RLock()
-			if !target.closed {
-				select {
-				case target.tasks <- task:
-					target.mu.RUnlock()
-					return true
-				default:
-				}
-			}
-			target.mu.RUnlock()
-		}
-	}
-	return false
-}
-
-// tryOffload attempts to push a task to any other shard with spare capacity.
-func (p *Pool) tryOffload(task func(), myShardID int) bool {
-	if p.closed.Load() {
-		return false
-	}
-	numShards := len(p.shards)
-	if numShards <= 1 {
-		return false
-	}
-
-	myShard := p.shards[myShardID]
-	start := (uint32(myShardID) + myShard.stealRound.Add(1)) & uint32(p.shardMask)
-
-	for i := 0; i < numShards-1; i++ {
-		targetIdx := (start + uint32(i) + 1) & uint32(p.shardMask)
-		target := p.shards[targetIdx]
-
-		// Fast path: avoid lock if target queue is full
-		if len(target.tasks) >= cap(target.tasks) {
-			continue
-		}
-
-		target.mu.RLock()
-		if !target.closed {
-			select {
-			case target.tasks <- task:
-				if target.idleWorkers.Load() == 0 && target.curWorkers.Load() < target.maxWorkers {
-					target.maybeSpawnWorker(nil)
-				}
-				target.mu.RUnlock()
-				return true
-			default:
-			}
-		}
-		target.mu.RUnlock()
-	}
-	return false
-}
-
-func (s *workerShard) submit(task func()) {
-	if s.pool.closed.Load() {
-		go runSafe(task)
-		return
-	}
-
-	s.mu.RLock()
+// reap retires the workers that have been parked for a whole IdleTimeout: the
+// ones parked three ticks ago or earlier, which sit at the bottom of the idle
+// stack. It runs every period while the shard has workers.
+func (s *shard) reap() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
-		s.mu.RUnlock()
-		go runSafe(task)
 		return
 	}
-
-	// 1. If this shard has an idle worker ready to execute immediately, wake it up (affinity path)
-	if s.idleWorkers.Load() > 0 {
-		select {
-		case s.tasks <- task:
-			s.mu.RUnlock()
-			return
-		default:
+	s.tick++
+	n := 0
+	for n < len(s.idle) && s.idle[n].tick+3 <= s.tick {
+		s.idle[n].wake <- false
+		n++
+	}
+	if n > 0 {
+		s.running -= n
+		rest := copy(s.idle, s.idle[n:])
+		clear(s.idle[rest:])
+		s.idle = s.idle[:rest]
+		if cap(s.idle) > 64 && rest < cap(s.idle)/4 {
+			s.idle = append([]*worker(nil), s.idle...) // a burst is over: give its array back
 		}
 	}
+	if s.reaping = s.running > 0; s.reaping {
+		s.reaper.Reset(s.period)
+	}
+}
 
-	// 2. No idle workers on this shard, but we can spawn another worker up to maxWorkers
-	if s.curWorkers.Load() < s.maxWorkers {
-		select {
-		case s.tasks <- task:
-			s.mu.RUnlock()
-			s.maybeSpawnWorker(nil)
-			return
-		default:
-			if s.maybeSpawnWorker(task) {
-				s.mu.RUnlock()
-				return
+// Close stops the pool: tasks already submitted still run, later ones are
+// refused, and Close returns once every worker has exited.
+func (p *Pool) Close() {
+	for i := range p.shards {
+		s := &p.shards[i]
+		s.mu.Lock()
+		if !s.closed {
+			s.closed = true
+			for _, w := range s.idle {
+				w.wake <- false
+			}
+			s.running -= len(s.idle)
+			s.idle = nil
+			if s.reaper != nil {
+				s.reaper.Stop()
 			}
 		}
+		s.mu.Unlock()
 	}
-
-	s.mu.RUnlock()
-
-	// 3. This shard is at capacity. If other shards have idle workers, offload to them immediately.
-	// Fast O(1) check: if globalIdleWorkers is 0, skip the 63-shard loop entirely!
-	if s.pool.globalIdleWorkers.Load() > 0 && s.pool.tryOffloadToIdle(task, s.id) {
-		return
-	}
-
-	// 4. No idle workers anywhere across the pool. Buffer in local queue if space allows.
-	s.mu.RLock()
-	if !s.closed {
-		select {
-		case s.tasks <- task:
-			s.mu.RUnlock()
-			return
-		default:
-		}
-	}
-	s.mu.RUnlock()
-
-	// 5. Local queue is full. Try offload to any shard with spare queue capacity.
-	if s.pool.tryOffload(task, s.id) {
-		return
-	}
-
-	// 6. Absolute saturation fallback: never block the caller (especially IO reactor loop).
-	// Run the task on a detached goroutine with panic protection.
-	go runSafe(task)
-}
-
-func (s *workerShard) maybeSpawnWorker(firstTask func()) bool {
-	for {
-		cur := s.curWorkers.Load()
-		if cur >= s.maxWorkers {
-			return false
-		}
-		if s.curWorkers.CompareAndSwap(cur, cur+1) {
-			s.pool.wg.Add(1)
-			go s.workerLoop(firstTask)
-			return true
-		}
+	for i := range p.shards {
+		p.shards[i].done.Wait()
 	}
 }
 
-func (s *workerShard) workerLoop(firstTask func()) {
+// RunningWorkers returns the number of live workers, busy or idle.
+func (p *Pool) RunningWorkers() int {
+	n := 0
+	for i := range p.shards {
+		s := &p.shards[i]
+		s.mu.Lock()
+		n += s.running
+		s.mu.Unlock()
+	}
+	return n
+}
+
+// IdleWorkers returns the number of workers waiting for a task.
+func (p *Pool) IdleWorkers() int {
+	n := 0
+	for i := range p.shards {
+		s := &p.shards[i]
+		s.mu.Lock()
+		n += len(s.idle)
+		s.mu.Unlock()
+	}
+	return n
+}
+
+// runSafe runs a task, logging a panic instead of losing the worker. The
+// servers recover their callbacks' panics themselves; one reaching here is a
+// task submitted directly, or a bug.
+func runSafe(task func()) {
 	defer func() {
-		s.curWorkers.Add(-1)
-		s.pool.wg.Done()
+		if r := recover(); r != nil {
+			log.Printf("fnet/pool: task panicked: %v\n%s", r, debug.Stack())
+		}
 	}()
-
-	if firstTask != nil {
-		runSafe(firstTask)
-	}
-
-	timer := time.NewTimer(s.idleTimeout)
-	defer timer.Stop()
-	lastReset := time.Now()
-	halfTimeout := s.idleTimeout / 2
-
-	for {
-		// 1. Fast path: drain local shard tasks first (maximizes CPU cache locality)
-		for {
-			select {
-			case task, ok := <-s.tasks:
-				if !ok {
-					return
-				}
-				runSafe(task)
-			default:
-				goto checkSteal
-			}
-		}
-
-	checkSteal:
-		// 2. Local queue is empty: try stealing tasks from other busy shards before going to sleep.
-		// This eliminates shard skew where one shard is overloaded while others sit idle.
-		for {
-			stolen := s.pool.trySteal(s.id)
-			if stolen == nil {
-				break
-			}
-			runSafe(stolen)
-
-			// If new local tasks arrived while executing stolen work, switch back to local
-			// queue immediately to maintain connection and core affinity.
-			if len(s.tasks) > 0 {
-				break
-			}
-		}
-
-		if len(s.tasks) > 0 {
-			continue
-		}
-
-		// 3. All queues across all shards are drained.
-		// Refresh idle timer if needed before sleeping.
-		now := time.Now()
-		if now.Sub(lastReset) >= halfTimeout {
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(s.idleTimeout)
-			lastReset = now
-		}
-
-		// Enter idle wait state
-		s.idleWorkers.Add(1)
-		s.pool.globalIdleWorkers.Add(1)
-		select {
-		case task, ok := <-s.tasks:
-			s.idleWorkers.Add(-1)
-			s.pool.globalIdleWorkers.Add(-1)
-			if !ok {
-				return
-			}
-			runSafe(task)
-
-		case <-timer.C:
-			s.idleWorkers.Add(-1)
-			s.pool.globalIdleWorkers.Add(-1)
-			return
-		}
-	}
+	task()
 }
 
-func runSafe(fn func()) {
-	defer func() {
-		_ = recover()
-	}()
-	fn()
+// fifo is a growable ring buffer of tasks. Only len may be called without the
+// shard's lock.
+type fifo struct {
+	buf  []func()
+	head int
+	n    atomic.Int32
+}
+
+func (q *fifo) len() int { return int(q.n.Load()) }
+
+func (q *fifo) push(t func()) {
+	n := q.len()
+	if n == len(q.buf) {
+		buf := make([]func(), max(16, 2*len(q.buf)))
+		for i := range n {
+			buf[i] = q.buf[(q.head+i)%len(q.buf)]
+		}
+		q.buf, q.head = buf, 0
+	}
+	q.buf[(q.head+n)%len(q.buf)] = t
+	q.n.Store(int32(n + 1))
+}
+
+// pop removes the oldest task, or returns nil when there is none.
+func (q *fifo) pop() func() {
+	n := q.len()
+	if n == 0 {
+		return nil
+	}
+	t := q.buf[q.head]
+	q.buf[q.head] = nil
+	q.head = (q.head + 1) % len(q.buf)
+	q.n.Store(int32(n - 1))
+	if n == 1 && len(q.buf) > 1024 {
+		q.buf, q.head = nil, 0 // a burst is over: give its array back
+	}
+	return t
 }
 
 // Default returns the process-wide pool used when no custom pool is
@@ -505,7 +390,7 @@ func Default() *Pool {
 	if p := defaultPool.Load(); p != nil {
 		return p
 	}
-	defaultOnce.Do(func() { defaultPool.CompareAndSwap(nil, New()) })
+	defaultOnce.Do(func() { defaultPool.CompareAndSwap(nil, New(Config{})) })
 	return defaultPool.Load()
 }
 
@@ -521,28 +406,28 @@ var (
 	defaultPool atomic.Pointer[Pool]
 )
 
-// Adapt turns a plain submit function (ants.Submit, a custom scheduler) into
-// the connection-keyed form fhttp and websocket take, ignoring the key.
-func Adapt(submit func(task func())) func(connID uint64, task func()) {
+// Adapt turns a plain submit function, such as ants.Submit, into the
+// connection-keyed form the servers take as their WorkerPool, ignoring the
+// key.
+func Adapt(submit func(task func()) error) func(connID uint64, task func()) error {
 	if submit == nil {
 		return nil
 	}
-	return func(_ uint64, task func()) { submit(task) }
+	return func(_ uint64, task func()) error { return submit(task) }
 }
 
 // Dispatch runs task through submit, or through Default when submit is nil,
-// keyed by connID. It reports false when submit panicked, i.e. a custom pool
-// rejected the task; the caller should then give up on the connection.
-func Dispatch(submit func(connID uint64, task func()), connID uint64, task func()) (ok bool) {
+// keyed by connID. It reports whether the task was accepted; a submit that
+// fails, or panics, refuses it and the caller should give up on the
+// connection.
+func Dispatch(submit func(connID uint64, task func()) error, connID uint64, task func()) (ok bool) {
 	if submit == nil {
-		Default().SubmitConn(connID, task)
-		return true
+		return Default().SubmitConn(connID, task) == nil
 	}
 	defer func() {
 		if recover() != nil {
 			ok = false
 		}
 	}()
-	submit(connID, task)
-	return true
+	return submit(connID, task) == nil
 }

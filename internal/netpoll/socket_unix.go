@@ -3,30 +3,21 @@
 package netpoll
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
 	"strconv"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// Listen opens a non-blocking TCP listener with SO_REUSEADDR and SO_REUSEPORT
-// set before bind and returns its fd.
+// Listen opens a non-blocking TCP listener and returns its fd. Like
+// net.Listen it sets SO_REUSEADDR, but not SO_REUSEPORT: a second server on
+// the same port fails instead of silently taking half the connections.
 func Listen(network, address string) (int, net.Addr, error) {
-	lc := net.ListenConfig{
-		Control: func(_, _ string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-			})
-		},
-	}
-	ln, err := lc.Listen(context.Background(), network, address)
+	ln, err := net.Listen(network, address)
 	if err != nil {
 		return -1, nil, err
 	}
@@ -55,6 +46,9 @@ func FromListener(ln net.Listener) (int, net.Addr, error) {
 		_ = unix.Close(fd)
 		return -1, nil, err
 	}
+	if noDelayInherited {
+		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	}
 	return fd, ln.Addr(), nil
 }
 
@@ -62,10 +56,12 @@ func FromListener(ln net.Listener) (int, net.Addr, error) {
 // TCP_NODELAY set. It returns an IsAgain error once the backlog is empty.
 func Accept(lnFD int) (int, netip.AddrPort, error) {
 	for {
-		fd, sa, err := sysAccept(lnFD)
+		fd, addr, err := sysAccept(lnFD)
 		if err == nil {
-			_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-			return fd, addrPort(sa), nil
+			if !noDelayInherited {
+				_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+			}
+			return fd, addr, nil
 		}
 		if err == unix.EINTR || err == unix.ECONNABORTED {
 			continue // interrupted, or the peer gave up while queued
@@ -123,6 +119,19 @@ func Write(fd int, b []byte) (int, error) {
 
 // Close closes fd. Closing also removes it from any poller.
 func Close(fd int) error { return unix.Close(fd) }
+
+// CloseWrite shuts down the sending side of fd: the peer reads EOF once the
+// data already written is delivered.
+func CloseWrite(fd int) error { return unix.Shutdown(fd, unix.SHUT_WR) }
+
+// LocalAddr returns the local address of the connected socket fd.
+func LocalAddr(fd int) (netip.AddrPort, error) {
+	sa, err := unix.Getsockname(fd)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	return addrPort(sa), nil
+}
 
 // SetKeepAlive applies ka to the TCP socket fd.
 func SetKeepAlive(fd int, ka KeepAlive) error {

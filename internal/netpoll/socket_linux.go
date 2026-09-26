@@ -9,4 +9,8 @@ import "golang.org/x/sys/unix"
 // several system calls per accept. Linux copies them into every child socket.
 const KeepAliveInherited = true
 
+// noDelayInherited: accepted sockets inherit TCP_NODELAY from their listener
+// too, so it is set once on the listener rather than per accept.
+const noDelayInherited = true
+
 const tcpKeepIdle = unix.TCP_KEEPIDLE

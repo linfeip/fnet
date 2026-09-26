@@ -6,6 +6,8 @@ fnet 是 Go 的网络框架：根包 `fnet` 跑自定义 TCP 消息协议（游�
 
 **压测数字不是验收标准，能不能扛住真实业务才是。**
 
+机器相关的信息（Linux 测试服务器、压测命令、report 路径、什么时候该压测）写在 `AGENTS.local.md`（不入库），需要在 Linux 上验证或压测时先读那份。
+
 ## 版本控制规则
 
 **不允许自动提交和推送代码。**
@@ -18,7 +20,7 @@ fnet 是 Go 的网络框架：根包 `fnet` 跑自定义 TCP 消息协议（游�
 
 ## 运行平台
 
-**本项目主要运行在 Linux 上。** 生产部署、百万连接容量、性能和默认值都以 Linux 为准：epoll（边沿触发）、`accept4`、`SO_REUSEPORT`、`writev`，以及由监听 socket 继承给新连接的 TCP keep-alive 选项。
+**本项目主要运行在 Linux 上。** 生产部署、百万连接容量、性能和默认值都以 Linux 为准：epoll（边沿触发）、`accept4`、`writev`，以及由监听 socket 继承给新连接的 TCP keep-alive 选项。默认不设 `SO_REUSEPORT`（误启动的第二个实例应当失败，而不是悄悄分走连接）；需要时由业务通过 `Listen` 自己打开。
 
 - macOS（kqueue）：行为正确、能编译、测试能过，用于开发；不为它做性能取舍。
 - Windows：基于 `net` 包的开发用仿真，每个 socket 一个泵 goroutine。只保证能编译、测试能过，不代表生产行为，也不承担容量。不为 Windows 仿真上的表现去改 reactor 或默认值。
@@ -41,15 +43,15 @@ fnet 是 Go 的网络框架：根包 `fnet` 跑自定义 TCP 消息协议（游�
 
 空闲连接只挂在 poller 上，并占连接表里的一个槽。它不持有 goroutine，也不持有 worker。读缓冲放在 reactor 上共享。
 
-`conn` 上多一个字段、或每条连接多一个 goroutine、map、常驻缓冲，都先按 1e6 算清字节和 goroutine，再改，并在说明里写出这笔账。当前每条空闲连接的对象：`reactor.Conn` 256 B；TCP 连接另有 `fnet.Conn` 104 B；事件驱动 WebSocket 另有 `eventConn` 248 B 和 `websocket.Conn` 128 B。改动后用 `unsafe.Sizeof` 重新量，并同步这里的数字。
+`conn` 上多一个字段、或每条连接多一个 goroutine、map、常驻缓冲，都先按 1e6 算清字节和 goroutine，再改，并在说明里写出这笔账。当前每条空闲连接的对象：`reactor.Conn` 240 B；TCP 连接另有 `fnet.Conn` 104 B；事件驱动 WebSocket 另有 `eventConn` 200 B 和 `websocket.Conn` 128 B。worker 服务连接期间另有 `reactor.blocking` 136 B，空闲连接不持有。改动后用 `unsafe.Sizeof` 重新量，并同步这里的数字。
 
 ## 热路径
 
 事件循环（`internal/reactor` 的 `Loop`）只做就绪、解析和移交。解析指的是 HTTP 判断请求头是否收齐、WebSocket 解帧和应答控制帧、TCP 用业务的 `Split` 切出完整消息，只找边界，不跑业务。`Split` panic、原地打转或超过 `MaxMessageSize`，都只关掉它自己的连接。
 
-`ServeHTTP`、WebSocket 与 TCP 的业务回调都进 worker pool。同一连接的回调由这条连接自己的排空循环串行执行（同一时刻只调度一个任务），所以一次一个、按到达顺序。`SubmitConn` 只负责按连接选分片，一个分片有多个 worker 还会互相窃取任务，它本身不保证串行。
+`ServeHTTP`、WebSocket 与 TCP 的业务回调都进 worker pool。同一连接的回调由这条连接自己的排空循环串行执行（同一时刻只调度一个任务），所以一次一个、按到达顺序。`SubmitConn` 只负责按连接选分片，一个分片有多个 worker、谁空闲谁取任务，它本身不保证串行。
 
-稳定态的 accept、read、write 复用 reactor 缓冲、对象池和 `writev`。
+稳定态的 accept、read、write 复用 reactor 缓冲、对象池和 `writev`。一次读出多条消息时，worker 用 `reactor.Conn.Corked` 把这批回复合并成一次写；暂存有上限（1 ms、64 KiB），慢 handler 拖不住它之前的回复和别的协程的广播，这个上限不能去掉。
 
 慢客户端、半包请求、阻塞的 handler 只拖住自己的连接，同一 reactor 上的其他 fd 继续收事件。用户 handler 的 panic 留在 worker 里。
 

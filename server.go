@@ -111,13 +111,15 @@ type Server struct {
 
 	// NumPollers is the number of event loops. Defaults to runtime.GOMAXPROCS(0).
 	NumPollers int
-	// Listen optionally creates the listeners (e.g. for socket activation).
-	// By default sockets are opened with SO_REUSEADDR and SO_REUSEPORT.
+	// Listen optionally creates the listeners (e.g. for socket activation, or
+	// SO_REUSEPORT to run several servers on one port). By default they are
+	// opened like net.Listen.
 	Listen func(network, addr string) (net.Listener, error)
-	// WorkerPool runs the callbacks, keyed by connection for affinity (e.g.
-	// p.SubmitConn for a *pool.Pool p, or pool.Adapt(ants.Submit)). It is
-	// called on an event loop and must not block. Defaults to pool.Default().
-	WorkerPool func(connID uint64, task func())
+	// WorkerPool runs the callbacks (e.g. p.SubmitConn for a *pool.Pool p, or
+	// pool.Adapt(ants.Submit)). It is called on an event loop and must not
+	// block; an error refuses the task and closes that connection. Defaults
+	// to pool.Default().
+	WorkerPool func(connID uint64, task func()) error
 
 	run reactor.Runner
 	mu  sync.Mutex
@@ -227,7 +229,7 @@ type handler struct {
 	onOpen    func(*Conn)
 	onMessage func(*Conn, []byte)
 	onClose   func(*Conn, error)
-	submit    func(connID uint64, task func())
+	submit    func(connID uint64, task func()) error
 
 	maxMessage  int   // math.MaxInt when unlimited
 	maxPending  int   // <= 0: no backpressure

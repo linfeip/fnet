@@ -70,3 +70,17 @@ func TestKeepAliveOnAcceptedSockets(t *testing.T) {
 	}
 	check("SO_KEEPALIVE after off", unix.SOL_SOCKET, unix.SO_KEEPALIVE, is(0))
 }
+
+// Accepted sockets have TCP_NODELAY: on Linux by inheritance from the listener
+// (no system call per accept), elsewhere by setting it on each.
+func TestNoDelayOnAcceptedSockets(t *testing.T) {
+	lfd, laddr, err := Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Close(lfd)
+	fd := acceptOne(t, lfd, laddr)
+	if v, err := unix.GetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY); err != nil || v == 0 {
+		t.Fatalf("TCP_NODELAY = %d (%v)", v, err)
+	}
+}

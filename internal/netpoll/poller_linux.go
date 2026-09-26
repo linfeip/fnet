@@ -59,7 +59,9 @@ func (p *epollPoller) DisableWrite(fd int) error { return p.ctl(unix.EPOLL_CTL_M
 func (p *epollPoller) Wait(timeout time.Duration) ([]Event, error) {
 	msec := -1
 	if timeout >= 0 {
-		msec = int(timeout / time.Millisecond)
+		// Round up: a timeout cut to 0ms would poll in a busy loop until it
+		// really elapses.
+		msec = int((timeout + time.Millisecond - 1) / time.Millisecond)
 	}
 	n, err := unix.EpollWait(p.fd, p.events, msec)
 	if err != nil {

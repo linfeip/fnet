@@ -319,6 +319,41 @@ func TestServerBlockedHandlerDoesNotBlockOthers(t *testing.T) {
 	}
 }
 
+// The replies to a burst are coalesced, but a slow OnMessage holds back
+// neither the replies written before it nor a write from another goroutine (a
+// room broadcast).
+func TestServerSlowHandlerInBurstDoesNotHoldReplies(t *testing.T) {
+	release, unblock := releaser(t)
+	conns := make(chan *Conn, 1)
+	addr := serve(t, &Server{
+		Split: lengthPrefixed,
+		OnMessage: func(c *Conn, msg []byte) {
+			echo(c, msg)
+			if string(msg) == "slow" {
+				conns <- c
+				<-release
+			}
+		},
+	})
+	a := dial(t, addr)
+	start := time.Now()
+	_, _ = a.Write(frames("fast", "slow", "later")) // one read, one batch
+	c := recv(t, conns)
+	_, _ = c.Write(frame([]byte("broadcast")))
+	for _, want := range []string{"fast", "slow", "broadcast"} {
+		if got := readFrame(t, a); string(got) != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("replies arrived after %v, behind the slow handler", d)
+	}
+	unblock()
+	if got := readFrame(t, a); string(got) != "later" {
+		t.Fatalf("got %q, want later", got)
+	}
+}
+
 // A connection stuck in the middle of a message must not hold up the others.
 func TestServerPartialMessageDoesNotBlockOthers(t *testing.T) {
 	addr := serve(t, &Server{Split: lengthPrefixed, OnMessage: echo, NumPollers: 1})
@@ -600,7 +635,7 @@ func TestServerPoolRejection(t *testing.T) {
 	closed := make(chan error, 1)
 	addr := serve(t, &Server{
 		Split:      lengthPrefixed,
-		WorkerPool: func(uint64, func()) { panic("pool full") },
+		WorkerPool: func(uint64, func()) error { return errors.New("pool full") },
 		OnMessage:  func(*Conn, []byte) { t.Error("OnMessage ran on a rejected connection") },
 		OnClose:    func(_ *Conn, err error) { closed <- err },
 	})
@@ -910,5 +945,205 @@ func TestServerShutdownBeforeServe(t *testing.T) {
 	}
 	if err := s.ListenAndServe(); err != ErrServerClosed {
 		t.Fatalf("ListenAndServe after Shutdown: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regressions
+// ---------------------------------------------------------------------------
+
+// Server.Close is a close from this side: messages queued behind a running
+// OnMessage are dropped, not handled after Close returns.
+func TestServerCloseDropsQueuedMessages(t *testing.T) {
+	block, release := releaser(t)
+	var closed atomic.Bool
+	var after atomic.Int32
+	started := make(chan struct{}, 1)
+	s := &Server{
+		Split: lengthPrefixed,
+		OnMessage: func(c *Conn, msg []byte) {
+			if closed.Load() {
+				after.Add(1)
+			}
+			if string(msg) == "first" {
+				started <- struct{}{}
+				<-block
+			}
+		},
+	}
+	addr := serve(t, s)
+	c := dial(t, addr)
+	_, _ = c.Write(frames("first", "a", "b", "c"))
+	recv(t, started)
+	time.Sleep(50 * time.Millisecond) // "a", "b" and "c" queue behind "first"
+	closed.Store(true)
+	_ = s.Close()
+	release()
+	time.Sleep(200 * time.Millisecond)
+	if n := after.Load(); n != 0 {
+		t.Fatalf("OnMessage ran %d times after Close", n)
+	}
+}
+
+// A peer that reads slower than the server pushes (a room broadcast to a
+// player on a slow link) is still read: its heartbeats keep IdleTimeout away.
+func TestServerSlowReaderHeartbeatsStillRead(t *testing.T) {
+	closed := make(chan error, 1)
+	var heartbeats atomic.Int32
+	stop := make(chan struct{})
+	s := &Server{
+		Split:       lengthPrefixed,
+		IdleTimeout: 400 * time.Millisecond,
+		OnOpen: func(c *Conn) {
+			go func() {
+				msg := frame(bytes.Repeat([]byte("x"), 16<<10))
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					if _, err := c.Write(msg); err != nil && !errors.Is(err, ErrWriteBufferFull) {
+						return
+					}
+					time.Sleep(time.Millisecond)
+				}
+			}()
+		},
+		OnMessage: func(*Conn, []byte) { heartbeats.Add(1) },
+		OnClose:   func(_ *Conn, err error) { closed <- err },
+	}
+	addr := serve(t, s)
+	c := dial(t, addr)
+	defer close(stop)
+	go func() {
+		buf := make([]byte, 8<<10)
+		for {
+			if _, err := c.Read(buf); err != nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for deadline := time.Now().Add(1500 * time.Millisecond); time.Now().Before(deadline); {
+		select {
+		case err := <-closed:
+			t.Fatalf("live peer closed with %v after %d heartbeats", err, heartbeats.Load())
+		case <-tick.C:
+			_, _ = c.Write(frame([]byte("hb")))
+		}
+	}
+	if heartbeats.Load() == 0 {
+		t.Fatal("no heartbeat was handled")
+	}
+}
+
+// A peer that half-closes right after its request still receives the whole
+// reply, however much of it had to be queued.
+func TestServerHalfCloseLargeReplyArrivesWhole(t *testing.T) {
+	const size = 4 << 20
+	addr := serve(t, &Server{
+		Split: lengthPrefixed,
+		OnMessage: func(c *Conn, _ []byte) {
+			_, _ = c.Write(frame(bytes.Repeat([]byte("r"), size)))
+		},
+	})
+	c := dial(t, addr)
+	_, _ = c.Write(frame([]byte("req")))
+	_ = c.(*net.TCPConn).CloseWrite()
+	time.Sleep(100 * time.Millisecond) // the reply queues before we read
+	n, err := io.Copy(io.Discard, c)
+	if err != nil || n != size+4 {
+		t.Fatalf("received %d of %d bytes (%v)", n, size+4, err)
+	}
+}
+
+// LocalAddr is the address the peer connected to, even when the server
+// listens on all interfaces.
+func TestServerLocalAddrIsConnectionAddress(t *testing.T) {
+	got := make(chan string, 1)
+	addrc := make(chan string, 1)
+	s := &Server{
+		Split:     lengthPrefixed,
+		OnOpen:    func(c *Conn) { got <- c.LocalAddr().String() },
+		OnMessage: func(*Conn, []byte) {},
+		Listen: func(network, _ string) (net.Listener, error) {
+			ln, err := net.Listen(network, ":0")
+			if err == nil {
+				addrc <- ln.Addr().String()
+			}
+			return ln, err
+		},
+	}
+	go func() { _ = s.ListenAndServe() }()
+	t.Cleanup(func() { _ = s.Close() })
+	_, port, _ := net.SplitHostPort(recv(t, addrc))
+	c := dial(t, "127.0.0.1:"+port)
+	if local, want := recv(t, got), c.RemoteAddr().String(); local != want {
+		t.Fatalf("LocalAddr = %s, want %s", local, want)
+	}
+}
+
+// Writev takes more buffers than writev(2) accepts at once (IOV_MAX).
+func TestServerWritevManyBuffers(t *testing.T) {
+	const parts = 3000
+	addr := serve(t, &Server{
+		Split: lengthPrefixed,
+		OnMessage: func(c *Conn, _ []byte) {
+			bufs := make([][]byte, 0, parts+1)
+			var hdr [4]byte
+			binary.BigEndian.PutUint32(hdr[:], parts)
+			bufs = append(bufs, hdr[:])
+			for range parts {
+				bufs = append(bufs, []byte{'v'})
+			}
+			if _, err := c.Writev(bufs); err != nil {
+				t.Errorf("Writev: %v", err)
+			}
+		},
+	})
+	c := dial(t, addr)
+	_, _ = c.Write(frame([]byte("go")))
+	if m := readFrame(t, c); len(m) != parts || bytes.Count(m, []byte{'v'}) != parts {
+		t.Fatalf("reply of %d bytes", len(m))
+	}
+}
+
+// The messages cut from one read share a buffer: while one of them is still
+// being handled, the next read must not be copied over the ones queued behind
+// it.
+func TestServerMessagesOfOneReadKeepTheirBytes(t *testing.T) {
+	release, unblock := releaser(t)
+	got := make(chan string, 32)
+	var first atomic.Bool
+	addr := serve(t, &Server{
+		Split: lengthPrefixed,
+		OnMessage: func(_ *Conn, msg []byte) {
+			if first.CompareAndSwap(false, true) {
+				<-release
+			}
+			got <- string(msg)
+		},
+	})
+	a := dial(t, addr)
+	var want []string
+	burst := func(tag string) {
+		var msgs []string
+		for i := range 8 {
+			msgs = append(msgs, fmt.Sprintf("%s%d%0100d", tag, i, 0))
+		}
+		want = append(want, msgs...)
+		_, _ = a.Write(frames(msgs...)) // one read, one buffer
+		time.Sleep(50 * time.Millisecond)
+	}
+	burst("a") // a0 is handled, a1.. wait behind it
+	burst("b") // cut while a1.. still wait
+	unblock()
+	for _, w := range want {
+		if s := recv(t, got); s != w {
+			t.Fatalf("got %.8q..., want %.8q...", s, w)
+		}
 	}
 }

@@ -225,6 +225,9 @@ func (e *Engine) StopAccept() {
 // goroutine and must not block.
 func (e *Engine) ForEach(fn func(c *Conn)) { e.table.forEach(fn) }
 
+// Handler returns the handler new connections start with.
+func (e *Engine) Handler() Handler { return e.handler }
+
 // Close stops accepting, closes every connection, and waits for the event
 // loops to exit. Handlers still running on other goroutines see their
 // connection closed. Close is idempotent and safe before Serve.

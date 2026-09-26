@@ -17,8 +17,14 @@ import (
 // detachedConn is a socketless Conn in blocking-reader mode: writes queue and
 // input is fed by hand.
 func detachedConn() *Conn {
-	return &Conn{fd: -1, detached: true}
+	c := &Conn{fd: -1}
+	c.Detach()
+	return c
 }
+
+// eventConn is a socketless Conn owned by a (missing) handler: writes queue
+// without blocking.
+func eventConn() *Conn { return &Conn{fd: -1} }
 
 func (c *Conn) feed(b []byte) { c.deliver(b) }
 
@@ -26,13 +32,13 @@ func (c *Conn) feed(b []byte) { c.deliver(b) }
 func (c *Conn) drain(dst []byte) int {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	if c.out == nil {
+		return 0
+	}
 	n := copy(dst, c.out.B[c.outR:c.outW])
 	c.outR += n
 	if c.outR == c.outW {
 		c.releaseOutLocked()
-	}
-	if c.outW-c.outR <= lowWatermark {
-		c.clearState(stPausedOut)
 	}
 	return n
 }
@@ -93,8 +99,8 @@ func TestConnCloseUnblocksRead(t *testing.T) {
 	_ = c.Close()
 	select {
 	case err := <-done:
-		if err != io.EOF {
-			t.Fatalf("want EOF, got %v", err)
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("want net.ErrClosed, got %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Read did not unblock")
@@ -131,9 +137,9 @@ func TestConnUnread(t *testing.T) {
 }
 
 func TestConnWriteBufferLimit(t *testing.T) {
-	c := detachedConn()
+	c := eventConn()
 	chunk := make([]byte, 1<<20)
-	for i := 0; i < DefaultMaxOutbound>>20; i++ {
+	for i := 0; i < DefaultMaxOutbound/len(chunk); i++ {
 		if _, err := c.Write(chunk); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
@@ -143,19 +149,82 @@ func TestConnWriteBufferLimit(t *testing.T) {
 	}
 }
 
-func TestConnOutboundBackpressure(t *testing.T) {
+// A blocking writer queues at most highWatermark and then waits, instead of
+// failing like an event-mode writer.
+func TestConnBlockingWriteWaitsForRoom(t *testing.T) {
 	c := detachedConn()
-	_, _ = c.Write(make([]byte, 32<<10))
-	if c.state.Load()&stPausedOut != 0 {
-		t.Fatal("paused below the high watermark")
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Write(make([]byte, 4*highWatermark))
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("write to a peer that does not read returned at once: %v", err)
+	default:
 	}
-	_, _ = c.Write(make([]byte, 40<<10))
-	if c.state.Load()&stPausedOut == 0 {
-		t.Fatal("not paused above the high watermark")
+	c.wmu.Lock()
+	if q := c.outW - c.outR; q > highWatermark {
+		t.Errorf("queued %d bytes, more than %d", q, highWatermark)
 	}
-	c.drain(make([]byte, 60<<10))
-	if c.state.Load()&stPausedOut != 0 {
-		t.Fatal("still paused below the low watermark")
+	c.wmu.Unlock()
+	buf := make([]byte, highWatermark)
+	for got := 0; got < 4*highWatermark; {
+		n := c.drain(buf)
+		got += n
+		if n == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		c.wmu.Lock()
+		c.wakeWritersLocked() // what the loop's flush does
+		c.wmu.Unlock()
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("blocking write: %v", err)
+	}
+}
+
+// A blocking write still waiting when the connection closes fails.
+func TestConnBlockingWriteFailsOnClose(t *testing.T) {
+	c := detachedConn()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Write(make([]byte, 4*highWatermark))
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	_ = c.Close()
+	select {
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("want net.ErrClosed, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not unblock the writer")
+	}
+}
+
+// A blocking reader that falls behind pauses reading from the socket instead
+// of buffering without bound, and catching up resumes it.
+func TestConnBlockingInputIsBounded(t *testing.T) {
+	c := detachedConn()
+	c.feed(make([]byte, maxBlockingInput))
+	if c.state.Load()&stPausedBuf == 0 {
+		t.Fatal("not paused with maxBlockingInput unread")
+	}
+	buf := make([]byte, maxBlockingInput)
+	if n, err := c.Read(buf[:maxBlockingInput/2]); err != nil || n != maxBlockingInput/2 {
+		t.Fatalf("Read = %d, %v", n, err)
+	}
+	if c.state.Load()&stPausedBuf == 0 {
+		t.Fatal("resumed while still far behind")
+	}
+	if n, err := c.Read(buf[:maxBlockingInput/4]); err != nil || n != maxBlockingInput/4 {
+		t.Fatalf("Read = %d, %v", n, err)
+	}
+	if c.state.Load()&stPausedBuf != 0 {
+		t.Fatal("still paused after catching up")
 	}
 }
 
@@ -490,7 +559,7 @@ func TestEngineDrainIgnoresPassedWriteDeadline(t *testing.T) {
 // One write larger than the cap still goes out whole when nothing is queued,
 // so a message is never cut short on the wire; the cap then holds.
 func TestConnWriteLargerThanCapIntoEmptyQueue(t *testing.T) {
-	c := detachedConn()
+	c := eventConn()
 	big := make([]byte, DefaultMaxOutbound+1)
 	if n, err := c.Write(big); err != nil || n != len(big) {
 		t.Fatalf("Write(big) = %d, %v", n, err)
@@ -622,5 +691,124 @@ func TestEngineMaxOutbound(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("handler did not run")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Corked
+// ---------------------------------------------------------------------------
+
+// corkedHandler runs burst on a goroutine of its own, as a worker would, for
+// the first input of each connection.
+func corkedHandler(burst func(c *Conn)) *funcHandler {
+	return &funcHandler{data: func(c *Conn, b []byte) int {
+		go burst(c)
+		return len(b)
+	}}
+}
+
+func (c *Conn) queued() int {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	return c.outW - c.outR
+}
+
+// Writes inside Corked are held, then leave together when it returns.
+func TestCorkedHoldsWritesUntilItReturns(t *testing.T) {
+	held := make(chan int, 1)
+	addr := startEngine(t, corkedHandler(func(c *Conn) {
+		c.Corked(func() {
+			for _, s := range []string{"one ", "two ", "three"} {
+				_, _ = c.Write([]byte(s))
+			}
+			held <- c.queued()
+		})
+	}))
+	c := dial(t, addr)
+	_, _ = c.Write([]byte("go"))
+	if n := <-held; n != len("one two three") {
+		t.Fatalf("%d bytes held inside Corked, want all of them", n)
+	}
+	buf := make([]byte, len("one two three"))
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "one two three" {
+		t.Fatalf("read %q %v", buf, err)
+	}
+}
+
+// A slow handler inside Corked holds neither its earlier replies nor another
+// goroutine's writes for long.
+func TestCorkedSlowHandlerDoesNotHoldOutput(t *testing.T) {
+	addr := startEngine(t, corkedHandler(func(c *Conn) {
+		c.Corked(func() {
+			_, _ = c.Write([]byte("early "))
+			time.AfterFunc(50*time.Millisecond, func() { _, _ = c.Write([]byte("broadcast")) })
+			time.Sleep(time.Second)
+		})
+	}))
+	c := dial(t, addr)
+	start := time.Now()
+	_, _ = c.Write([]byte("go"))
+	buf := make([]byte, len("early broadcast"))
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "early broadcast" {
+		t.Fatalf("read %q %v", buf, err)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("output arrived after %v, held behind the slow handler", d)
+	}
+}
+
+// More than a cork holds goes out as it comes, in order and complete.
+func TestCorkedOverflowKeepsOrder(t *testing.T) {
+	const chunks, size = 200, 1000 // well over maxCorked
+	addr := startEngine(t, corkedHandler(func(c *Conn) {
+		c.Corked(func() {
+			for i := range chunks {
+				_, _ = c.Write(bytes.Repeat([]byte{byte(i)}, size))
+			}
+			_ = c.Close()
+		})
+	}))
+	c := dial(t, addr)
+	_, _ = c.Write([]byte("go"))
+	all, err := io.ReadAll(c)
+	if err != nil || len(all) != chunks*size {
+		t.Fatalf("read %d bytes (%v), want %d", len(all), err, chunks*size)
+	}
+	for i := range chunks {
+		if b := all[i*size : (i+1)*size]; !bytes.Equal(b, bytes.Repeat([]byte{byte(i)}, size)) {
+			t.Fatalf("chunk %d out of order", i)
+		}
+	}
+}
+
+// A close deadline further away than an idle loop sleeps is not announced to
+// the loop, yet still fires on time: the loop finds it when it next wakes, and
+// the peer reads EOF at the deadline.
+func TestFarCloseDeadlineFiresOnIdleLoop(t *testing.T) {
+	conns := make(chan *Conn, 1)
+	addr := startEngine(t, &funcHandler{data: func(c *Conn, b []byte) int {
+		select {
+		case conns <- c:
+		default:
+		}
+		return len(b)
+	}})
+	c := dial(t, addr)
+	_, _ = c.Write([]byte("x"))
+	var conn *Conn
+	select {
+	case conn = <-conns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no data")
+	}
+	time.Sleep(50 * time.Millisecond) // the loop idles with an empty wheel
+	deadline := time.Now().Add(pollTimeout + 300*time.Millisecond)
+	conn.SetCloseDeadline(deadline)
+	_ = c.SetReadDeadline(deadline.Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("read %v, want EOF at the deadline", err)
+	}
+	if late := time.Since(deadline); late < 0 || late > 2*time.Duration(tickNanos)+50*time.Millisecond {
+		t.Fatalf("EOF %v after the deadline", late)
 	}
 }

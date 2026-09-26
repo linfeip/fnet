@@ -51,6 +51,10 @@ type KeepAlive struct {
 	Count    int
 }
 
+// iovBatch is how many buffers Writev passes to one writev(2), well below
+// IOV_MAX (1024 on Linux and Darwin), beyond which writev fails with EINVAL.
+const iovBatch = 64
+
 // NewPoller creates the platform-native poller.
 func NewPoller() (Poller, error) { return newPoller() }
 

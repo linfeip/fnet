@@ -77,7 +77,9 @@ func (f LengthField) length(b []byte) (uint64, error) {
 	case 2:
 		return uint64(order.Uint16(b)), nil
 	case 3:
-		if order == binary.LittleEndian || order == binary.NativeEndian && binary.NativeEndian.Uint16([]byte{1, 0}) == 1 {
+		// ByteOrder has no 24-bit read: ask the order which end comes first,
+		// which works for any implementation, not just the standard ones.
+		if order.Uint16([]byte{1, 0}) == 1 {
 			return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16, nil
 		}
 		return uint64(b[0])<<16 | uint64(b[1])<<8 | uint64(b[2]), nil

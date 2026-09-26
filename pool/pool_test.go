@@ -1,304 +1,311 @@
 package pool
 
 import (
+	"errors"
+	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestDirectAPI(t *testing.T) {
-	p := New(Config{
-		Shards:             4,
-		MaxWorkersPerShard: 8,
-		QueueSizePerShard:  64,
-		IdleTimeout:        100 * time.Millisecond,
-	})
+func TestRunsEveryTaskAndReclaimsWorkers(t *testing.T) {
+	p := New(Config{MaxWorkers: 8, IdleTimeout: 100 * time.Millisecond})
 	defer p.Close()
 
 	const tasks = 200
 	var executed atomic.Int64
 	var wg sync.WaitGroup
 	wg.Add(tasks)
-
-	for i := 0; i < tasks; i++ {
-		connID := uint64(i % 16)
-		p.SubmitConn(connID, func() {
+	for i := range tasks {
+		if err := p.SubmitConn(uint64(i%16), func() {
 			defer wg.Done()
 			executed.Add(1)
-		})
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
-
 	wg.Wait()
 	if executed.Load() != tasks {
 		t.Fatalf("expected %d tasks, got %d", tasks, executed.Load())
 	}
 
-	// Verify worker reclamation
 	time.Sleep(300 * time.Millisecond)
-	if remaining := p.RunningWorkers(); remaining != 0 {
-		t.Fatalf("expected 0 running workers after idle timeout, got %d", remaining)
+	if n := p.RunningWorkers(); n != 0 {
+		t.Fatalf("expected 0 workers after the idle timeout, got %d", n)
 	}
 }
 
-func TestWorkStealingUnderSkew(t *testing.T) {
-	// Scenario:
-	// A pool has 4 shards, each limited to 1 worker.
-	// Shard A receives a heavy task that blocks for 150ms.
-	// Subsequently, 10 fast tasks are also routed to the exact same shard.
-	// Without work-stealing, the 10 fast tasks are stuck behind the heavy task on Shard A for 150ms.
-	// With work-stealing, idle workers from Shard B, C, D immediately steal and complete the 10 fast tasks
-	// while Shard A's single worker is still busy sleeping!
-
-	p := New(Config{
-		Shards:             4,
-		MaxWorkersPerShard: 1, // Strict 1 worker per shard
-		QueueSizePerShard:  64,
-		IdleTimeout:        time.Second,
-	})
+// Tasks beyond MaxWorkers wait for a worker instead of starting goroutines,
+// and run as soon as one frees up.
+func TestWorkersAreBounded(t *testing.T) {
+	p := New(Config{MaxWorkers: 4, IdleTimeout: time.Second})
 	defer p.Close()
 
-	// Pre-spawn workers on all 4 shards by dispatching warmup tasks
-	for i := 0; p.RunningWorkers() < 4 && i < 100; i++ {
-		p.Submit(func() {
-			time.Sleep(5 * time.Millisecond)
+	release := make(chan struct{})
+	var started, peak atomic.Int32
+	var wg sync.WaitGroup
+	const tasks = 40
+	wg.Add(tasks)
+	for range tasks {
+		_ = p.Submit(func() {
+			defer wg.Done()
+			n := started.Add(1)
+			for {
+				old := peak.Load()
+				if n <= old || peak.CompareAndSwap(old, n) {
+					break
+				}
+			}
+			<-release
+			started.Add(-1)
 		})
-		time.Sleep(2 * time.Millisecond)
 	}
-
-	// Ensure all 4 shards have their 1 worker running and now idle
-	time.Sleep(20 * time.Millisecond)
-	if workers := p.RunningWorkers(); workers != 4 {
-		t.Fatalf("expected 4 running workers, got %d", workers)
+	time.Sleep(50 * time.Millisecond)
+	if w := p.RunningWorkers(); w != 4 {
+		t.Fatalf("running workers = %d, want 4", w)
 	}
+	close(release)
+	wg.Wait()
+	if peak.Load() > 4 {
+		t.Fatalf("%d tasks ran at once, more than MaxWorkers", peak.Load())
+	}
+}
 
-	const targetConnID = uint64(0)
-	var heavyTaskRunning atomic.Bool
-	var heavyTaskFinished atomic.Bool
+// A slow task does not hold up the ones submitted after it while other
+// workers are free.
+func TestSlowTaskDoesNotBlockOthers(t *testing.T) {
+	p := New(Config{MaxWorkers: 4, IdleTimeout: time.Second})
+	defer p.Close()
+
 	heavyStarted := make(chan struct{})
-
-	// 1. Submit heavy task to targetConnID
-	p.SubmitConn(targetConnID, func() {
-		heavyTaskRunning.Store(true)
+	var heavyRunning atomic.Bool
+	heavyRunning.Store(true)
+	_ = p.Submit(func() {
 		close(heavyStarted)
 		time.Sleep(150 * time.Millisecond)
-		heavyTaskRunning.Store(false)
-		heavyTaskFinished.Store(true)
+		heavyRunning.Store(false)
 	})
-
 	<-heavyStarted
 
-	// 2. Submit 10 fast tasks to the EXACT same connection/shard
-	const fastTaskCount = 10
-	var fastCompletedWhileHeavyRunning atomic.Int64
-	var fastWg sync.WaitGroup
-	fastWg.Add(fastTaskCount)
-
+	const fast = 10
+	var wg sync.WaitGroup
+	var whileHeavy atomic.Int64
+	wg.Add(fast)
 	start := time.Now()
-	for i := 0; i < fastTaskCount; i++ {
-		p.SubmitConn(targetConnID, func() {
-			defer fastWg.Done()
-			if heavyTaskRunning.Load() {
-				// Completed while heavy task is still running! Proof of work-stealing!
-				fastCompletedWhileHeavyRunning.Add(1)
+	for range fast {
+		_ = p.Submit(func() {
+			defer wg.Done()
+			if heavyRunning.Load() {
+				whileHeavy.Add(1)
 			}
 		})
 	}
-
-	fastWg.Wait()
-	fastDuration := time.Since(start)
-
-	// Verify that fast tasks finished well before the 150ms heavy task completed
-	if fastDuration >= 120*time.Millisecond {
-		t.Fatalf("Work-stealing failed: fast tasks took %v (expected < 100ms, stolen by other workers)", fastDuration)
+	wg.Wait()
+	if d := time.Since(start); d >= 120*time.Millisecond || whileHeavy.Load() != fast {
+		t.Fatalf("fast tasks took %v, %d of %d ran beside the slow one", d, whileHeavy.Load(), fast)
 	}
-
-	if completed := fastCompletedWhileHeavyRunning.Load(); completed == 0 {
-		t.Fatalf("Expected fast tasks to be executed concurrently by stolen workers while heavy task was running, got %d", completed)
-	}
-
-	t.Logf("Work-stealing verified: %d/%d tasks stolen and completed in %v while heavy task was running",
-		fastCompletedWhileHeavyRunning.Load(), fastTaskCount, fastDuration)
 }
 
-func TestPowerOfTwoChoicesBalance(t *testing.T) {
-	// Verify that Submit with Power-of-Two-Choices effectively balances tasks
-	p := New(Config{
-		Shards:             8,
-		MaxWorkersPerShard: 4,
-		QueueSizePerShard:  128,
-		IdleTimeout:        time.Second,
-	})
+// A task submitted just as the only worker's idle timer fires must still run:
+// the worker either takes it or leaves before it is chosen, never both.
+func TestTaskNotStrandedByIdleExit(t *testing.T) {
+	p := New(Config{MaxWorkers: 1, IdleTimeout: 2 * time.Millisecond})
 	defer p.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for i := 0; time.Now().Before(deadline); i++ {
+		done := make(chan struct{})
+		time.Sleep(time.Duration(1000+rand.Intn(2000)) * time.Microsecond) // around the idle timer
+		_ = p.Submit(func() { close(done) })
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("round %d: task stranded (workers=%d idle=%d)", i, p.RunningWorkers(), p.IdleWorkers())
+		}
+	}
+}
 
-	const total = 400
-	var executed atomic.Int64
+// The shards split MaxWorkers between them, each getting minShardWorkers at
+// least unless there is only one, and there are no more shards than cores
+// (rounded up to a power of two).
+func TestShardsSplitMaxWorkers(t *testing.T) {
+	procs := runtime.GOMAXPROCS(0)
+	for _, maxWorkers := range []int{1, 8, 255, 256, 1000, 4096, 1024 * procs, 100003} {
+		p := New(Config{MaxWorkers: maxWorkers})
+		n, total := len(p.shards), 0
+		for i := range p.shards {
+			s := &p.shards[i]
+			total += s.max
+			if n > 1 && s.max < minShardWorkers {
+				t.Errorf("MaxWorkers %d: shard %d of %d gets %d workers", maxWorkers, i, n, s.max)
+			}
+		}
+		if total != maxWorkers || n&(n-1) != 0 || n > 2*procs {
+			t.Errorf("MaxWorkers %d: %d shards with %d workers in all", maxWorkers, n, total)
+		}
+		p.Close()
+	}
+}
+
+// With every shard saturated the pool runs exactly MaxWorkers tasks at once,
+// and every queued task runs once workers free up.
+func TestShardedSaturation(t *testing.T) {
+	const maxWorkers = 4 * minShardWorkers
+	p := New(Config{MaxWorkers: maxWorkers, IdleTimeout: 100 * time.Millisecond})
+	defer p.Close()
+	release := make(chan struct{})
+	var running, peak atomic.Int32
 	var wg sync.WaitGroup
-	wg.Add(total)
-
-	for i := 0; i < total; i++ {
-		p.Submit(func() {
+	const tasks = 3 * maxWorkers
+	wg.Add(tasks)
+	for i := range tasks {
+		_ = p.SubmitConn(uint64(i), func() {
 			defer wg.Done()
-			executed.Add(1)
-			time.Sleep(time.Millisecond)
+			n := running.Add(1)
+			for {
+				old := peak.Load()
+				if n <= old || peak.CompareAndSwap(old, n) {
+					break
+				}
+			}
+			<-release
+			running.Add(-1)
 		})
 	}
+	deadline := time.Now().Add(5 * time.Second)
+	for running.Load() < maxWorkers && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if w := p.RunningWorkers(); w != maxWorkers {
+		t.Fatalf("running workers = %d, want %d", w, maxWorkers)
+	}
+	close(release)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued tasks stranded")
+	}
+	if peak.Load() > maxWorkers {
+		t.Fatalf("%d tasks ran at once, more than MaxWorkers", peak.Load())
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := p.RunningWorkers(); n != 0 {
+		t.Fatalf("%d workers left after the idle timeout", n)
+	}
+}
 
-	wg.Wait()
-	if executed.Load() != total {
-		t.Fatalf("expected %d, got %d", total, executed.Load())
+// Bursts of short tasks are carried by a few busy workers that take the next
+// task without parking, not by a goroutine per task: each worker holds a
+// stack, and a pool that grows to its backlog costs memory and locality. With
+// one P every burst is queued before a worker runs, so that is deterministic.
+func TestBurstsOfShortTasksNeedFewWorkers(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	p := New(Config{MaxWorkers: 400, IdleTimeout: time.Minute}) // one shard
+	defer p.Close()
+	const size = 200
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(size)
+		for range size {
+			_ = p.Submit(wg.Done)
+		}
+		wg.Wait()
+	}
+	if n := p.RunningWorkers(); n > 4 {
+		t.Fatalf("%d workers for bursts of %d short tasks", n, size)
+	}
+}
+
+// A worker about to park takes a task another shard has waiting, so a shard
+// whose workers are all busy does not hold its queue while others idle.
+func TestIdleWorkerTakesTaskFromBusyShard(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
+	p := New(Config{MaxWorkers: 2 * minShardWorkers, IdleTimeout: time.Minute})
+	defer p.Close()
+	if len(p.shards) != 2 {
+		t.Fatalf("%d shards, want 2", len(p.shards))
+	}
+	// A task waits in shard 1 with no worker coming for it, as it would
+	// behind busy workers.
+	ran := make(chan struct{})
+	s := &p.shards[1]
+	s.mu.Lock()
+	s.queue.push(func() { close(ran) })
+	s.mu.Unlock()
+	var id uint64
+	for id*0x9e3779b97f4a7c15>>p.shift != 0 {
+		id++
+	}
+	_ = p.SubmitConn(id, func() {}) // shard 0's worker looks around before parking
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the task waiting in a busy shard was left there")
 	}
 }
 
 func TestConcurrentCloseAndSubmit(t *testing.T) {
-	p := New(Config{
-		Shards:             4,
-		MaxWorkersPerShard: 8,
-		QueueSizePerShard:  16,
-		IdleTimeout:        100 * time.Millisecond,
-	})
-
-	const numSubmitters = 50
+	p := New(Config{MaxWorkers: 32, IdleTimeout: 100 * time.Millisecond})
+	var ran, refused atomic.Int64
 	var wg sync.WaitGroup
-	wg.Add(numSubmitters)
-
-	for i := 0; i < numSubmitters; i++ {
+	for i := range 50 {
+		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < 50; j++ {
-				p.SubmitConn(uint64(id), func() {
+			for range 50 {
+				err := p.SubmitConn(uint64(id), func() {
 					time.Sleep(time.Microsecond)
+					ran.Add(1)
 				})
+				if err != nil {
+					if !errors.Is(err, ErrClosed) {
+						t.Errorf("Submit: %v", err)
+					}
+					refused.Add(1)
+				}
 			}
 		}(i)
 	}
-
 	time.Sleep(time.Millisecond)
 	p.Close()
 	wg.Wait()
+	if ran.Load()+refused.Load() != 50*50 {
+		t.Fatalf("ran %d + refused %d, want every task accounted for", ran.Load(), refused.Load())
+	}
+	if n := p.RunningWorkers(); n != 0 {
+		t.Fatalf("%d workers left after Close", n)
+	}
+}
+
+func TestPanicIsContained(t *testing.T) {
+	p := New(Config{MaxWorkers: 2})
+	defer p.Close()
+	done := make(chan struct{})
+	_ = p.Submit(func() { panic("simulated business handler panic") })
+	_ = p.Submit(func() { close(done) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pool stopped running tasks after a panic")
+	}
 }
 
 func TestAdapt(t *testing.T) {
 	var count atomic.Int64
-	legacySubmit := func(task func()) {
+	plain := func(task func()) error {
 		count.Add(1)
 		task()
+		return nil
 	}
-
-	adapted := Adapt(legacySubmit)
-	if adapted == nil {
-		t.Fatal("expected non-nil adapted p")
-	}
-
 	var executed atomic.Bool
-	adapted(12345, func() {
-		executed.Store(true)
-	})
-
-	if count.Load() != 1 || !executed.Load() {
-		t.Fatalf("expected legacySubmit to execute task, count=%d, executed=%v", count.Load(), executed.Load())
+	if err := Adapt(plain)(12345, func() { executed.Store(true) }); err != nil || count.Load() != 1 || !executed.Load() {
+		t.Fatalf("adapted submit: err=%v count=%d executed=%v", err, count.Load(), executed.Load())
 	}
-
 	if Adapt(nil) != nil {
 		t.Fatal("expected nil for nil submit function")
-	}
-}
-
-func TestSubmitAndDispatch(t *testing.T) {
-	p := New(Config{
-		Shards:             8,
-		MaxWorkersPerShard: 16,
-		QueueSizePerShard:  128,
-		IdleTimeout:        time.Second,
-	})
-	defer p.Close()
-
-	const totalTasks = 1000
-	var counter atomic.Int64
-	var wg sync.WaitGroup
-	wg.Add(totalTasks)
-
-	for i := 0; i < totalTasks; i++ {
-		connID := uint64(i % 50)
-		p.SubmitConn(connID, func() {
-			defer wg.Done()
-			counter.Add(1)
-		})
-	}
-
-	wg.Wait()
-	if counter.Load() != totalTasks {
-		t.Fatalf("expected counter %d, got %d", totalTasks, counter.Load())
-	}
-
-	// Test panic recovery inside the pool: the worker must survive
-	var panicHandled atomic.Bool
-	wg.Add(1)
-	p.Submit(func() {
-		defer wg.Done()
-		panicHandled.Store(true)
-		panic("simulated business handler panic")
-	})
-	wg.Wait()
-
-	if !panicHandled.Load() {
-		t.Fatal("expected panic task to run")
-	}
-
-	// Submit another normal task to ensure the pool is still healthy
-	var afterPanic atomic.Bool
-	wg.Add(1)
-	p.Submit(func() {
-		defer wg.Done()
-		afterPanic.Store(true)
-	})
-	wg.Wait()
-
-	if !afterPanic.Load() {
-		t.Fatal("expected p to execute tasks normally after panic")
-	}
-}
-
-func TestIdleWorkerReclamation(t *testing.T) {
-	idleTimeout := 100 * time.Millisecond
-	p := New(Config{
-		Shards:             4,
-		MaxWorkersPerShard: 8,
-		QueueSizePerShard:  64,
-		IdleTimeout:        idleTimeout,
-	})
-	defer p.Close()
-
-	// Initially zero running workers
-	if workers := p.RunningWorkers(); workers != 0 {
-		t.Fatalf("expected 0 running workers initially, got %d", workers)
-	}
-
-	// Dispatch tasks to spawn workers
-	var wg sync.WaitGroup
-	const tasks = 50
-	wg.Add(tasks)
-	for i := 0; i < tasks; i++ {
-		p.Submit(func() {
-			defer wg.Done()
-			time.Sleep(10 * time.Millisecond)
-		})
-	}
-	wg.Wait()
-
-	// Some workers must have been spawned
-	running := p.RunningWorkers()
-	if running == 0 {
-		t.Fatal("expected running workers > 0 after executing tasks")
-	}
-
-	// Wait for idleTimeout to elapse
-	time.Sleep(idleTimeout * 3)
-
-	// All idle workers should have exited
-	remaining := p.RunningWorkers()
-	if remaining != 0 {
-		t.Fatalf("expected all idle workers to be reaped (0 remaining), got %d", remaining)
 	}
 }
 
@@ -307,7 +314,7 @@ func TestDefaultAndSetDefault(t *testing.T) {
 	if d == nil || Default() != d {
 		t.Fatal("Default must return one shared pool")
 	}
-	custom := New(Config{Shards: 2})
+	custom := New(Config{MaxWorkers: 2})
 	defer custom.Close()
 	SetDefault(custom)
 	defer SetDefault(d)
@@ -332,10 +339,27 @@ func TestDispatch(t *testing.T) {
 	}
 
 	var ran atomic.Bool
-	if !Dispatch(func(_ uint64, task func()) { task() }, 2, func() { ran.Store(true) }) || !ran.Load() {
+	if !Dispatch(func(_ uint64, task func()) error { task(); return nil }, 2, func() { ran.Store(true) }) || !ran.Load() {
 		t.Fatal("custom submit did not run the task")
 	}
-	if Dispatch(func(uint64, func()) { panic("full") }, 3, func() {}) {
-		t.Fatal("a rejecting custom pool must be reported")
+	if Dispatch(func(uint64, func()) error { return errors.New("full") }, 3, func() {}) {
+		t.Fatal("a refusing custom pool must be reported")
 	}
+	if Dispatch(func(uint64, func()) error { panic("broken pool") }, 4, func() {}) {
+		t.Fatal("a panicking custom pool must be reported as refusing")
+	}
+}
+
+func BenchmarkSubmit(b *testing.B) {
+	p := New(Config{})
+	defer p.Close()
+	var wg sync.WaitGroup
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			wg.Add(1)
+			_ = p.Submit(wg.Done)
+		}
+	})
+	wg.Wait()
 }

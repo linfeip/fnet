@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -22,9 +23,7 @@ import (
 const maxBufferedBody = 64 << 10
 
 var (
-	responseWriterPool = sync.Pool{New: func() any {
-		return &responseWriter{header: make(http.Header, 8)}
-	}}
+	bodyPool   = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 	readerPool = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 4<<10) }}
 	writerPool = sync.Pool{New: func() any { return bufio.NewWriterSize(nil, 4<<10) }}
 	headPool   = sync.Pool{New: func() any { return new(bytes.Buffer) }}
@@ -34,45 +33,71 @@ var (
 	lastChunk       = []byte("0\r\n\r\n")
 	errUnwrapped    = errors.New("fnet/fhttp: connection was moved to the event loop")
 	errDoubleHijack = errors.New("fnet/fhttp: connection already hijacked")
+	errFinished     = errors.New("fnet/fhttp: response used after the handler returned")
+
+	// interimExcluded are the framing headers a 1xx response must not carry.
+	interimExcluded = map[string]bool{"Content-Length": true, "Transfer-Encoding": true}
 )
 
-// responseWriter implements http.ResponseWriter and http.Hijacker for one
-// request. It is not safe for concurrent use, like net/http's.
+// responseWriter implements http.ResponseWriter, http.Flusher and
+// http.Hijacker for one request, and the deadlines of http.ResponseController.
+// It is not safe for concurrent use, like net/http's, and fails once the
+// handler has returned.
 type responseWriter struct {
+	srv  *httpHandler
 	conn net.Conn      // response stream: the reactor conn, or TLS on top of it
 	br   *bufio.Reader // request reader, handed to a hijacker
 	raw  *reactor.Conn // the unencrypted connection; nil under TLS
 	hc   *hijackedConn
 
-	header      http.Header
-	status      int
-	body        bytes.Buffer
-	discarded   int64 // body bytes a bodyless response swallowed, for HEAD's Content-Length
-	wroteStatus bool  // the first WriteHeader (or Write) fixed the status
-	wroteHeader bool  // the header block is on the wire
-	chunked     bool  // the body goes out chunk-encoded
-	hijacked    bool
-	closeConn   bool // close after this response
-	isHead      bool
-	http10      bool // the client speaks HTTP/1.0: no chunked encoding
+	header        http.Header
+	status        int
+	body          *bytes.Buffer // the body held back until its length is known; from bodyPool
+	contentLength int64         // declared once the header is out; -1 when unknown
+	written       int64         // body bytes sent, to check against contentLength
+	discarded     int64         // body bytes a bodyless response swallowed, for HEAD's Content-Length
+	done          atomic.Bool   // the handler returned
+	wroteStatus   bool          // the first WriteHeader (or Write) fixed the status
+	wroteHeader   bool          // the header block is on the wire
+	chunked       bool          // the body goes out chunk-encoded
+	hijacked      bool
+	closeConn     bool // close after this response
+	isHead        bool
+	http10        bool // the client speaks HTTP/1.0: no chunked encoding, no 1xx
+	sent100       bool // a 100 Continue went out
 }
 
-func newResponseWriter(conn net.Conn, br *bufio.Reader, raw *reactor.Conn) *responseWriter {
-	w := responseWriterPool.Get().(*responseWriter)
-	w.conn, w.br, w.raw = conn, br, raw
-	w.status = http.StatusOK
-	return w
-}
-
-func (w *responseWriter) release() {
-	h, body := w.header, w.body
-	clear(h)
-	body.Reset()
-	if body.Cap() > 2*maxBufferedBody {
-		body = bytes.Buffer{}
+func newResponseWriter(srv *httpHandler, conn net.Conn, br *bufio.Reader, raw *reactor.Conn) *responseWriter {
+	return &responseWriter{
+		srv:           srv,
+		conn:          conn,
+		br:            br,
+		raw:           raw,
+		header:        make(http.Header, 4),
+		status:        http.StatusOK,
+		contentLength: -1,
 	}
-	*w = responseWriter{header: h, body: body}
-	responseWriterPool.Put(w)
+}
+
+// release ends the handler's use of w and returns its pooled buffer. Any later
+// call from a goroutine the handler left behind fails instead of reaching the
+// buffer's next owner.
+func (w *responseWriter) release() {
+	w.done.Store(true)
+	if b := w.body; b != nil {
+		w.body = nil
+		if b.Cap() <= 2*maxBufferedBody {
+			b.Reset()
+			bodyPool.Put(b)
+		}
+	}
+}
+
+func (w *responseWriter) buffered() int {
+	if w.body == nil {
+		return 0
+	}
+	return w.body.Len()
 }
 
 // bodyless reports whether the response must not carry a body: HEAD, 1xx, 204
@@ -89,23 +114,58 @@ func (w *responseWriter) allowsContentLength() bool {
 // awaitingBody reports whether the client may still be waiting for permission
 // to send the body: no response yet and no body byte received.
 func (w *responseWriter) awaitingBody() bool {
-	if w.wroteHeader || w.hijacked || w.br.Buffered() > 0 {
+	if w.wroteHeader || w.hijacked || w.sent100 || w.br.Buffered() > 0 {
 		return false
 	}
 	return w.raw == nil || w.raw.Buffered() == 0
 }
 
+// declaredLength returns the Content-Length the handler set, or -1. A
+// malformed one is logged and dropped, as net/http does.
+func (w *responseWriter) declaredLength() int64 {
+	cl := w.header.Get("Content-Length")
+	if cl == "" {
+		return -1
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(cl), 10, 64)
+	if err != nil || n < 0 {
+		w.srv.logf("fhttp: invalid Content-Length %q", cl)
+		w.header.Del("Content-Length")
+		return -1
+	}
+	return n
+}
+
 // hasFraming reports whether the handler chose the framing itself.
 func (w *responseWriter) hasFraming() bool {
-	return w.header.Get("Content-Length") != "" || w.header.Get("Transfer-Encoding") != ""
+	return w.declaredLength() >= 0 || w.header.Get("Transfer-Encoding") != ""
+}
+
+// stream frames a body whose length is unknown: chunked, or for an HTTP/1.0
+// client delimited by closing the connection.
+func (w *responseWriter) stream() {
+	if w.http10 {
+		w.closeConn = true
+	} else {
+		w.header.Set("Transfer-Encoding", "chunked")
+	}
 }
 
 func (w *responseWriter) Header() http.Header { return w.header }
 
 // WriteHeader records the status; only the first call counts. With explicit
 // framing the header block is sent at once, otherwise when the body is known.
+// A 1xx status (but 101) goes out at once as an interim response, such as 103
+// Early Hints, and the final status follows later.
 func (w *responseWriter) WriteHeader(code int) {
-	if w.hijacked || w.wroteStatus {
+	if w.done.Load() || w.hijacked || w.wroteStatus {
+		return
+	}
+	if code < 100 || code > 999 {
+		panic(fmt.Sprintf("invalid WriteHeader code %v", code)) // as net/http does
+	}
+	if code < 200 && code != http.StatusSwitchingProtocols {
+		w.writeInterim(code)
 		return
 	}
 	w.wroteStatus = true
@@ -115,7 +175,28 @@ func (w *responseWriter) WriteHeader(code int) {
 	}
 }
 
+// writeInterim sends a 1xx response with the header set so far, minus its
+// framing. HTTP/1.0 clients do not get one (RFC 9110 15.2).
+func (w *responseWriter) writeInterim(code int) {
+	if w.http10 {
+		return
+	}
+	if code == http.StatusContinue {
+		w.sent100 = true
+	}
+	hb := headPool.Get().(*bytes.Buffer)
+	hb.Reset()
+	fmt.Fprintf(hb, "HTTP/1.1 %d %s\r\n", code, http.StatusText(code))
+	_ = w.header.WriteSubset(hb, interimExcluded)
+	hb.Write(crlf)
+	_ = w.send(hb.Bytes())
+	headPool.Put(hb)
+}
+
 func (w *responseWriter) Write(b []byte) (int, error) {
+	if w.done.Load() {
+		return 0, errFinished
+	}
 	if w.hijacked {
 		return 0, http.ErrHijacked
 	}
@@ -129,26 +210,25 @@ func (w *responseWriter) Write(b []byte) (int, error) {
 	}
 	if !w.wroteHeader {
 		if !w.hasFraming() {
-			if w.body.Len()+len(b) <= maxBufferedBody {
+			if w.buffered()+len(b) <= maxBufferedBody {
+				if w.body == nil {
+					w.body = bodyPool.Get().(*bytes.Buffer)
+				}
 				return w.body.Write(b)
 			}
-			// Outgrew the buffer: stream the rest, chunked, or delimited by
-			// closing the connection for an HTTP/1.0 client.
-			if w.http10 {
-				w.closeConn = true
-			} else {
-				w.header.Set("Transfer-Encoding", "chunked")
-			}
+			w.stream() // outgrew the buffer: stream the rest
 		}
 		if err := w.writeHeader(nil); err != nil {
 			return 0, err
 		}
-		if w.body.Len() > 0 {
-			err := w.writeBody(w.body.Bytes())
-			w.body.Reset()
-			if err != nil {
-				return 0, err
-			}
+		if err := w.flushBuffered(); err != nil {
+			return 0, err
+		}
+	}
+	if w.contentLength >= 0 {
+		if w.written += int64(len(b)); w.written > w.contentLength {
+			w.closeConn = true
+			return 0, http.ErrContentLength // more than declared: refuse it, as net/http does
 		}
 	}
 	if err := w.writeBody(b); err != nil {
@@ -157,7 +237,65 @@ func (w *responseWriter) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// finish completes the response after the handler returns.
+// WriteString is Write for a string (io.StringWriter): a body still held back
+// takes it without a conversion.
+func (w *responseWriter) WriteString(s string) (int, error) {
+	if !w.done.Load() && !w.hijacked && !w.wroteHeader && !w.bodyless() && len(s) > 0 &&
+		w.buffered()+len(s) <= maxBufferedBody && !w.hasFraming() {
+		w.wroteStatus = true
+		if w.body == nil {
+			w.body = bodyPool.Get().(*bytes.Buffer)
+		}
+		return w.body.WriteString(s)
+	}
+	return w.Write([]byte(s))
+}
+
+// Flush sends the header and the body written so far; later writes go out as
+// they come (http.Flusher). A body of unknown length is then chunked.
+func (w *responseWriter) Flush() { _ = w.FlushError() }
+
+// FlushError is Flush that reports failure, for http.ResponseController.
+func (w *responseWriter) FlushError() error {
+	switch {
+	case w.done.Load():
+		return errFinished
+	case w.hijacked:
+		return http.ErrHijacked
+	case w.wroteHeader:
+		return nil // everything written after the header went out already
+	}
+	w.wroteStatus = true
+	if !w.bodyless() && !w.hasFraming() {
+		w.stream()
+	}
+	if err := w.writeHeader(nil); err != nil {
+		return err
+	}
+	return w.flushBuffered()
+}
+
+// flushBuffered sends the body held back before the header went out.
+func (w *responseWriter) flushBuffered() error {
+	if w.buffered() == 0 {
+		return nil
+	}
+	err := w.writeBody(w.body.Bytes())
+	w.body.Reset()
+	return err
+}
+
+// SetReadDeadline sets the deadline for reading the request body, for
+// http.ResponseController.
+func (w *responseWriter) SetReadDeadline(t time.Time) error { return w.conn.SetReadDeadline(t) }
+
+// SetWriteDeadline sets the deadline for writing the response, for
+// http.ResponseController.
+func (w *responseWriter) SetWriteDeadline(t time.Time) error { return w.conn.SetWriteDeadline(t) }
+
+// finish completes the response after the handler returns. A body shorter
+// than its declared Content-Length marks the connection for closing: reusing
+// it would make the client read the next response as the rest of this one.
 func (w *responseWriter) finish() error {
 	if w.hijacked {
 		return nil
@@ -165,24 +303,35 @@ func (w *responseWriter) finish() error {
 	if !w.wroteHeader {
 		// The whole response is known: header and body leave in one write.
 		if w.allowsContentLength() && !w.hasFraming() {
-			n := int64(w.body.Len())
+			n := int64(w.buffered())
 			if w.bodyless() {
 				n = w.discarded
 			}
 			w.header.Set("Content-Length", strconv.FormatInt(n, 10))
 		}
 		var body []byte
-		if !w.bodyless() {
+		if !w.bodyless() && w.body != nil {
 			body = w.body.Bytes()
+			w.written = int64(len(body))
 		}
 		err := w.writeHeader(body)
-		w.body.Reset()
+		if w.body != nil {
+			w.body.Reset()
+		}
 		if err != nil {
 			return err
 		}
 	}
-	if w.chunked && !w.bodyless() {
-		return w.send(lastChunk)
+	if w.bodyless() {
+		return nil
+	}
+	if w.chunked {
+		if err := w.send(lastChunk); err != nil {
+			return err
+		}
+	}
+	if w.contentLength >= 0 && w.written != w.contentLength {
+		w.closeConn = true
 	}
 	return nil
 }
@@ -191,9 +340,13 @@ func (w *responseWriter) finish() error {
 func (w *responseWriter) writeHeader(body []byte) error {
 	w.wroteHeader = true
 	h := w.header
+	w.contentLength = w.declaredLength()
 	w.chunked = h.Get("Transfer-Encoding") == "chunked"
 	if h.Get("Date") == "" {
 		h.Set("Date", httpDate())
+	}
+	if w.srv.shuttingDown.Load() {
+		w.closeConn = true
 	}
 	switch conn := h.Get("Connection"); {
 	case strings.EqualFold(conn, "close"):
@@ -263,13 +416,13 @@ func (w *responseWriter) send(parts ...[]byte) error {
 // Hijack implements http.Hijacker. Bytes the request reader buffered ahead are
 // served first by the returned connection.
 func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if w.done.Load() {
+		return nil, nil, errFinished
+	}
 	if w.hijacked {
 		return nil, nil, errDoubleHijack
 	}
 	w.hijacked = true
-	if w.br == nil {
-		w.br = bufio.NewReader(w.conn)
-	}
 	bw := writerPool.Get().(*bufio.Writer)
 	bw.Reset(w.conn)
 	w.hc = &hijackedConn{Conn: w.conn, br: w.br, bw: bw, raw: w.raw}
@@ -359,6 +512,7 @@ func httpDate() string {
 
 var (
 	_ http.ResponseWriter = (*responseWriter)(nil)
+	_ http.Flusher        = (*responseWriter)(nil)
 	_ http.Hijacker       = (*responseWriter)(nil)
 	_ io.Reader           = (*hijackedConn)(nil)
 )

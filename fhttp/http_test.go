@@ -458,11 +458,11 @@ func TestHTTPHeaderBombDropped(t *testing.T) {
 		}
 	}
 
-	// Either the server already reset us mid-write, or it drops the connection
-	// without producing a response.
+	// Like net/http, the server refuses it with 431 and closes, unless it
+	// already reset us mid-write.
 	out := c.readAll(2 * time.Second)
-	if strings.Contains(out, "HTTP/1.1") {
-		t.Fatalf("server answered an oversized header (wrote %d bytes): %q", wrote, truncate(out, 200))
+	if out != "" && !strings.HasPrefix(out, "HTTP/1.1 431 ") {
+		t.Fatalf("server answered an oversized header (wrote %d bytes) with %q", wrote, truncate(out, 200))
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -482,8 +482,8 @@ func TestHTTPMalformedRequestsRejected(t *testing.T) {
 		_, _ = io.WriteString(w, "should-not-happen")
 	})
 
-	// Requests the parser must refuse outright. The server answers by closing
-	// the connection rather than emitting 400, so assert on "no response".
+	// Requests the parser must refuse outright: like net/http, the server
+	// answers 400 (or 501) and closes the connection.
 	cases := []struct{ name, raw string }{
 		{"garbage-request-line", "TOTALLY BROKEN\r\n\r\n"},
 		{"missing-version", "GET /\r\n\r\n"},
@@ -496,8 +496,8 @@ func TestHTTPMalformedRequestsRejected(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			out := rawExchange(t, addr, tc.raw)
-			if strings.Contains(out, "HTTP/1.1") {
-				t.Fatalf("server responded to a malformed request: %q", truncate(out, 200))
+			if !strings.HasPrefix(out, "HTTP/1.1 400 ") || !strings.Contains(out, "Connection: close") {
+				t.Fatalf("malformed request answered with %q", truncate(out, 200))
 			}
 		})
 	}
@@ -1518,7 +1518,7 @@ func TestHTTPDefaultHandlerIsServeMux(t *testing.T) {
 
 func TestResponseWriterContentLengthAuto(t *testing.T) {
 	var buf bytes.Buffer
-	w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
+	w := newResponseWriter(&httpHandler{}, &bufferConn{buf: &buf}, nil, nil)
 	_, _ = io.WriteString(w, "hello")
 	if err := w.finish(); err != nil {
 		t.Fatalf("finish: %v", err)
@@ -1534,7 +1534,7 @@ func TestResponseWriterContentLengthAuto(t *testing.T) {
 
 func TestResponseWriterSwitchesToChunkedPastBuffer(t *testing.T) {
 	var buf bytes.Buffer
-	w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
+	w := newResponseWriter(&httpHandler{}, &bufferConn{buf: &buf}, nil, nil)
 
 	// Stay inside the 64 KiB buffer, then cross it: the writer must abandon
 	// Content-Length and flush what it had as chunks.
@@ -1572,10 +1572,10 @@ func TestResponseWriterSwitchesToChunkedPastBuffer(t *testing.T) {
 }
 
 func TestResponseWriterBodylessStatuses(t *testing.T) {
-	for _, status := range []int{http.StatusNoContent, http.StatusNotModified, http.StatusContinue} {
+	for _, status := range []int{http.StatusNoContent, http.StatusNotModified} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			var buf bytes.Buffer
-			w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
+			w := newResponseWriter(&httpHandler{}, &bufferConn{buf: &buf}, nil, nil)
 			w.WriteHeader(status)
 			if _, err := io.WriteString(w, "must-be-dropped"); err != nil {
 				t.Fatalf("write: %v", err)
@@ -1599,7 +1599,7 @@ func TestResponseWriterBodylessStatuses(t *testing.T) {
 
 func TestResponseWriterHeadKeepsContentLength(t *testing.T) {
 	var buf bytes.Buffer
-	w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
+	w := newResponseWriter(&httpHandler{}, &bufferConn{buf: &buf}, nil, nil)
 	w.isHead = true
 	if _, err := io.WriteString(w, "hello world"); err != nil {
 		t.Fatalf("write: %v", err)
@@ -1618,7 +1618,7 @@ func TestResponseWriterHeadKeepsContentLength(t *testing.T) {
 
 func TestResponseWriterWriteAfterHijack(t *testing.T) {
 	var buf bytes.Buffer
-	w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
+	w := newResponseWriter(&httpHandler{}, &bufferConn{buf: &buf}, nil, nil)
 	if _, _, err := w.Hijack(); err != nil {
 		t.Fatalf("Hijack: %v", err)
 	}
@@ -1639,7 +1639,7 @@ func TestResponseWriterWriteAfterHijack(t *testing.T) {
 func TestResponseWriterCloseHeader(t *testing.T) {
 	for _, closeConn := range []bool{false, true} {
 		var buf bytes.Buffer
-		w := newResponseWriter(&bufferConn{buf: &buf}, nil, nil)
+		w := newResponseWriter(&httpHandler{}, &bufferConn{buf: &buf}, nil, nil)
 		w.closeConn = closeConn
 		_ = w.finish()
 		want := "Connection: keep-alive\r\n"

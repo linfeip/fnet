@@ -1,6 +1,7 @@
 package reactor
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,9 +19,10 @@ const (
 type taskKind uint8
 
 const (
-	taskResume taskKind = iota // offer buffered input, then read the socket
-	taskClose                  // close the fd, then notify the handler
-	taskNotify                 // notify a handler attached after the close
+	taskResume  taskKind = iota // offer buffered input, then read the socket
+	taskDrained                 // a closing connection has no output left
+	taskClose                   // close the fd, then notify the handler
+	taskNotify                  // notify a handler attached after the close
 )
 
 type task struct {
@@ -38,6 +40,7 @@ type Loop struct {
 	buf     []byte
 	wheel   wheel   // close deadlines of this loop's connections
 	expired []*Conn // scratch for expireDeadlines
+	fresh   int     // see Conn.NewBytes; set before every OnData call
 
 	mu      sync.Mutex
 	tasks   []task
@@ -91,6 +94,7 @@ func (l *Loop) run() {
 		if err != nil {
 			continue
 		}
+		read := false
 		for _, ev := range events {
 			c := l.eng.table.get(ev.Fd)
 			if c == nil || c.loop != l {
@@ -98,12 +102,22 @@ func (l *Loop) run() {
 			}
 			if ev.Readable {
 				l.onReadable(c, ev.Hup)
+				read = true
 			}
 			if ev.Writable {
 				l.onWritable(c)
 			}
 		}
 		l.expireDeadlines()
+		if read {
+			// The workers the input just woke are queued on this goroutine's
+			// P, and Wait is about to hold that P in a system call until the
+			// runtime hands it on, after which the loop waits behind them for
+			// a P of its own. Yielding first runs them here at once: when the
+			// CPU is saturated, the loops no longer take turns stalling for
+			// milliseconds, and every connection's input waits about as long.
+			runtime.Gosched()
+		}
 	}
 	l.mu.Lock()
 	l.stopped = true
@@ -136,6 +150,10 @@ func (l *Loop) run1(t task) {
 		if !l.eng.closing.Load() {
 			l.resume(t.c)
 		}
+	case taskDrained:
+		if !l.eng.closing.Load() {
+			t.c.drained()
+		}
 	case taskClose:
 		_ = netpoll.Close(t.c.fd)
 		if t.h != nil {
@@ -163,7 +181,7 @@ func (l *Loop) resume(c *Conn) {
 	if c.state.Load()&stClosed != 0 {
 		return
 	}
-	c.offer()
+	c.offer(-1)
 	if c.handlerSawEOF() {
 		c.handlerEOF()
 		return
@@ -174,11 +192,12 @@ func (l *Loop) resume(c *Conn) {
 // onReadable reads c until its socket is drained. Readiness is edge-triggered,
 // so a short read means drained, except when the peer's EOF or an error came
 // with the same edge (hup), or no edge can be trusted (after a pause): then
-// read on until the socket reports it.
+// read on until the socket reports it. A closing connection is read too, and
+// its input dropped, until the peer's EOF.
 func (l *Loop) onReadable(c *Conn, hup bool) {
 	for reads := 1; ; reads++ {
 		st := c.state.Load()
-		if st&(stClosed|stPaused) != 0 {
+		if st&(stClosed|stPeerDone) != 0 || st&stPaused != 0 && st&stDraining == 0 {
 			return // a paused connection is read again on resume
 		}
 		n, err := netpoll.Read(c.fd, l.buf)
@@ -187,14 +206,22 @@ func (l *Loop) onReadable(c *Conn, hup bool) {
 		}
 		if err != nil {
 			if !netpoll.IsAgain(err) {
+				if st&stLinger != 0 {
+					err = nil // everything was delivered: close for the recorded reason
+				}
 				c.abort(err)
 			}
 			return
 		}
 		if n == 0 {
-			if st&stDraining != 0 {
-				c.abort(nil) // closing anyway, and the peer is gone: stop draining
-			} else {
+			c.setState(stPeerDone)
+			switch {
+			case st&stLinger != 0:
+				c.abort(nil) // both sides are done
+			case st&stDraining != 0:
+				// The peer only half-closed and may still read: the queued
+				// output keeps flowing, and drained closes once it is gone.
+			default:
 				c.onPeerEOF()
 			}
 			return
@@ -231,7 +258,7 @@ func (l *Loop) onWritable(c *Conn) {
 	_ = l.poller.DisableWrite(c.fd)
 	st, _ := c.clearState(stWriteArmed)
 	if st&stDraining != 0 {
-		c.abort(nil) // the local Close finished draining
+		c.drained() // the local Close finished flushing
 		return
 	}
 	if c.hasPendingOutput() { // a writer queued after flush saw the interest still armed

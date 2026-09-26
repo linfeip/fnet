@@ -24,7 +24,7 @@ func TestHTTPParseAndRespond(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	w := newResponseWriter(&bufferConn{buf: &out}, nil, nil)
+	w := newResponseWriter(&httpHandler{}, &bufferConn{buf: &out}, nil, nil)
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, "ok")
@@ -131,7 +131,7 @@ func TestServerHTTPS(t *testing.T) {
 func TestResponseWriterChunked(t *testing.T) {
 	var buf bytes.Buffer
 	rw := &bufferConn{buf: &buf}
-	w := newResponseWriter(rw, nil, nil)
+	w := newResponseWriter(&httpHandler{}, rw, nil, nil)
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = w.Write([]byte("hi"))
@@ -337,7 +337,7 @@ func TestServerCustomWorkerPoolPanicRecoveryAndGracefulClose(t *testing.T) {
 	srv := &Server{
 		Addr:    addr,
 		Handler: mux,
-		WorkerPool: func(connID uint64, task func()) {
+		WorkerPool: func(connID uint64, task func()) error {
 			panic("simulated custom pool rejection/panic")
 		},
 	}

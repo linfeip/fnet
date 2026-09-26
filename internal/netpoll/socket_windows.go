@@ -30,18 +30,19 @@ type sock struct {
 	ln   net.Listener
 	conn net.Conn
 
-	mu       sync.Mutex
-	cond     sync.Cond // the read pump waits here while rbuf is full
-	poller   *winPoller
-	closed   bool
-	eof      bool // the read pump hit EOF or an error
-	writeOn  bool // write readiness requested
-	acceptQ  []net.Conn
-	rbuf     []byte
-	wbuf     []byte // accepted by Write, not yet handed to the write pump
-	inflight int    // bytes the write pump is sending
-	writing  bool   // a write pump is running
-	werr     error  // the write pump failed
+	mu        sync.Mutex
+	cond      sync.Cond // the read pump waits here while rbuf is full
+	poller    *winPoller
+	closed    bool
+	eof       bool // the read pump hit EOF or an error
+	writeOn   bool // write readiness requested
+	acceptQ   []net.Conn
+	rbuf      []byte
+	wbuf      []byte // accepted by Write, not yet handed to the write pump
+	inflight  int    // bytes the write pump is sending
+	writing   bool   // a write pump is running
+	shutWrite bool   // CloseWrite was called: half-close once wbuf is sent
+	werr      error  // the write pump failed
 
 	queued bool // guarded by poller.mu: already on poller.ready
 }
@@ -248,17 +249,21 @@ func Writev(fd int, iovs [][]byte) (int, error) {
 	return total, nil
 }
 
-// writePump sends the send buffer, then closes the connection if Close was
-// called meanwhile (so a response written just before Close still arrives).
+// writePump sends the send buffer, then half-closes or closes the connection
+// if CloseWrite or Close was called meanwhile (so a response written just
+// before still arrives).
 func (s *sock) writePump() {
 	for {
 		s.mu.Lock()
 		if len(s.wbuf) == 0 || s.werr != nil {
 			s.writing = false
-			closed := s.closed
+			closed, shutWrite := s.closed, s.shutWrite
 			s.mu.Unlock()
-			if closed {
+			switch {
+			case closed:
 				_ = s.conn.Close()
+			case shutWrite:
+				s.closeWrite()
 			}
 			return
 		}
@@ -304,6 +309,42 @@ func SetKeepAlive(fd int, ka KeepAlive) error {
 		return tc.SetKeepAlivePeriod(ka.Idle)
 	}
 	return nil
+}
+
+// CloseWrite half-closes the connection once the send buffer is flushed.
+func CloseWrite(fd int) error {
+	s := lookup(fd)
+	if s == nil || s.conn == nil {
+		return net.ErrClosed
+	}
+	s.mu.Lock()
+	s.shutWrite = true
+	flushing := s.writing // the write pump half-closes once it is done
+	s.mu.Unlock()
+	if !flushing {
+		s.closeWrite()
+	}
+	return nil
+}
+
+func (s *sock) closeWrite() {
+	if tc, ok := s.conn.(*net.TCPConn); ok {
+		_ = tc.CloseWrite()
+	}
+}
+
+// LocalAddr returns the local address of the connection fd.
+func LocalAddr(fd int) (netip.AddrPort, error) {
+	s := lookup(fd)
+	if s == nil || s.conn == nil {
+		return netip.AddrPort{}, net.ErrClosed
+	}
+	ta, ok := s.conn.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		return netip.AddrPort{}, nil
+	}
+	ap := ta.AddrPort()
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), nil
 }
 
 // Close closes the socket and releases its id.

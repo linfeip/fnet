@@ -18,7 +18,7 @@ type ListenFunc func(network, addr string) (net.Listener, error)
 // Listen opens a TCP listener for addr, then for each of addrs; an empty addr
 // is only used when addrs is empty (it means ":0"-style defaults, like
 // net.Listen). listen, when non-nil, creates the listeners (e.g. for socket
-// activation); by default they get SO_REUSEADDR and SO_REUSEPORT. On error the
+// activation); by default they are opened like net.Listen. On error the
 // listeners opened so far are closed.
 func Listen(addr string, addrs []string, listen ListenFunc) ([]Listener, error) {
 	if addr != "" || len(addrs) == 0 {

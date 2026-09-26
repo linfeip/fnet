@@ -142,7 +142,6 @@ func TestHTTPWorkerPool_KeepAliveIdleZeroGoroutines(t *testing.T) {
 
 	shortIdleTimeout := 100 * time.Millisecond
 	testPool := pool.New(pool.Config{
-		Shards:      8,
 		IdleTimeout: shortIdleTimeout,
 	})
 	defer testPool.Close()
@@ -263,9 +262,10 @@ func TestHTTPWorkerPool_CustomPool(t *testing.T) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	var customPoolDispatched atomic.Int64
-	customPool := func(connID uint64, task func()) {
+	customPool := func(connID uint64, task func()) error {
 		customPoolDispatched.Add(1)
 		go task()
+		return nil
 	}
 
 	mux := http.NewServeMux()
@@ -342,10 +342,8 @@ func TestHTTPWorkerPool_PanicRecovery(t *testing.T) {
 func TestWorkerPool_ServerAndUpgraderCustomPool(t *testing.T) {
 	// Test passing custom *WorkerPool directly via Server.WorkerPool (SubmitConn)
 	customPool := pool.New(pool.Config{
-		Shards:             4,
-		MaxWorkersPerShard: 8,
-		QueueSizePerShard:  64,
-		IdleTimeout:        time.Second,
+		MaxWorkers:  32,
+		IdleTimeout: time.Second,
 	})
 	defer customPool.Close()
 

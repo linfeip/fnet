@@ -19,9 +19,15 @@ const (
 	wheelMask  = wheelSlots - 1
 )
 
-// drainStall is how long a closing connection may go without the peer taking
-// any queued output before it is dropped. A variable only so tests can shorten it.
-var drainStall = 30 * time.Second
+// Variables only so tests can shorten them.
+var (
+	// drainStall is how long a closing connection, or a blocking writer, may
+	// go without the peer taking any queued output before it gives up.
+	drainStall = 30 * time.Second
+	// lingerTimeout is how long a closed connection whose output is delivered
+	// waits for the peer to finish sending (see Conn.drained).
+	lingerTimeout = 500 * time.Millisecond
+)
 
 type wheel struct {
 	mu    sync.Mutex

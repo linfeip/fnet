@@ -13,7 +13,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"sync/atomic"
+	"strings"
 
 	"github.com/gobwas/httphead"
 	"github.com/gobwas/ws"
@@ -34,6 +34,21 @@ const (
 
 // OpCode is a frame opcode.
 type OpCode = ws.OpCode
+
+// StatusCode is a close status (RFC 6455 7.4).
+type StatusCode = ws.StatusCode
+
+// Close statuses, re-exported from gobwas/ws.
+const (
+	StatusNormalClosure           = ws.StatusNormalClosure
+	StatusGoingAway               = ws.StatusGoingAway
+	StatusProtocolError           = ws.StatusProtocolError
+	StatusUnsupportedData         = ws.StatusUnsupportedData
+	StatusInvalidFramePayloadData = ws.StatusInvalidFramePayloadData
+	StatusPolicyViolation         = ws.StatusPolicyViolation
+	StatusMessageTooBig           = ws.StatusMessageTooBig
+	StatusInternalServerError     = ws.StatusInternalServerError
+)
 
 const (
 	// DefaultMaxDecompressedMessageSize (16 MiB) guards against deflate bombs.
@@ -78,15 +93,19 @@ type Upgrader struct {
 	// until they drain to a quarter of it: 0 means 64 KiB, negative disables.
 	MaxPendingMessageBytes int64
 
-	// WorkerPool runs OnMessage, keyed by connection (e.g. p.SubmitConn for a
-	// *pool.Pool p, or pool.Adapt(ants.Submit)). It is called on an event loop
-	// and must not block. Defaults to pool.Default().
-	WorkerPool func(connID uint64, task func())
+	// WorkerPool runs OnMessage (e.g. p.SubmitConn for a *pool.Pool p, or
+	// pool.Adapt(ants.Submit)). It is called on an event loop and must not
+	// block; an error refuses the task and closes that connection. Defaults
+	// to pool.Default().
+	WorkerPool func(connID uint64, task func()) error
 
 	// Setting OnMessage makes Upgrade event-driven; see EventHandler.
 	OnOpen    func(c *Conn)
 	OnMessage func(c *Conn, op OpCode, payload []byte)
 	OnClose   func(c *Conn, err error)
+	// OnPong, if set, receives the Pong frames, in both modes; see
+	// EventHandler.
+	OnPong func(c *Conn, data []byte)
 }
 
 // EventHandler holds the callbacks of an event-driven connection.
@@ -97,12 +116,16 @@ type Upgrader struct {
 //     payload is only valid during the call; copy what must outlive it.
 //   - OnClose runs once, on the worker pool, after the messages that arrived
 //     before the close.
+//   - OnPong, if set, runs on the worker pool for each Pong frame, in order
+//     with the messages: with a server-side Ping and SetReadDeadline it tells
+//     live peers from vanished ones.
 //
 // A panic in OnMessage closes the connection with status 1011.
 type EventHandler struct {
 	OnOpen    func(c *Conn)
 	OnMessage func(c *Conn, op OpCode, payload []byte)
 	OnClose   func(c *Conn, err error)
+	OnPong    func(c *Conn, data []byte)
 }
 
 // DefaultUpgrader is an Upgrader with default settings.
@@ -122,12 +145,10 @@ func UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventHandler) (*Conn
 // event-driven; otherwise the returned Conn is read with ReadMessage.
 func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 	if u.OnMessage != nil {
-		return u.UpgradeEvent(w, r, EventHandler{OnOpen: u.OnOpen, OnMessage: u.OnMessage, OnClose: u.OnClose})
+		return u.UpgradeEvent(w, r, EventHandler{OnOpen: u.OnOpen, OnMessage: u.OnMessage, OnClose: u.OnClose, OnPong: u.OnPong})
 	}
 	return u.handshake(w, r)
 }
-
-var nextConnID atomic.Uint64
 
 // UpgradeEvent upgrades the request and drives the connection with h. On an
 // fhttp server the connection moves onto the event loop and the HTTP handler
@@ -139,6 +160,7 @@ func (u *Upgrader) UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventH
 	if err != nil {
 		return nil, err
 	}
+	c.onPong = h.OnPong
 	maxPending := u.MaxPendingMessageBytes
 	if maxPending == 0 {
 		maxPending = DefaultMaxPendingMessageBytes
@@ -147,7 +169,6 @@ func (u *Upgrader) UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventH
 		c:          c,
 		handler:    h,
 		submit:     u.WorkerPool,
-		id:         nextConnID.Add(1),
 		maxPending: maxPending,
 		lowPending: maxPending / 4,
 	}
@@ -175,6 +196,9 @@ func (u *Upgrader) handshake(w http.ResponseWriter, r *http.Request) (*Conn, err
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return nil, errors.New("fnet/websocket: origin not allowed")
 	}
+	if err := checkUpgrade(w, r); err != nil {
+		return nil, err
+	}
 	up := ws.HTTPUpgrader{Header: u.Header}
 	if len(u.Subprotocols) > 0 {
 		up.Protocol = func(proto string) bool {
@@ -198,6 +222,12 @@ func (u *Upgrader) handshake(w http.ResponseWriter, r *http.Request) (*Conn, err
 	}
 	nc, brw, hs, err := up.Upgrade(r, w)
 	if err != nil {
+		if nc != nil {
+			// The upgrader hijacked the connection before failing (a bad
+			// subprotocol or extension offer) and answered: the connection is
+			// ours to close.
+			_ = nc.Close()
+		}
 		return nil, err
 	}
 
@@ -213,6 +243,7 @@ func (u *Upgrader) handshake(w http.ResponseWriter, r *http.Request) (*Conn, err
 		compressThreshold: orDefault(u.CompressionThreshold, DefaultCompressionThreshold),
 		maxDecompressSize: orDefault(u.MaxDecompressedMessageSize, DefaultMaxDecompressedMessageSize),
 		maxMessageSize:    orDefault(u.MaxMessageSize, DefaultMaxMessageSize),
+		onPong:            u.OnPong,
 	}
 	if u.EnableCompression {
 		_, c.compressed = ext.Accepted()
@@ -225,4 +256,49 @@ func orDefault[T int | int64](v, def T) T {
 		return def
 	}
 	return v
+}
+
+// checkUpgrade refuses, with a plain HTTP error, a request that is not a
+// WebSocket handshake (RFC 6455 4.2.1): the checks the upgrader makes only
+// after hijacking the connection, which would leave a refused connection
+// hijacked and open.
+func checkUpgrade(w http.ResponseWriter, r *http.Request) error {
+	var err error
+	switch v := r.Header.Get("Sec-WebSocket-Version"); {
+	case r.Method != http.MethodGet:
+		err = ws.ErrHandshakeBadMethod
+	case !r.ProtoAtLeast(1, 1):
+		err = ws.ErrHandshakeBadProtocol
+	case r.Host == "":
+		err = ws.ErrHandshakeBadHost
+	case !strings.EqualFold(r.Header.Get("Upgrade"), "websocket"):
+		err = ws.ErrHandshakeBadUpgrade
+	case !hasToken(r.Header.Get("Connection"), "upgrade"):
+		err = ws.ErrHandshakeBadConnection
+	case len(r.Header.Get("Sec-WebSocket-Key")) != 24:
+		err = ws.ErrHandshakeBadSecKey
+	case v == "":
+		err = ws.ErrHandshakeBadSecVersion
+	case v != "13":
+		w.Header().Set("Sec-WebSocket-Version", "13")
+		err = ws.ErrHandshakeUpgradeRequired
+	default:
+		return nil
+	}
+	code := http.StatusBadRequest
+	if rej, ok := err.(*ws.ConnectionRejectedError); ok {
+		code = rej.StatusCode()
+	}
+	http.Error(w, err.Error(), code)
+	return err
+}
+
+// hasToken reports whether the comma-separated list v holds token, in any case.
+func hasToken(v, token string) bool {
+	for t := range strings.SplitSeq(v, ",") {
+		if strings.EqualFold(strings.TrimSpace(t), token) {
+			return true
+		}
+	}
+	return false
 }

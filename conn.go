@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,26 +52,17 @@ const (
 
 // message is one complete message waiting for OnMessage.
 type message struct {
-	buf *bufpool.Buffer // owns the bytes; nil for an empty message
-	n   int
+	data []byte
+	buf  *bufpool.Buffer // holds data; nil for an empty message
 }
 
 var emptyMessage = []byte{}
 
 func (m *message) bytes() []byte {
-	if m.buf == nil {
+	if m.data == nil {
 		return emptyMessage
 	}
-	return m.buf.B[:m.n]
-}
-
-func newMessage(tok []byte) message {
-	if len(tok) == 0 {
-		return message{}
-	}
-	b := bufpool.Get(len(tok))
-	copy(b.B, tok)
-	return message{buf: b, n: len(tok)}
+	return m.data
 }
 
 func release(ms []message) {
@@ -112,7 +104,9 @@ func newConn(rc *reactor.Conn, h *handler) *Conn {
 // another's. With more than MaxOutboundBytes queued because the peer is not
 // reading, Write fails with ErrWriteBufferFull; a write into an empty queue is
 // always taken whole, so a message is never cut short on the wire. After
-// Close it fails with net.ErrClosed.
+// Close it fails with net.ErrClosed. While the connection handles a burst of
+// messages its output is held, for a millisecond at most, so that the replies
+// leave in one system call.
 func (c *Conn) Write(b []byte) (int, error) { return c.raw.Write(b) }
 
 // Writev sends bufs as one unit, e.g. a header and a payload, with a single
@@ -157,7 +151,9 @@ func (c *Conn) OnData(_ *reactor.Conn, data []byte) int {
 		return len(data)
 	}
 	var buf [batchSize]message
-	batch, off, final, err := c.cut(data, false, buf[:0])
+	var a bufpool.Arena
+	batch, off, final, err := c.cut(data, false, buf[:0], &a)
+	a.Release()
 	if err == nil && len(data)-off > c.h.maxMessage {
 		err = ErrMessageTooLarge // a partial message already beyond the limit
 	}
@@ -185,7 +181,9 @@ func (c *Conn) OnEOF(_ *reactor.Conn, rest []byte) {
 	}
 	c.dead = true
 	var buf [batchSize]message
-	batch, off, _, err := c.cut(rest, true, buf[:0])
+	var a bufpool.Arena
+	batch, off, _, err := c.cut(rest, true, buf[:0], &a)
+	a.Release()
 	if err != nil {
 		release(batch)
 		c.closeWith(err)
@@ -205,14 +203,24 @@ func (c *Conn) OnClose(_ *reactor.Conn, err error) {
 	if errors.Is(err, net.ErrClosed) && c.h.stopping.Load() {
 		err = ErrServerClosed
 	}
+	// A timeout or the server's Close is a close from this side: the messages
+	// not handled yet are dropped. After the peer's close they still run.
+	local := err == ErrServerClosed || errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded)
 	c.mu.Lock()
 	c.recordLocked(err)
 	c.state |= csClosed
+	var dropped []message
+	if local && c.state&csClosing == 0 {
+		c.state |= csClosing
+		c.quit.Store(true)
+		dropped = c.dropLocked()
+	}
 	idle := c.state&csRunning == 0
 	if idle {
 		c.state |= csRunning // stays set: nothing is scheduled after OnClose
 	}
 	c.mu.Unlock()
+	release(dropped)
 	switch {
 	case !idle: // the running drain gets to OnClose after the queue
 	case c.h.onClose == nil:
@@ -223,10 +231,11 @@ func (c *Conn) OnClose(_ *reactor.Conn, err error) {
 }
 
 // cut runs Split over data and appends a copy of each message it yields to
-// batch. It returns the batch, how much was consumed, whether Split ended the
-// input with bufio.ErrFinalToken, and why the connection must close, if it
-// must. A panic in Split closes only this connection.
-func (c *Conn) cut(data []byte, atEOF bool, into []message) (batch []message, off int, final bool, err error) {
+// batch, the copies sharing the arena's buffers. It returns the batch, how much
+// was consumed, whether Split ended the input with bufio.ErrFinalToken, and why
+// the connection must close, if it must. A panic in Split closes only this
+// connection.
+func (c *Conn) cut(data []byte, atEOF bool, into []message, a *bufpool.Arena) (batch []message, off int, final bool, err error) {
 	batch = into
 	defer func() {
 		if r := recover(); r != nil {
@@ -247,7 +256,11 @@ func (c *Conn) cut(data []byte, atEOF bool, into []message) (batch []message, of
 			if len(tok) > c.h.maxMessage {
 				return batch, off, false, ErrMessageTooLarge
 			}
-			batch = append(batch, newMessage(tok))
+			var m message
+			if len(tok) > 0 {
+				m.data, m.buf = a.Copy(tok, len(tok)+len(data)-off)
+			}
+			batch = append(batch, m)
 		}
 		switch {
 		case serr != nil:
@@ -272,7 +285,7 @@ func (c *Conn) cut(data []byte, atEOF bool, into []message) (batch []message, of
 func (c *Conn) push(batch []message, progressed, partial, done bool, end error) bool {
 	size := 0
 	for i := range batch {
-		size += batch[i].n
+		size += len(batch[i].data)
 	}
 	now := time.Now().UnixNano()
 	c.mu.Lock()
@@ -401,16 +414,25 @@ func (c *Conn) drain() {
 	}
 }
 
-// handle runs OnMessage for a batch and returns its buffers to the pool.
+// handle runs OnMessage for a batch and returns its buffers to the pool. The
+// replies to a batch of several messages leave in one write; a slow OnMessage
+// holds them back for a millisecond at most (see reactor.Conn.Corked).
 func (c *Conn) handle(batch []message) {
 	size := 0
-	for i := range batch {
-		size += batch[i].n
-		if !c.quit.Load() {
-			c.deliver(&batch[i])
+	run := func() {
+		for i := range batch {
+			size += len(batch[i].data)
+			if !c.quit.Load() {
+				c.deliver(&batch[i])
+			}
+			bufpool.Put(batch[i].buf)
+			batch[i] = message{}
 		}
-		bufpool.Put(batch[i].buf)
-		batch[i] = message{}
+	}
+	if len(batch) > 1 {
+		c.raw.Corked(run)
+	} else {
+		run()
 	}
 	c.mu.Lock()
 	c.pending -= size
@@ -504,7 +526,7 @@ func (c *Conn) dropLocked() []message {
 	q := c.queue
 	c.queue = nil
 	for i := range q {
-		c.pending -= q[i].n
+		c.pending -= len(q[i].data)
 	}
 	return q
 }

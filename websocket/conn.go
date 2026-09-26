@@ -17,9 +17,13 @@ import (
 	"github.com/linfeip/fnet/internal/reactor"
 )
 
-// maxBatch is the largest frame coalesced into a write batch; bigger frames
-// flush the batch and go out on their own.
-const maxBatch = 64 << 10
+const (
+	// maxBatch is the largest frame coalesced into a write batch; bigger
+	// frames flush the batch and go out on their own.
+	maxBatch = 64 << 10
+	// maxHeaderSize is the largest header of a server frame, which is unmasked.
+	maxHeaderSize = 10
+)
 
 var errEventDriven = errors.New("fnet/websocket: messages of an event-driven connection are delivered to OnMessage")
 
@@ -38,11 +42,12 @@ type Conn struct {
 	compressThreshold int
 	maxDecompressSize int64
 	maxMessageSize    int64
+	onPong            func(c *Conn, data []byte)
 
 	wmu        sync.Mutex
-	batchDepth int
 	batch      *bufpool.Buffer
-	batchLen   int
+	batchDepth int32
+	batchLen   int32 // at most maxBatch
 }
 
 // Subprotocol returns the negotiated subprotocol, or "".
@@ -69,10 +74,23 @@ func (c *Conn) LocalAddr() net.Addr { return c.nc.LocalAddr() }
 func (c *Conn) RemoteAddr() net.Addr { return c.nc.RemoteAddr() }
 
 // SetDeadline sets the read and write deadlines.
-func (c *Conn) SetDeadline(t time.Time) error { return c.nc.SetDeadline(t) }
+func (c *Conn) SetDeadline(t time.Time) error {
+	_ = c.SetReadDeadline(t)
+	return c.SetWriteDeadline(t)
+}
 
-// SetReadDeadline sets the read deadline.
-func (c *Conn) SetReadDeadline(t time.Time) error { return c.nc.SetReadDeadline(t) }
+// SetReadDeadline sets the read deadline: a blocking ReadMessage fails once it
+// passes. On an event-driven connection, which nobody reads, the connection
+// closes at t unless the deadline is moved first (OnClose gets
+// os.ErrDeadlineExceeded): pushing it forward on each message or Pong makes a
+// liveness timeout.
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	if c.raw != nil && c.br == nil {
+		c.raw.SetCloseDeadline(t)
+		return nil
+	}
+	return c.nc.SetReadDeadline(t)
+}
 
 // SetWriteDeadline sets the write deadline.
 func (c *Conn) SetWriteDeadline(t time.Time) error { return c.nc.SetWriteDeadline(t) }
@@ -135,7 +153,7 @@ func (c *Conn) EndBatch() error {
 }
 
 func (c *Conn) flushBatchLocked() error {
-	b, n := c.batch, c.batchLen
+	b, n := c.batch, int(c.batchLen)
 	if b == nil {
 		return nil
 	}
@@ -149,10 +167,10 @@ func (c *Conn) flushBatchLocked() error {
 }
 
 func (c *Conn) writeFrameLocked(op OpCode, payload []byte, rsv1 bool) error {
-	var hdr [10]byte
+	var hdr [maxHeaderSize]byte
 	hn := putHeader(hdr[:], op, len(payload), rsv1)
 	if size := hn + len(payload); c.batchDepth > 0 && !op.IsControl() && size <= maxBatch {
-		if c.batch != nil && c.batchLen+size > len(c.batch.B) {
+		if c.batch != nil && int(c.batchLen)+size > len(c.batch.B) {
 			if err := c.flushBatchLocked(); err != nil {
 				return err
 			}
@@ -160,8 +178,8 @@ func (c *Conn) writeFrameLocked(op OpCode, payload []byte, rsv1 bool) error {
 		if c.batch == nil {
 			c.batch = bufpool.Get(maxBatch)
 		}
-		c.batchLen += copy(c.batch.B[c.batchLen:], hdr[:hn])
-		c.batchLen += copy(c.batch.B[c.batchLen:], payload)
+		c.batchLen += int32(copy(c.batch.B[c.batchLen:], hdr[:hn]))
+		c.batchLen += int32(copy(c.batch.B[c.batchLen:], payload))
 		return nil
 	}
 	if err := c.flushBatchLocked(); err != nil { // keep frames in order
@@ -170,24 +188,24 @@ func (c *Conn) writeFrameLocked(op OpCode, payload []byte, rsv1 bool) error {
 	return c.writev(hdr[:hn], payload)
 }
 
-// writev sends a frame header and payload as one unit.
+// writev sends a frame header and payload as one unit. hdr does not escape:
+// the event-driven path keeps it on the caller's stack, and the others, which
+// hand their buffers to an interface, send a copy.
 func (c *Conn) writev(hdr, payload []byte) error {
-	var err error
-	switch {
-	case c.raw != nil:
-		_, err = c.raw.Writev([][]byte{hdr, payload})
-	case len(payload) == 0:
-		_, err = c.nc.Write(hdr)
-	default:
-		if vw, ok := c.nc.(interface{ Writev([][]byte) (int, error) }); ok {
-			_, err = vw.Writev([][]byte{hdr, payload})
-			break
-		}
-		buf := bufpool.Get(len(hdr) + len(payload))
-		copy(buf.B[copy(buf.B, hdr):], payload)
-		_, err = c.nc.Write(buf.B)
-		bufpool.Put(buf)
+	if c.raw != nil {
+		_, err := c.raw.Writev([][]byte{hdr, payload})
+		return err
 	}
+	var h [maxHeaderSize]byte
+	parts := [][]byte{h[:copy(h[:], hdr)], payload}
+	if vw, ok := c.nc.(interface{ Writev([][]byte) (int, error) }); ok {
+		_, err := vw.Writev(parts)
+		return err
+	}
+	buf := bufpool.Get(len(parts[0]) + len(payload))
+	copy(buf.B[copy(buf.B, parts[0]):], payload)
+	_, err := c.nc.Write(buf.B)
+	bufpool.Put(buf)
 	return err
 }
 
@@ -254,6 +272,10 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 			switch h.OpCode {
 			case OpPing:
 				_ = c.writeControl(OpPong, payload)
+			case OpPong:
+				if c.onPong != nil {
+					c.onPong(c, payload)
+				}
 			case OpClose:
 				echo, perr := checkClosePayload(payload)
 				if perr != nil {
@@ -274,8 +296,7 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 			op, deflated = h.OpCode, c.compressed && h.Rsv1()
 		}
 		n := len(msg)
-		msg = slices.Grow(msg, int(h.Length))[:n+int(h.Length)]
-		if _, err := io.ReadFull(c.br, msg[n:]); err != nil {
+		if msg, err = readPayload(c.br, msg, int(h.Length)); err != nil {
 			return 0, nil, err
 		}
 		ws.Cipher(msg[n:], h.Mask, 0)
@@ -287,6 +308,22 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 		}
 		return op, msg, nil
 	}
+}
+
+// readPayload appends length bytes from r to msg. msg grows with what
+// arrives, not with what the frame header claims, so a peer cannot make the
+// server allocate a whole message it never sends.
+func readPayload(r io.Reader, msg []byte, length int) ([]byte, error) {
+	for length > 0 {
+		chunk := min(length, 64<<10)
+		n := len(msg)
+		msg = slices.Grow(msg, chunk)[:n+chunk]
+		if _, err := io.ReadFull(r, msg[n:]); err != nil {
+			return msg[:n], err
+		}
+		length -= chunk
+	}
+	return msg, nil
 }
 
 // decode inflates a message and validates text as UTF-8, closing the
