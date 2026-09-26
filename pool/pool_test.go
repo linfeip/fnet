@@ -219,6 +219,43 @@ func TestBurstsOfShortTasksNeedFewWorkers(t *testing.T) {
 	}
 }
 
+// Tasks that block (a database call, say) each get a worker although a shard
+// has at most maxWaking on their way at a time: every worker that takes a task
+// gets the next one moving. The second round is served by the workers the
+// first one left parked.
+func TestBlockingTasksFanOut(t *testing.T) {
+	p := New(Config{MaxWorkers: minShardWorkers, IdleTimeout: time.Minute}) // one shard
+	defer p.Close()
+	const n = 64
+	for round := range 2 {
+		var started atomic.Int32
+		all := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(n)
+		for range n {
+			_ = p.Submit(func() {
+				defer wg.Done()
+				if started.Add(1) == n {
+					close(all)
+				}
+				select { // each task waits for all of them to have started
+				case <-all:
+				case <-time.After(5 * time.Second):
+				}
+			})
+		}
+		select {
+		case <-all:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: %d of %d blocking tasks started", round, started.Load(), n)
+		}
+		wg.Wait()
+	}
+	if w := p.RunningWorkers(); w != n {
+		t.Fatalf("%d workers for %d blocking tasks", w, n)
+	}
+}
+
 // A worker about to park takes a task another shard has waiting, so a shard
 // whose workers are all busy does not hold its queue while others idle.
 func TestIdleWorkerTakesTaskFromBusyShard(t *testing.T) {
@@ -233,7 +270,7 @@ func TestIdleWorkerTakesTaskFromBusyShard(t *testing.T) {
 	ran := make(chan struct{})
 	s := &p.shards[1]
 	s.mu.Lock()
-	s.queue.push(func() { close(ran) })
+	s.queue.push(funcTask(func() { close(ran) }))
 	s.mu.Unlock()
 	var id uint64
 	for id*0x9e3779b97f4a7c15>>p.shift != 0 {
@@ -244,6 +281,37 @@ func TestIdleWorkerTakesTaskFromBusyShard(t *testing.T) {
 	case <-ran:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the task waiting in a busy shard was left there")
+	}
+}
+
+// An event loop submitting must not wait for a shard whose lock a worker
+// holds (one preempted mid-update, say): the task goes to a free shard.
+func TestSubmitPassesOverABusyShard(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
+	p := New(Config{MaxWorkers: 4 * minShardWorkers, IdleTimeout: time.Minute})
+	defer p.Close()
+	if len(p.shards) != 4 {
+		t.Fatalf("%d shards, want 4", len(p.shards))
+	}
+	busy := &p.shards[0]
+	busy.mu.Lock()
+	defer busy.mu.Unlock()
+
+	ran := make(chan struct{})
+	submitted := make(chan error, 1)
+	go func() { submitted <- p.SubmitConn(0, func() { close(ran) }) }() // id 0 hashes to shard 0
+	select {
+	case err := <-submitted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SubmitConn waited for the busy shard's lock")
+	}
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the task was not run by another shard")
 	}
 }
 
@@ -346,6 +414,36 @@ func TestDispatch(t *testing.T) {
 		t.Fatal("a refusing custom pool must be reported")
 	}
 	if Dispatch(func(uint64, func()) error { panic("broken pool") }, 4, func() {}) {
+		t.Fatal("a panicking custom pool must be reported as refusing")
+	}
+}
+
+type doneTask chan struct{}
+
+func (d doneTask) Run() { close(d) }
+
+func TestDispatchTask(t *testing.T) {
+	done := make(doneTask)
+	if !DispatchTask(nil, 1, done) {
+		t.Fatal("DispatchTask to the default pool failed")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("default pool never ran the task")
+	}
+
+	// A custom pool gets a func that runs the task.
+	done = make(doneTask)
+	if !DispatchTask(func(_ uint64, task func()) error { go task(); return nil }, 2, done) {
+		t.Fatal("custom submit refused")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the func the custom pool got did not run the task")
+	}
+	if DispatchTask(func(uint64, func()) error { panic("broken pool") }, 3, make(doneTask)) {
 		t.Fatal("a panicking custom pool must be reported as refusing")
 	}
 }

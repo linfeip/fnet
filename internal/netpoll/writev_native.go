@@ -2,10 +2,7 @@
 
 package netpoll
 
-import (
-	"syscall"
-	"unsafe"
-)
+import "syscall"
 
 // Writev writes iovs with writev(2), iovBatch buffers per call, and may return
 // a short count. The buffers are described in an array on the stack, so they
@@ -33,17 +30,4 @@ func Writev(fd int, iovs [][]byte) (int, error) {
 		}
 	}
 	return total, nil
-}
-
-func writev(fd int, vecs *syscall.Iovec, n int) (int, error) {
-	for {
-		r, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(vecs)), uintptr(n))
-		switch errno {
-		case 0:
-			return int(r), nil
-		case syscall.EINTR:
-		default:
-			return 0, errno
-		}
-	}
 }

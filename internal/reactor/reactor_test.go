@@ -136,6 +136,40 @@ func TestConnUnread(t *testing.T) {
 	}
 }
 
+// The kept input survives compaction, draining and pushing back, and an idle
+// handler-owned connection lets go of it.
+func TestConnInputKeepsItsBytes(t *testing.T) {
+	var in input
+	in.add([]byte("abcdef"))
+	if !in.consume(4) || string(in.unread()) != "ef" {
+		t.Fatalf("after consume: %q", in.unread())
+	}
+	in.add([]byte("gh")) // the consumed prefix outweighs the rest: compacted
+	if in.off != 0 || string(in.unread()) != "efgh" {
+		t.Fatalf("after compacting add: off %d %q", in.off, in.unread())
+	}
+	in.consume(1)
+	in.prepend([]byte("E"))  // fits in the consumed prefix
+	in.prepend([]byte("xy")) // does not
+	if string(in.unread()) != "xyEfgh" {
+		t.Fatalf("after prepend: %q", in.unread())
+	}
+	if in.consume(6) || len(in.unread()) != 0 {
+		t.Fatalf("drained input still holds %q", in.unread())
+	}
+
+	c := eventConn()
+	c.handler = &funcHandler{data: func(*Conn, []byte) int { return 0 }}
+	c.mu.Lock()
+	c.retainLocked([]byte("partial"))
+	c.consumeLocked(len("partial"))
+	idle := c.in == nil
+	c.mu.Unlock()
+	if !idle {
+		t.Fatal("a handler-owned connection kept its input after consuming it all")
+	}
+}
+
 func TestConnWriteBufferLimit(t *testing.T) {
 	c := eventConn()
 	chunk := make([]byte, 1<<20)

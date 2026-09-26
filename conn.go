@@ -354,7 +354,7 @@ func (c *Conn) start() {
 }
 
 func (c *Conn) schedule() {
-	if !pool.Dispatch(c.h.submit, uint64(c.raw.Fd()), c.drain) {
+	if !pool.DispatchTask(c.h.submit, uint64(c.raw.Fd()), (*drainTask)(c)) {
 		// A custom pool refused the task: shed the connection, but still run
 		// the callbacks it is owed, on a goroutine of its own.
 		c.closeWith(errPoolRejected)
@@ -362,11 +362,26 @@ func (c *Conn) schedule() {
 	}
 }
 
+// drainTask is a Conn as its own pool.Task, which runs drain: dispatching it
+// allocates nothing, and Conn itself gets no Run method.
+type drainTask Conn
+
+func (t *drainTask) Run() { (*Conn)(t).drain() }
+
 // drain runs the connection's callbacks on a worker, in order. At most one
-// drain per connection is scheduled or running (csRunning).
+// drain per connection is scheduled or running (csRunning). A handled batch is
+// settled under the same lock that takes the next one, and its emptied array
+// takes the messages that arrive while the next batch is handled. An idle
+// Conn keeps no array.
 func (c *Conn) drain() {
+	var (
+		spare   []message // the array of the batch just handled, emptied
+		handled int       // that batch's message bytes
+	)
 	for {
 		c.mu.Lock()
+		c.settleLocked(handled)
+		handled = 0
 		switch {
 		case c.state&csOpen != 0:
 			c.state &^= csOpen
@@ -375,9 +390,10 @@ func (c *Conn) drain() {
 
 		case len(c.queue) > 0 && c.state&csClosing == 0:
 			batch := c.queue
-			c.queue = nil
+			c.queue = spare
 			c.mu.Unlock()
-			c.handle(batch)
+			handled = c.handle(batch)
+			spare = batch[:0]
 
 		case c.state&csClosed != 0:
 			// Gone, and everything it is owed has run: OnClose comes last.
@@ -414,11 +430,11 @@ func (c *Conn) drain() {
 	}
 }
 
-// handle runs OnMessage for a batch and returns its buffers to the pool. The
-// replies to a batch of several messages leave in one write; a slow OnMessage
-// holds them back for a millisecond at most (see reactor.Conn.Corked).
-func (c *Conn) handle(batch []message) {
-	size := 0
+// handle runs OnMessage for a batch, returns its buffers to the pool, and
+// reports its message bytes. The replies to a batch of several messages leave
+// in one write; a slow OnMessage holds them back for a millisecond at most
+// (see reactor.Conn.Corked).
+func (c *Conn) handle(batch []message) (size int) {
 	run := func() {
 		for i := range batch {
 			size += len(batch[i].data)
@@ -434,7 +450,12 @@ func (c *Conn) handle(batch []message) {
 	} else {
 		run()
 	}
-	c.mu.Lock()
+	return size
+}
+
+// settleLocked takes a handled batch's bytes out of pending, which may resume
+// reading.
+func (c *Conn) settleLocked(size int) {
 	c.pending -= size
 	if c.state&csPaused != 0 && c.pending <= c.h.lowPending {
 		c.state &^= csPaused
@@ -444,10 +465,6 @@ func (c *Conn) handle(batch []message) {
 		c.raw.ResumeRead()
 		c.rearmLocked()
 	}
-	if c.queue == nil {
-		c.queue = batch[:0] // reused for the next batch; an idle Conn drops it
-	}
-	c.mu.Unlock()
 }
 
 func (c *Conn) deliver(m *message) {

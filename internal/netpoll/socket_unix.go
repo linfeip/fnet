@@ -91,32 +91,6 @@ func zoneName(id uint32) string {
 	return strconv.FormatUint(uint64(id), 10)
 }
 
-// Read reads from a non-blocking fd. n == 0 with a nil error means EOF.
-func Read(fd int, b []byte) (int, error) {
-	for {
-		n, err := unix.Read(fd, b)
-		if err != unix.EINTR {
-			if n < 0 {
-				n = 0
-			}
-			return n, err
-		}
-	}
-}
-
-// Write writes to a non-blocking fd and may return a short count.
-func Write(fd int, b []byte) (int, error) {
-	for {
-		n, err := unix.Write(fd, b)
-		if err != unix.EINTR {
-			if n < 0 {
-				n = 0
-			}
-			return n, err
-		}
-	}
-}
-
 // Close closes fd. Closing also removes it from any poller.
 func Close(fd int) error { return unix.Close(fd) }
 

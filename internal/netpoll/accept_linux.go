@@ -12,11 +12,12 @@ import (
 // sysAccept calls accept4 itself rather than through unix.Accept4, whose
 // Sockaddr costs an allocation per accept and, for IPv4, a getsockopt on the
 // listener (to tell L2TP sockets apart): a second system call on the path
-// that bounds how fast a burst of clients is let in.
+// that bounds how fast a burst of clients is let in. The listener is
+// non-blocking, so it is a raw call (see io_linux.go).
 func sysAccept(lnFD int) (int, netip.AddrPort, error) {
 	var rsa unix.RawSockaddrAny
 	n := uint32(unix.SizeofSockaddrAny)
-	fd, _, errno := unix.Syscall6(unix.SYS_ACCEPT4, uintptr(lnFD), uintptr(unsafe.Pointer(&rsa)),
+	fd, _, errno := unix.RawSyscall6(unix.SYS_ACCEPT4, uintptr(lnFD), uintptr(unsafe.Pointer(&rsa)),
 		uintptr(unsafe.Pointer(&n)), unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0, 0)
 	if errno != 0 {
 		return -1, netip.AddrPort{}, errno

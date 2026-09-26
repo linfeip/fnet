@@ -109,7 +109,9 @@ type Server struct {
 	// DefaultKeepAlive, negative turns probes off.
 	KeepAlive time.Duration
 
-	// NumPollers is the number of event loops. Defaults to runtime.GOMAXPROCS(0).
+	// NumPollers is the number of event loops. Defaults to a third of
+	// runtime.GOMAXPROCS(0), rounded up: the loops only read and frame, and the
+	// workers do the rest.
 	NumPollers int
 	// Listen optionally creates the listeners (e.g. for socket activation, or
 	// SO_REUSEPORT to run several servers on one port). By default they are
@@ -167,10 +169,9 @@ func (s *Server) ListenAndServe() error {
 // for every connection, with ErrServerClosed, but Close does not wait for it.
 // Close is idempotent.
 func (s *Server) Close() error {
-	if h := s.handler(); h != nil {
-		h.stopping.Store(true)
-	}
-	if eng := s.run.Stop(); eng != nil {
+	eng := s.run.Stop()
+	s.markStopping()
+	if eng != nil {
 		eng.Close()
 	}
 	return nil
@@ -186,11 +187,8 @@ func (s *Server) Close() error {
 // ListenAndServe returns ErrServerClosed as soon as Shutdown starts; wait for
 // Shutdown to return before exiting.
 func (s *Server) Shutdown(ctx context.Context) error {
-	h := s.handler()
-	if h != nil {
-		h.stopping.Store(true)
-	}
 	eng := s.run.Stop()
+	h := s.markStopping()
 	if eng == nil {
 		return nil
 	}
@@ -215,10 +213,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (s *Server) handler() *handler {
+// markStopping makes the closes that follow report ErrServerClosed, and
+// returns the handler. Called after run.Stop: ListenAndServe sets the handler
+// before it starts the engine, so once Stop has returned an engine the
+// handler is there, even if ListenAndServe was still starting when Close or
+// Shutdown began.
+func (s *Server) markStopping() *handler {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.h
+	h := s.h
+	s.mu.Unlock()
+	if h != nil {
+		h.stopping.Store(true)
+	}
+	return h
 }
 
 // handler is a Server's settings, resolved when it starts, shared by its

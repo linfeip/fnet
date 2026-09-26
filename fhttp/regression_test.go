@@ -383,3 +383,166 @@ func (s *syncBuffer) String() string {
 	defer s.mu.Unlock()
 	return s.b.String()
 }
+
+// The same with keep-alive: the connection goes back to the event loop with
+// the end of the response still queued, finds the client's EOF there, and must
+// deliver that end before closing.
+func TestHTTPHalfCloseKeepAliveLargeResponse(t *testing.T) {
+	const size = 16 << 20
+	addr := startHTTPFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(bytes.Repeat([]byte("r"), size))
+	})
+	c := dialRaw(t, addr)
+	defer c.close()
+	_, _ = io.WriteString(c.c, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	_ = c.c.(*net.TCPConn).CloseWrite()
+	_ = c.c.SetReadDeadline(time.Now().Add(20 * time.Second))
+	// A slow reader keeps the socket buffers full, so the handler returns with
+	// output still queued.
+	resp, err := http.ReadResponse(bufio.NewReader(slowReader{c.c}), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := io.Copy(io.Discard, resp.Body); err != nil || n != size {
+		t.Fatalf("body %d of %d bytes (%v)", n, size, err)
+	}
+}
+
+// A hijacked connection has no deadlines, as with net/http: the request's
+// ReadTimeout and WriteTimeout end with the request, and a WebSocket or other
+// protocol taken over from it must not inherit them.
+func TestHijackClearsDeadlines(t *testing.T) {
+	res := make(chan error, 1)
+	srv := &Server{
+		ReadTimeout:  100 * time.Millisecond,
+		WriteTimeout: 100 * time.Millisecond,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, rw, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				res <- err
+				return
+			}
+			go func() {
+				defer conn.Close()
+				time.Sleep(300 * time.Millisecond) // past both deadlines
+				line, err := rw.ReadString('\n')
+				if err == nil {
+					_, err = conn.Write([]byte(line))
+				}
+				res <- err
+			}()
+		}),
+	}
+	addr := startServer(t, srv)
+	c := dialRaw(t, addr)
+	defer c.close()
+	_, _ = io.WriteString(c.c, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	time.Sleep(200 * time.Millisecond)
+	_, _ = io.WriteString(c.c, "ping\n")
+	out := c.readAll(2 * time.Second)
+	if err := <-res; err != nil || out != "ping\n" {
+		t.Fatalf("after the deadlines the hijacked connection got %q (%v)", out, err)
+	}
+}
+
+// Shutdown lets a request in progress on an idle-then-resumed TLS session
+// finish: a session a worker is serving is not idle.
+func TestHTTPSShutdownLetsSessionRequestFinish(t *testing.T) {
+	ca := newTestCA(t)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := &Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/slow" {
+				started <- struct{}{}
+				<-release
+			}
+			_, _ = io.WriteString(w, "done")
+		}),
+		TLSConfig:   &tls.Config{Certificates: []tls.Certificate{ca.serverCert(t)}},
+		IdleTimeout: time.Minute,
+	}
+	addr := startServer(t, srv)
+	c, err := tls.Dial("tcp", addr, clientTLSConfig(ca, "localhost"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	br := bufio.NewReader(c)
+	_, _ = io.WriteString(c, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || readBody(t, resp) != "done" {
+		t.Fatalf("warm-up request: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond) // the session idles on the poller
+	_, _ = io.WriteString(c, "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
+	<-started
+
+	done := make(chan error, 1)
+	go func() { done <- srv.Shutdown(context.Background()) }()
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if resp, err = http.ReadResponse(br, nil); err != nil {
+		t.Fatalf("the request in progress lost its response: %v", err)
+	}
+	if !resp.Close || readBody(t, resp) != "done" {
+		t.Fatal("the request in progress did not finish with Connection: close")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not return after the last request")
+	}
+}
+
+// The framing a handler sets is made consistent as net/http makes it: only
+// chunked marks where a body ends, so without a Content-Length another coding
+// (identity, once recommended for event streams) is delimited by closing the
+// connection; a body-less status carries no framing headers.
+func TestHTTPHandlerFramingIsConsistent(t *testing.T) {
+	addr := startHTTPFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/identity":
+			w.Header().Set("Transfer-Encoding", "identity")
+			_, _ = io.WriteString(w, "hello")
+		case "/nocontent":
+			w.Header().Set("Content-Length", "5")
+			w.WriteHeader(http.StatusNoContent)
+		case "/both":
+			w.Header().Set("Transfer-Encoding", "chunked")
+			w.Header().Set("Content-Length", "5")
+			_, _ = io.WriteString(w, "hello")
+		}
+	})
+	// Keep-alive requests: a response the client cannot delimit would hang it.
+	out := rawExchange(t, addr, "GET /identity HTTP/1.1\r\nHost: x\r\n\r\n")
+	head, body, _ := strings.Cut(out, "\r\n\r\n")
+	if strings.Contains(head, "Transfer-Encoding") || !strings.Contains(head, "Connection: close") || body != "hello" {
+		t.Fatalf("identity: %q", out)
+	}
+	out = rawExchange(t, addr, "GET /nocontent HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+	if !strings.HasPrefix(out, "HTTP/1.1 204") || strings.Contains(out, "Content-Length") {
+		t.Fatalf("204: %q", out)
+	}
+	out = rawExchange(t, addr, "GET /both HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(strings.NewReader(out)), nil)
+	if err != nil || strings.Contains(out, "Content-Length") || readBody(t, resp) != "hello" {
+		t.Fatalf("chunked and a length: %q (%v)", out, err)
+	}
+}
+
+// An expectation other than 100-continue is refused with 417, as net/http
+// does (RFC 9110 10.1.1).
+func TestHTTPUnknownExpectation(t *testing.T) {
+	addr := startHTTPFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "served")
+	})
+	out := rawExchange(t, addr, "POST / HTTP/1.1\r\nHost: x\r\nExpect: 200-ok\r\nContent-Length: 1\r\n\r\nx")
+	if !strings.HasPrefix(out, "HTTP/1.1 417") || strings.Contains(out, "served") {
+		t.Fatalf("response %q", out)
+	}
+}

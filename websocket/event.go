@@ -37,24 +37,13 @@ type eventConn struct {
 	handler EventHandler
 	submit  func(connID uint64, task func()) error
 
-	maxPending int64 // queued bytes that pause reading; <= 0 disables
-	lowPending int64 // ...and the level at which reading resumes
-
 	// Event-loop state.
-	msg        *bufpool.Buffer // message being assembled across reads or frames
-	msgLen     int
-	part       ws.Header // frame whose payload is still arriving
-	partGot    int
-	dead       bool // closing: ignore further input
-	msgOp      OpCode
-	deflated   bool
-	fragmented bool // a fragmented message is open
-	streaming  bool
+	asm  *assembly // a message arriving in pieces; nil between messages
+	dead bool      // closing: ignore further input
 
 	// Shared with the worker.
 	mu       sync.Mutex
-	queue    []message
-	spare    []message
+	queue    []message // parsed, waiting for the worker; nil while idle
 	closeErr error
 	pending  int64
 	running  bool
@@ -64,13 +53,24 @@ type eventConn struct {
 	paused   bool
 }
 
+// assembly is a data message the loop is still putting together: a frame whose
+// payload spans reads, or a fragmented message. A connection has one only
+// meanwhile, so between messages it pays a pointer for it.
+type assembly struct {
+	msg        *bufpool.Buffer // the payload so far; nil while empty
+	msgLen     int
+	part       ws.Header // the frame being read
+	partGot    int       // how much of part's payload has arrived
+	op         OpCode
+	deflated   bool
+	fragmented bool // the message goes on in further frames
+	streaming  bool // part's payload is still arriving
+}
+
 var (
 	errHandlerPanic = errors.New("fnet/websocket: OnMessage panicked")
 	errPoolRejected = errors.New("fnet/websocket: the worker pool rejected the connection")
 )
-
-// idleQueueCap is the largest queue array an idle connection keeps.
-const idleQueueCap = 8
 
 // ---------------------------------------------------------------------------
 // Event loop side (reactor.Handler)
@@ -98,8 +98,8 @@ func (e *eventConn) OnData(_ *reactor.Conn, data []byte) int {
 // incomplete header is left for the next read.
 func (e *eventConn) parse(data []byte, msgs []message, a *bufpool.Arena) (int, []message) {
 	off := 0
-	if e.streaming {
-		if off, msgs = e.fill(data, msgs); e.streaming {
+	if e.streaming() {
+		if off, msgs = e.fill(data, msgs); e.streaming() {
 			return off, msgs
 		}
 	}
@@ -141,27 +141,31 @@ func (e *eventConn) parse(data []byte, msgs []message, a *bufpool.Arena) (int, [
 			continue
 		}
 		if h.OpCode != OpContinuation {
-			e.msgOp, e.deflated, e.msgLen = h.OpCode, e.c.compressed && h.Rsv1(), 0
-		}
-		e.part, e.partGot, e.streaming = h, 0, true
+			e.asm = &assembly{op: h.OpCode, deflated: e.c.compressed && h.Rsv1()}
+		} // else check saw the fragmented message the frame continues
+		e.asm.part, e.asm.partGot, e.asm.streaming = h, 0, true
 		var n int
 		n, msgs = e.fill(data[start:], msgs)
-		if off = start + n; e.streaming {
+		if off = start + n; e.streaming() {
 			return off, msgs
 		}
 	}
 	return off, msgs
 }
 
+// streaming reports whether the payload of a frame is still arriving.
+func (e *eventConn) streaming() bool { return e.asm != nil && e.asm.streaming }
+
 func (e *eventConn) check(h ws.Header) *protocolError {
-	if perr := checkHeader(h, e.c.compressed, e.fragmented); perr != nil || h.OpCode.IsControl() {
+	fragmented := e.asm != nil && e.asm.fragmented
+	if perr := checkHeader(h, e.c.compressed, fragmented); perr != nil || h.OpCode.IsControl() {
 		return perr
 	}
 	have := 0
 	if h.OpCode == OpContinuation {
-		have = e.msgLen
+		have = e.asm.msgLen
 	}
-	return checkSize(h, have, e.c.maxMessageSize)
+	return checkSize(h, have, e.c.limits.maxMessageSize)
 }
 
 // fill copies the next bytes of the current frame's payload into the message
@@ -169,31 +173,32 @@ func (e *eventConn) check(h ws.Header) *protocolError {
 // complete. The buffer grows with what actually arrived, never with what a
 // header merely claims.
 func (e *eventConn) fill(data []byte, msgs []message) (int, []message) {
-	n := min(len(data), int(e.part.Length)-e.partGot)
+	asm := e.asm
+	n := min(len(data), int(asm.part.Length)-asm.partGot)
 	if n > 0 {
-		if need := e.msgLen + n; e.msg == nil || need > cap(e.msg.B) {
+		if need := asm.msgLen + n; asm.msg == nil || need > cap(asm.msg.B) {
 			nb := bufpool.Get(need)
-			if e.msg != nil {
-				copy(nb.B, e.msg.B[:e.msgLen])
-				bufpool.Put(e.msg)
+			if asm.msg != nil {
+				copy(nb.B, asm.msg.B[:asm.msgLen])
+				bufpool.Put(asm.msg)
 			}
-			e.msg = nb
+			asm.msg = nb
 		}
-		dst := e.msg.B[e.msgLen : e.msgLen+n : cap(e.msg.B)]
+		dst := asm.msg.B[asm.msgLen : asm.msgLen+n : cap(asm.msg.B)]
 		copy(dst, data[:n])
-		ws.Cipher(dst, e.part.Mask, e.partGot)
-		e.msgLen += n
-		e.partGot += n
+		ws.Cipher(dst, asm.part.Mask, asm.partGot)
+		asm.msgLen += n
+		asm.partGot += n
 	}
-	if e.partGot == int(e.part.Length) {
-		e.streaming = false
-		if e.fragmented = !e.part.Fin; !e.fragmented {
-			m := message{op: e.msgOp, deflated: e.deflated, buf: e.msg}
-			if e.msg != nil {
-				m.data = e.msg.B[:e.msgLen]
+	if asm.partGot == int(asm.part.Length) {
+		asm.streaming = false
+		if asm.fragmented = !asm.part.Fin; !asm.fragmented {
+			m := message{op: asm.op, deflated: asm.deflated, buf: asm.msg}
+			if asm.msg != nil {
+				m.data = asm.msg.B[:asm.msgLen]
 			}
 			msgs = append(msgs, m)
-			e.msg, e.msgLen = nil, 0
+			e.asm = nil
 		}
 	}
 	return n, msgs
@@ -250,7 +255,7 @@ func (e *eventConn) flush(msgs []message) {
 	}
 	e.queue = append(e.queue, msgs...)
 	e.pending += size
-	if e.maxPending > 0 && e.pending > e.maxPending && !e.paused {
+	if limit := e.c.limits.maxPending; limit > 0 && e.pending > limit && !e.paused {
 		// Under the lock, so a worker that drains the queue at once cannot
 		// resume before the pause lands and leave the connection unread.
 		e.paused = true
@@ -269,8 +274,10 @@ func (e *eventConn) flush(msgs []message) {
 func (e *eventConn) OnClose(_ *reactor.Conn, err error) {
 	e.dead = true
 	e.c.closed.Store(true)
-	bufpool.Put(e.msg)
-	e.msg, e.streaming = nil, false
+	if e.asm != nil {
+		bufpool.Put(e.asm.msg)
+		e.asm = nil
+	}
 	e.mu.Lock()
 	e.closed = true
 	if e.closeErr == nil {
@@ -289,7 +296,7 @@ func (e *eventConn) OnClose(_ *reactor.Conn, err error) {
 // ---------------------------------------------------------------------------
 
 func (e *eventConn) schedule() {
-	if pool.Dispatch(e.submit, uint64(e.c.raw.Fd()), e.run) {
+	if pool.DispatchTask(e.submit, uint64(e.c.raw.Fd()), e) {
 		return
 	}
 	// A custom pool refused the task: shed the connection and the messages it
@@ -301,65 +308,72 @@ func (e *eventConn) schedule() {
 	}
 	e.mu.Unlock()
 	_ = e.c.nc.Close()
-	go e.run()
+	go e.Run()
 }
 
-// run drains the queue on a worker; at most one run is active per connection.
-func (e *eventConn) run() {
+// Run drains the queue on a worker (eventConn is its own pool.Task); at most
+// one Run is active per connection.
+// A handled batch is settled under the same lock that takes the next one: its
+// bytes leave pending, and its emptied array takes the messages that arrive
+// while the next batch is handled. An idle connection keeps no array.
+func (e *eventConn) Run() {
+	var (
+		spare   []message // the array of the batch just handled, emptied
+		handled int64     // that batch's payload bytes
+	)
 	for {
 		e.mu.Lock()
+		e.pending -= handled
+		if e.paused && e.pending <= e.c.limits.lowPending {
+			e.paused = false
+			e.c.raw.ResumeRead()
+		}
 		if len(e.queue) == 0 {
 			e.running = false
-			e.spare = nil // an idle connection keeps no burst-sized arrays
-			if cap(e.queue) > idleQueueCap {
-				e.queue = nil
-			}
+			e.queue = nil
 			notify := e.closed && !e.notified
 			e.notified = e.notified || notify
 			err := e.closeErr
 			e.mu.Unlock()
-			if notify && e.handler.OnClose != nil {
-				e.handler.OnClose(e.c, err)
+			if notify {
+				e.callClose(err)
 			}
 			return
 		}
 		batch := e.queue
-		e.queue, e.spare = e.spare[:0], batch
+		e.queue = spare
 		failed := e.failed
 		e.mu.Unlock()
-
-		var size int64
-		handle := func() {
-			for i := range batch {
-				size += int64(len(batch[i].data))
-				if !failed {
-					if err := e.deliver(&batch[i]); err != nil {
-						failed = true
-						e.mu.Lock()
-						e.failed, e.closeErr = true, err
-						e.mu.Unlock()
-					}
-				}
-				bufpool.Put(batch[i].buf)
-				batch[i] = message{}
-			}
-		}
-		if len(batch) > 1 {
-			// The replies to a burst leave in one write; a slow handler
-			// holds them back for a millisecond at most (see Corked).
-			e.c.raw.Corked(handle)
-		} else {
-			handle()
-		}
-
-		e.mu.Lock()
-		e.pending -= size
-		if e.paused && e.pending <= e.lowPending {
-			e.paused = false
-			e.c.raw.ResumeRead()
-		}
-		e.mu.Unlock()
+		handled = e.handle(batch, failed)
+		spare = batch[:0]
 	}
+}
+
+// handle delivers a batch in order, returns its buffers to the pool, and
+// reports its payload bytes. The replies to a burst leave in one write; a slow
+// handler holds them back for a millisecond at most (see Corked).
+func (e *eventConn) handle(batch []message, failed bool) (size int64) {
+	run := func() {
+		for i := range batch {
+			size += int64(len(batch[i].data))
+			if !failed {
+				if err := e.deliver(&batch[i]); err != nil {
+					failed = true
+					e.mu.Lock()
+					e.failed, e.closeErr = true, err
+					e.mu.Unlock()
+				}
+			}
+			bufpool.Put(batch[i].buf)
+			batch[i] = message{}
+		}
+	}
+	if len(batch) > 1 {
+		e.c.raw.Corked(run)
+	} else {
+		run()
+	}
+	return size
 }
 
 // deliver decodes one message and calls OnMessage. A decode failure or a
@@ -410,7 +424,20 @@ func (e *eventConn) serveBlocking() {
 		return nil
 	})
 	_ = e.c.Close()
-	if e.handler.OnClose != nil {
-		e.handler.OnClose(e.c, err)
+	e.callClose(err)
+}
+
+// callClose runs OnClose. A panic in it is logged, like one in OnMessage, and
+// goes no further: the connection is gone already, and the goroutine may be
+// one of its own (serveBlocking), where nothing else would recover it.
+func (e *eventConn) callClose(err error) {
+	if e.handler.OnClose == nil {
+		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("fnet/websocket: panic in OnClose for %s: %v\n%s", e.c.RemoteAddr(), r, debug.Stack())
+		}
+	}()
+	e.handler.OnClose(e.c, err)
 }

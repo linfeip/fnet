@@ -80,7 +80,19 @@ type EOFHandler interface {
 // Output written from any goroutine goes straight to the socket and is only
 // queued, then flushed by the loop, when the kernel buffer is full. Conn
 // implements net.Conn.
+//
+// The inbound side comes first and the outbound side last: mu, which the loop
+// takes for every read, and wmu, which a worker takes for every write, then
+// never share a cache line, in one Conn or between neighbours.
 type Conn struct {
+	// Inbound side.
+	mu       sync.Mutex
+	handler  Handler
+	peerEOF  bool   // the peer finished sending
+	eofDone  bool   // an EOFHandler was told about peerEOF
+	in       *input // input kept between reads; nil when there is none
+	closeErr error  // why the connection closed: passed to OnClose, returned by Read
+
 	fd    int
 	loop  *Loop
 	ln    *Listener
@@ -94,16 +106,6 @@ type Conn struct {
 
 	// blocking is set while a blocking reader owns the input.
 	blocking atomic.Pointer[blocking]
-
-	// Inbound side.
-	mu       sync.Mutex
-	handler  Handler
-	peerEOF  bool // the peer finished sending
-	eofDone  bool // an EOFHandler was told about peerEOF
-	in       []byte
-	inOff    int
-	inSince  int64 // unix nanos when the retained input started to accumulate
-	closeErr error // why the connection closed: passed to OnClose, returned by Read
 
 	// Outbound side. wmu also serialises direct socket writes.
 	wmu        sync.Mutex
@@ -123,6 +125,57 @@ type blocking struct {
 	rdeadline int64     // guarded by mu
 	onEnd     func()    // guarded by mu; see NotifyInputEnd
 	writing   bool      // guarded by wmu: a write is in progress
+}
+
+// input is the inbound bytes a connection keeps between reads: what its
+// handler left unconsumed, a partial message say, or what a blocking reader
+// has not read yet. A connection has one only while it keeps such bytes, or
+// while a blocking reader, which will want the space again, owns the input:
+// an idle connection pays a pointer for it.
+type input struct {
+	b     []byte
+	off   int   // b[off:] is not consumed yet
+	since int64 // unix nanos when the oldest byte not consumed arrived
+}
+
+func (in *input) unread() []byte { return in.b[in.off:] }
+
+// add appends p, first moving what is left to the front when the consumed
+// prefix is large or larger than what is left.
+func (in *input) add(p []byte) {
+	if unread := len(in.b) - in.off; in.off > 0 && (in.off > compactAfter || in.off >= unread) {
+		copy(in.b, in.b[in.off:])
+		in.b, in.off = in.b[:unread], 0
+	}
+	in.b = append(in.b, p...)
+}
+
+// consume drops the first n bytes not consumed yet and reports whether any
+// are left.
+func (in *input) consume(n int) bool {
+	in.off += n
+	unread := len(in.b) - in.off
+	if unread <= 0 {
+		in.b, in.off = in.b[:0], 0
+		return false
+	}
+	if in.off > compactAfter && in.off >= unread {
+		copy(in.b, in.b[in.off:])
+		in.b, in.off = in.b[:unread], 0
+	}
+	return true
+}
+
+// prepend puts p back in front of the bytes not consumed yet.
+func (in *input) prepend(p []byte) {
+	if in.off >= len(p) {
+		in.off -= len(p)
+		copy(in.b[in.off:], p)
+		return
+	}
+	b := make([]byte, 0, len(p)+len(in.b)-in.off)
+	b = append(b, p...)
+	in.b, in.off = append(b, in.unread()...), 0
 }
 
 func newConn(fd int, l *Loop, ln *Listener, raddr netip.AddrPort, h Handler) *Conn {
@@ -188,12 +241,12 @@ func (c *Conn) Attach(h Handler) {
 	if b != nil {
 		b.onEnd = nil
 	}
-	if c.inOff == len(c.in) {
-		c.in, c.inOff = nil, 0 // idle connections keep no input buffer
+	if len(c.unreadLocked()) == 0 {
+		c.in = nil // idle connections keep no input buffer
 	} else {
-		c.inSince = time.Now().UnixNano() // the handler's clock starts now
+		c.in.since = time.Now().UnixNano() // the handler's clock starts now
 	}
-	resume := len(c.in) > 0 || c.peerEOF
+	resume := c.in != nil || c.peerEOF
 	c.mu.Unlock()
 	if b != nil {
 		c.wmu.Lock()
@@ -263,15 +316,10 @@ func (c *Conn) Unread(b []byte) {
 		return
 	}
 	c.mu.Lock()
-	if c.inOff >= len(b) {
-		c.inOff -= len(b)
-		copy(c.in[c.inOff:], b)
-	} else {
-		in := make([]byte, 0, len(b)+len(c.in)-c.inOff)
-		in = append(in, b...)
-		c.in = append(in, c.in[c.inOff:]...)
-		c.inOff = 0
+	if c.in == nil {
+		c.in = &input{since: time.Now().UnixNano()}
 	}
+	c.in.prepend(b)
 	c.mu.Unlock()
 }
 
@@ -296,7 +344,7 @@ func (c *Conn) setDeadline(d int64) {
 func (c *Conn) Buffered() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return len(c.in) - c.inOff
+	return len(c.unreadLocked())
 }
 
 // InputSince reports when the oldest input byte not yet consumed by the
@@ -304,8 +352,8 @@ func (c *Conn) Buffered() int {
 func (c *Conn) InputSince() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.inOff < len(c.in) {
-		return time.Unix(0, c.inSince)
+	if len(c.unreadLocked()) > 0 {
+		return time.Unix(0, c.in.since)
 	}
 	return time.Now()
 }
@@ -343,41 +391,35 @@ func (c *Conn) signalLocked() {
 	}
 }
 
-func (c *Conn) appendLocked(b []byte) {
-	if c.inOff > 0 {
-		unread := len(c.in) - c.inOff
-		if unread == 0 {
-			c.in, c.inOff = c.in[:0], 0
-		} else if c.inOff > compactAfter || c.inOff >= unread {
-			copy(c.in, c.in[c.inOff:])
-			c.in, c.inOff = c.in[:unread], 0
-		}
+// unreadLocked returns the input kept and not consumed yet, if any.
+func (c *Conn) unreadLocked() []byte {
+	if c.in == nil {
+		return nil
 	}
-	c.in = append(c.in, b...)
+	return c.in.unread()
+}
+
+func (c *Conn) appendLocked(b []byte) {
+	if c.in == nil {
+		c.in = new(input)
+	}
+	c.in.add(b)
 }
 
 // retainLocked keeps input the handler has not consumed yet.
 func (c *Conn) retainLocked(b []byte) {
-	if c.inOff == len(c.in) {
-		c.inSince = time.Now().UnixNano()
-	}
+	fresh := len(c.unreadLocked()) == 0
 	c.appendLocked(b)
+	if fresh {
+		c.in.since = time.Now().UnixNano()
+	}
 }
 
+// consumeLocked drops the first n bytes of the kept input. Once none are left
+// the input is released, but for a blocking reader's, which it will want again.
 func (c *Conn) consumeLocked(n int) {
-	c.inOff += n
-	unread := len(c.in) - c.inOff
-	if unread <= 0 {
-		if c.blocking.Load() != nil {
-			c.in, c.inOff = c.in[:0], 0 // an active reader will want the space again
-		} else {
-			c.in, c.inOff = nil, 0
-		}
-		return
-	}
-	if c.inOff > compactAfter && c.inOff >= unread {
-		copy(c.in, c.in[c.inOff:])
-		c.in, c.inOff = c.in[:unread], 0
+	if c.in != nil && !c.in.consume(n) && c.blocking.Load() == nil {
+		c.in = nil
 	}
 }
 
@@ -394,14 +436,14 @@ func (c *Conn) deliver(data []byte) {
 		c.appendLocked(data)
 		if b != nil {
 			b.readable.Broadcast()
-			if len(c.in)-c.inOff >= maxBlockingInput {
+			if len(c.unreadLocked()) >= maxBlockingInput {
 				c.setState(stPausedBuf) // the reader fell behind: let TCP push back
 			}
 		}
 		c.mu.Unlock()
 		return
 	}
-	if c.inOff < len(c.in) {
+	if len(c.unreadLocked()) > 0 {
 		c.retainLocked(data)
 		c.mu.Unlock()
 		c.offer(len(data))
@@ -427,11 +469,11 @@ func (c *Conn) deliver(data []byte) {
 func (c *Conn) offer(fresh int) {
 	c.mu.Lock()
 	h := c.handler
-	if c.blocking.Load() != nil || h == nil || c.inOff == len(c.in) || c.state.Load()&(stClosed|stDraining) != 0 {
+	view := c.unreadLocked()
+	if c.blocking.Load() != nil || h == nil || len(view) == 0 || c.state.Load()&(stClosed|stDraining) != 0 {
 		c.mu.Unlock()
 		return
 	}
-	view := c.in[c.inOff:]
 	c.mu.Unlock()
 	if fresh < 0 {
 		fresh = len(view)
@@ -466,13 +508,14 @@ func (c *Conn) onPeerEOF() {
 
 // handlerEOF ends the input of a handler-owned connection. An EOFHandler gets
 // the unconsumed input, once, and decides when to close; for any other handler
-// the connection is done. Loop goroutine only.
+// the connection is done, and closes once the output already written (the end
+// of a response, say) is delivered. Loop goroutine only.
 func (c *Conn) handlerEOF() {
 	c.mu.Lock()
 	eh, ok := c.handler.(EOFHandler)
 	if !ok {
 		c.mu.Unlock()
-		c.abort(io.EOF)
+		c.shutdown(io.EOF)
 		return
 	}
 	if c.eofDone || c.state.Load()&stClosed != 0 {
@@ -480,8 +523,8 @@ func (c *Conn) handlerEOF() {
 		return
 	}
 	c.eofDone = true
-	rest := c.in[c.inOff:]
-	c.in, c.inOff = nil, 0 // handed over: no more input will follow it
+	rest := c.unreadLocked()
+	c.in = nil // handed over: no more input will follow it
 	c.mu.Unlock()
 	eh.OnEOF(c, rest)
 }
@@ -510,10 +553,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 		if bl == nil {
 			return 0, errHandlerOwned
 		}
-		if c.inOff < len(c.in) {
-			n := copy(b, c.in[c.inOff:])
+		if unread := c.unreadLocked(); len(unread) > 0 {
+			n := copy(b, unread)
 			c.consumeLocked(n)
-			if c.state.Load()&stPausedBuf != 0 && len(c.in)-c.inOff <= maxBlockingInput/4 {
+			if c.state.Load()&stPausedBuf != 0 && len(c.unreadLocked()) <= maxBlockingInput/4 {
 				c.unpause(stPausedBuf)
 			}
 			return n, nil
@@ -990,7 +1033,7 @@ func (c *Conn) abort(err error) {
 	c.closeErr = err
 	h := c.handler
 	c.handler = nil
-	c.in, c.inOff = nil, 0
+	c.in = nil
 	c.signalLocked()
 	end := c.takeEndLocked()
 	c.mu.Unlock()

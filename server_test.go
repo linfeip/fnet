@@ -853,6 +853,30 @@ func TestServerCloseReportsErrServerClosed(t *testing.T) {
 	expectClosed(t, c)
 }
 
+// Close or Shutdown while the server is still starting (a signal during
+// startup) stops it without a crash, and ListenAndServe returns. The race it
+// guards is narrow, so this only exercises the interleavings that come up.
+func TestServerStopWhileStarting(t *testing.T) {
+	for i := range 100 {
+		s := &Server{Addr: "127.0.0.1:0", Split: lengthPrefixed, OnMessage: echo}
+		done := make(chan error, 1)
+		go func() { done <- s.ListenAndServe() }()
+		if i%2 == 0 {
+			_ = s.Shutdown(context.Background())
+		} else {
+			_ = s.Close()
+		}
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrServerClosed) {
+				t.Fatalf("round %d: ListenAndServe = %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: ListenAndServe did not return", i)
+		}
+	}
+}
+
 // Shutdown lets received messages finish, flushes their replies, and returns
 // only after every OnClose has.
 func TestServerShutdown(t *testing.T) {

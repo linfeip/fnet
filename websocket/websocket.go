@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/gobwas/httphead"
 	"github.com/gobwas/ws"
@@ -161,17 +162,7 @@ func (u *Upgrader) UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventH
 		return nil, err
 	}
 	c.onPong = h.OnPong
-	maxPending := u.MaxPendingMessageBytes
-	if maxPending == 0 {
-		maxPending = DefaultMaxPendingMessageBytes
-	}
-	e := &eventConn{
-		c:          c,
-		handler:    h,
-		submit:     u.WorkerPool,
-		maxPending: maxPending,
-		lowPending: maxPending / 4,
-	}
+	e := &eventConn{c: c, handler: h, submit: u.WorkerPool}
 
 	if hc, ok := c.nc.(interface{ Unwrap() *reactor.Conn }); ok {
 		c.raw = hc.Unwrap()
@@ -235,20 +226,53 @@ func (u *Upgrader) handshake(w http.ResponseWriter, r *http.Request) (*Conn, err
 	if brw != nil && brw.Reader != nil {
 		br = brw.Reader // it may hold bytes read ahead of the handshake
 	}
+	maxPending := orDefault(u.MaxPendingMessageBytes, DefaultMaxPendingMessageBytes)
 	c := &Conn{
-		nc:                nc,
-		br:                br,
-		protocol:          hs.Protocol,
-		compressLevel:     orDefault(u.CompressionLevel, flate.DefaultCompression),
-		compressThreshold: orDefault(u.CompressionThreshold, DefaultCompressionThreshold),
-		maxDecompressSize: orDefault(u.MaxDecompressedMessageSize, DefaultMaxDecompressedMessageSize),
-		maxMessageSize:    orDefault(u.MaxMessageSize, DefaultMaxMessageSize),
-		onPong:            u.OnPong,
+		nc:       nc,
+		br:       br,
+		protocol: hs.Protocol,
+		limits: share(limits{
+			compressLevel:     orDefault(u.CompressionLevel, flate.DefaultCompression),
+			compressThreshold: orDefault(u.CompressionThreshold, DefaultCompressionThreshold),
+			maxDecompressSize: orDefault(u.MaxDecompressedMessageSize, DefaultMaxDecompressedMessageSize),
+			maxMessageSize:    orDefault(u.MaxMessageSize, DefaultMaxMessageSize),
+			maxPending:        maxPending,
+			lowPending:        maxPending / 4,
+		}),
+		onPong: u.OnPong,
 	}
 	if u.EnableCompression {
 		_, c.compressed = ext.Accepted()
 	}
 	return c, nil
+}
+
+// limits are the numeric settings a connection takes from its Upgrader. They
+// never change once made, so a connection points to them rather than holding
+// a copy: the connections upgraded one after another with the same settings
+// share one (see share).
+type limits struct {
+	compressLevel     int
+	compressThreshold int
+	maxDecompressSize int64
+	maxMessageSize    int64
+	maxPending        int64 // queued message bytes that pause reading; <= 0 disables
+	lowPending        int64 // ...and the level at which reading resumes
+}
+
+// lastLimits are the limits made last, for the next connection with the same
+// ones to share.
+var lastLimits atomic.Pointer[limits]
+
+// share returns limits equal to l: the ones made last if they are, otherwise
+// a new copy, which becomes the last.
+func share(l limits) *limits {
+	if p := lastLimits.Load(); p != nil && *p == l {
+		return p
+	}
+	p := &l
+	lastLimits.Store(p)
+	return p
 }
 
 func orDefault[T int | int64](v, def T) T {

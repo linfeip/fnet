@@ -33,7 +33,8 @@ type Opener interface {
 
 // Config tunes an Engine. Zero fields take the defaults.
 type Config struct {
-	// Loops is the number of event loops; 0 means runtime.GOMAXPROCS(0).
+	// Loops is the number of event loops; 0 means a third of
+	// runtime.GOMAXPROCS(0), rounded up.
 	Loops int
 	// KeepAlive is applied to every accepted connection; the zero value leaves
 	// the platform default.
@@ -41,6 +42,14 @@ type Config struct {
 	// MaxOutbound caps a connection's queued output; 0 means DefaultMaxOutbound.
 	MaxOutbound int
 }
+
+// defaultLoops is a third of the Ps, rounded up. The loops only read, frame
+// and hand over, a small share of the CPU next to what the workers do with
+// each message. Loops beyond that share would spend their time queued for a P,
+// each waiting its own turn, which spreads the latency of their connections,
+// and would read further ahead of the workers, keeping input in the process
+// that the kernel would otherwise hold.
+func defaultLoops() int { return (runtime.GOMAXPROCS(0) + 2) / 3 }
 
 // Engine accepts connections on its listeners and spreads them round-robin
 // over its event loops. Every new connection starts with the engine's Handler.
@@ -79,7 +88,7 @@ func New(cfg Config, listeners []Listener, h Handler) (*Engine, error) {
 	}
 	n := cfg.Loops
 	if n <= 0 {
-		n = runtime.GOMAXPROCS(0)
+		n = defaultLoops()
 	}
 	fail := func(err error) (*Engine, error) {
 		for _, l := range e.loops {
@@ -190,9 +199,7 @@ func (e *Engine) accept(ln *Listener) bool {
 		if e.opener != nil {
 			e.opener.OnOpen(c)
 		}
-		if err := l.poller.Add(fd); err != nil {
-			c.abort(err)
-		}
+		l.post(task{kind: taskRegister, c: c}) // the loop adds it to its poller
 	}
 }
 

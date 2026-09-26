@@ -91,11 +91,11 @@ Acceptor（accept4）--> 事件循环（epoll / kqueue）---- 空闲连接停在
 ## 特性
 
 - **标准 `net/http` 接口**：直接对接 `http.Handler` / `http.ServeMux`，支持 `fhttp.ListenAndServe` 与 `fhttp.ListenAndServeTLS`。
-- **Multi-Reactor 多核扩展架构**：一个 Acceptor（Linux 上用 `accept4`）把连接轮询分发到与 CPU 核数匹配的事件循环。
+- **Multi-Reactor 多核扩展架构**：一个 Acceptor（Linux 上用 `accept4`）把连接轮询分发到各事件循环，由各循环自己注册到自己的 poller。默认每三个核一个事件循环：循环只负责读取和解帧，开得更多只会各自排队等调度器，还会把输入读到 worker 前头、积在进程里。
 - **双模 WebSocket 支持**：
   - **事件驱动模式（推荐）**：连接空闲时 0 协程常驻，Reactor 读事件触发解析，业务数据包自动投递到内置工作协程池执行，绝不卡死 IO Reactor 事件循环。
   - **阻塞协程模式**：兼容传统业务模型，保留独立 Goroutine 阻塞 `ReadMessage()` / `WriteMessage()`。
-- **内置工作协程池**：有上限的弹性协程池，按核分片、每片一把锁，事件循环与 worker 很少争锁。worker 做完一个任务直接取下一个、不停车；停着的 worker 只为没人认领的任务唤醒；只有所有 worker 都忙时才新起一个；worker 停车前先去别的分片拿等着的任务——10 万条繁忙的 WebSocket 连接只需几百个 worker。worker 按需启动（上限 `MaxWorkers`，由各分片均分）、空闲超时退出，超出上限的任务按顺序排队而不是再起协程。HTTP 业务请求（`ServeHTTP`）、WebSocket 与 TCP 业务消息（`OnMessage`）默认都在这里执行，事件循环不被阻塞；同一连接的回调一次一个、按到达顺序执行。任何协程池都可以作为 `WorkerPool` 接入，例如 `pool.Adapt(ants.Submit)`；返回 error 即拒绝该任务并关闭对应连接。
+- **内置工作协程池**：有上限的弹性协程池，按核分片、每片一把锁，事件循环与 worker 很少争锁；事件循环投递时从不等锁，分片锁被占就交给下一个空闲分片。worker 做完一个任务直接取下一个、不停车；停着的 worker 只为没人认领的任务唤醒，每个分片同时最多叫醒两个（其余任务按顺序等已在跑的 worker，每个 worker 取到任务时再叫醒下一个）；只有所有 worker 都忙时才新起一个；worker 停车前先去别的分片拿等着的任务——10 万条繁忙的 WebSocket 连接只需几百个 worker。worker 按需启动（上限 `MaxWorkers`，由各分片均分）、空闲超时退出，超出上限的任务按顺序排队而不是再起协程。HTTP 业务请求（`ServeHTTP`）、WebSocket 与 TCP 业务消息（`OnMessage`）默认都在这里执行，事件循环不被阻塞；同一连接的回调一次一个、按到达顺序执行。任何协程池都可以作为 `WorkerPool` 接入，例如 `pool.Adapt(ants.Submit)`；返回 error 即拒绝该任务并关闭对应连接。
 - **向量化写入 (writev)**：将帧头部与数据负载通过单次系统调用直达网卡，杜绝内存拼包拷贝。
 - **空闲连接内存小**：全局分块无锁连接表（O(1) 访问）、只在 worker 服务期间存在的连接状态、缓冲区自动收缩。
 - **运行平台**：生产运行在 Linux (`epoll`) 上，容量和默认值都按 Linux 设计。macOS (`kqueue`) 行为一致，用于开发。Windows 为基于 `net` 包的开发用仿真（每个 socket 一个泵协程），不用于生产。

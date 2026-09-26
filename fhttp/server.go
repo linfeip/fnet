@@ -71,7 +71,9 @@ type Server struct {
 	// connections have no idle timeout of their own). 0 means
 	// DefaultKeepAlive, negative turns probes off.
 	KeepAlive time.Duration
-	// NumPollers is the number of event loops. Defaults to runtime.GOMAXPROCS(0).
+	// NumPollers is the number of event loops. Defaults to a third of
+	// runtime.GOMAXPROCS(0), rounded up: the loops only read and frame, and the
+	// workers do the rest.
 	NumPollers int
 
 	// Listen optionally creates the listeners (e.g. for socket activation, or

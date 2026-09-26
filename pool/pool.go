@@ -46,16 +46,19 @@ type Config struct {
 //
 // The pool is split into shards, one per core or so, each with its own lock,
 // queue and workers, so that event loops and workers on different cores rarely
-// meet on a lock. SubmitConn keeps a connection on one shard; each shard is
-// given an equal part of MaxWorkers, at least minShardWorkers.
+// meet on a lock. SubmitConn sends a connection's tasks to one shard, unless
+// its lock is taken, and then to the next free one; each shard is given an
+// equal part of MaxWorkers, at least minShardWorkers.
 //
 // A shard keeps as few workers as keep its queue moving: a worker that
 // finishes a task takes the next one without parking, a parked worker is woken
-// only for a task no other worker is coming for, and a new one is started only
-// when every worker the shard has is busy, one at a time. Under load the busy
-// workers carry the tasks; a burst, or tasks that block, bring in more. A
-// worker about to park first takes a task another shard has waiting, so no
-// shard's queue waits behind its own busy workers while others idle.
+// only for a task no other worker is coming for, and no more than two at a
+// time, and a new one is started only when every worker the shard has is
+// busy, one at a time. Under load the busy workers carry the tasks, in order;
+// a burst, or tasks that block, bring in more, each worker that takes a task
+// getting the next one moving. A worker about to park first takes a task
+// another shard has waiting, so no shard's queue waits behind its own busy
+// workers while others idle.
 type Pool struct {
 	shards []shard
 	shift  uint // 64 - log2(len(shards)): an index is the top bits of a hash
@@ -118,25 +121,66 @@ func New(cfg Config) *Pool {
 	return p
 }
 
+// Task is work that runs itself. The servers hand the pool their connections
+// as Tasks: a func() closing over a connection would cost an allocation each
+// time the connection's messages are dispatched.
+type Task interface{ Run() }
+
+// funcTask is a func() as a Task. A func is a single pointer, so the
+// conversion allocates nothing.
+type funcTask func()
+
+func (f funcTask) Run() { f() }
+
 // Submit runs task on a worker of a shard picked at random: a busy one that
 // finishes, a parked one, or a new one while the shard has room. It fails only
 // after Close.
 func (p *Pool) Submit(task func()) error {
-	return p.shards[rand.Uint64()>>p.shift].submit(task)
-}
-
-// SubmitConn is Submit for the servers' WorkerPool: the tasks of one
-// connection stay on one shard.
-func (p *Pool) SubmitConn(connID uint64, task func()) error {
-	// Fibonacci hashing spreads sequential ids (fds, counters) evenly.
-	return p.shards[connID*0x9e3779b97f4a7c15>>p.shift].submit(task)
-}
-
-func (s *shard) submit(task func()) error {
 	if task == nil {
 		return nil
 	}
-	s.mu.Lock()
+	return p.submit(rand.Uint64()>>p.shift, funcTask(task))
+}
+
+// SubmitConn is Submit for the servers' WorkerPool: the tasks of one
+// connection go to one shard while its lock is free.
+func (p *Pool) SubmitConn(connID uint64, task func()) error {
+	if task == nil {
+		return nil
+	}
+	return p.SubmitTask(connID, funcTask(task))
+}
+
+// SubmitTask is SubmitConn for a Task.
+func (p *Pool) SubmitTask(connID uint64, task Task) error {
+	if task == nil {
+		return nil
+	}
+	// Fibonacci hashing spreads sequential ids (fds, counters) evenly.
+	return p.submit(connID*0x9e3779b97f4a7c15>>p.shift, task)
+}
+
+// submit queues task on shard i, or on the next shard whose lock is free. The
+// submitter is usually an event loop, which must not park behind a worker
+// holding the lock: with the CPU saturated a parked goroutine waits
+// milliseconds to run again, every connection of that loop waits with it, and
+// sync.Mutex then hands the lock from one such waiter to the next (starvation
+// mode). Only when every shard's lock is taken does it wait for shard i.
+func (p *Pool) submit(i uint64, task Task) error {
+	n := uint64(len(p.shards))
+	s := &p.shards[i]
+	for k := uint64(1); !s.mu.TryLock(); k++ {
+		if k == n {
+			s = &p.shards[i]
+			s.mu.Lock()
+			break
+		}
+		s = &p.shards[(i+k)&(n-1)]
+	}
+	return s.submitLocked(task)
+}
+
+func (s *shard) submitLocked(task Task) error {
 	if s.closed {
 		s.mu.Unlock()
 		return ErrClosed
@@ -148,15 +192,25 @@ func (s *shard) submit(task func()) error {
 	return nil
 }
 
+// maxWaking bounds the workers a shard has on their way to its queue. A woken
+// worker is runnable, and with the CPU saturated it waits for a P behind every
+// other runnable goroutine, the event loops included; waking one for each task
+// that arrives meanwhile would only lengthen that wait, and turn the queue,
+// which is served in order, into run queues, which are not. So the tasks
+// beyond maxWaking wait in the queue for the workers already running, or on
+// their way, each of which gets the next one moving when it takes a task: a
+// burst of tasks that block still fans out, one hop at a time.
+const maxWaking = 2
+
 // wakeLocked gets workers on their way to the queue: a parked worker for each
-// queued task no worker is coming for yet, or, with none parked, a new worker
-// while the shard has room, one at a time: a pool grows only while every
-// worker it has is busy. With every worker busy the first to finish looks at
-// the queue. The caller wakes or starts the worker with start, after
-// unlocking.
+// queued task no worker is coming for yet, up to maxWaking at a time, or, with
+// none parked, a new worker while the shard has room, one at a time: a pool
+// grows only while every worker it has is busy. With every worker busy the
+// first to finish looks at the queue. The caller wakes or starts the worker
+// with start, after unlocking.
 func (s *shard) wakeLocked() (w *worker, spawn bool) {
 	switch {
-	case s.waking >= s.queue.len():
+	case s.waking >= min(s.queue.len(), maxWaking):
 	case len(s.idle) > 0:
 		w = s.idle[len(s.idle)-1]
 		s.idle[len(s.idle)-1] = nil
@@ -237,16 +291,19 @@ func (s *shard) work() {
 	}
 }
 
-// steal takes a task queued in a shard other than from, if there is one.
-func (p *Pool) steal(from *shard) func() {
+// steal takes a task queued in a shard other than from, if there is one. It
+// passes over a shard whose lock is taken: meanwhile the stealing worker counts
+// as on its way to its own shard, so a task queued there would wait for
+// another shard's lock, and that shard's own workers are about to take its
+// task anyway.
+func (p *Pool) steal(from *shard) Task {
 	n := len(p.shards)
 	start := int(rand.Uint64() >> p.shift)
 	for i := range n {
 		v := &p.shards[(start+i)&(n-1)]
-		if v == from || v.queue.len() == 0 {
+		if v == from || v.queue.len() == 0 || !v.mu.TryLock() {
 			continue
 		}
-		v.mu.Lock()
 		task := v.queue.pop()
 		v.mu.Unlock()
 		if task != nil {
@@ -336,29 +393,29 @@ func (p *Pool) IdleWorkers() int {
 // runSafe runs a task, logging a panic instead of losing the worker. The
 // servers recover their callbacks' panics themselves; one reaching here is a
 // task submitted directly, or a bug.
-func runSafe(task func()) {
+func runSafe(task Task) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("fnet/pool: task panicked: %v\n%s", r, debug.Stack())
 		}
 	}()
-	task()
+	task.Run()
 }
 
 // fifo is a growable ring buffer of tasks. Only len may be called without the
 // shard's lock.
 type fifo struct {
-	buf  []func()
+	buf  []Task
 	head int
 	n    atomic.Int32
 }
 
 func (q *fifo) len() int { return int(q.n.Load()) }
 
-func (q *fifo) push(t func()) {
+func (q *fifo) push(t Task) {
 	n := q.len()
 	if n == len(q.buf) {
-		buf := make([]func(), max(16, 2*len(q.buf)))
+		buf := make([]Task, max(16, 2*len(q.buf)))
 		for i := range n {
 			buf[i] = q.buf[(q.head+i)%len(q.buf)]
 		}
@@ -369,7 +426,7 @@ func (q *fifo) push(t func()) {
 }
 
 // pop removes the oldest task, or returns nil when there is none.
-func (q *fifo) pop() func() {
+func (q *fifo) pop() Task {
 	n := q.len()
 	if n == 0 {
 		return nil
@@ -420,14 +477,27 @@ func Adapt(submit func(task func()) error) func(connID uint64, task func()) erro
 // keyed by connID. It reports whether the task was accepted; a submit that
 // fails, or panics, refuses it and the caller should give up on the
 // connection.
-func Dispatch(submit func(connID uint64, task func()) error, connID uint64, task func()) (ok bool) {
+func Dispatch(submit func(connID uint64, task func()) error, connID uint64, task func()) bool {
+	if task == nil {
+		return true // nothing to run, as SubmitConn takes it
+	}
+	return DispatchTask(submit, connID, funcTask(task))
+}
+
+// DispatchTask is Dispatch for a Task. Through Default it allocates nothing; a
+// custom submit gets task.Run.
+func DispatchTask(submit func(connID uint64, task func()) error, connID uint64, task Task) (ok bool) {
 	if submit == nil {
-		return Default().SubmitConn(connID, task) == nil
+		return Default().SubmitTask(connID, task) == nil
 	}
 	defer func() {
 		if recover() != nil {
 			ok = false
 		}
 	}()
-	return submit(connID, task) == nil
+	run, isFunc := task.(funcTask)
+	if !isFunc {
+		run = task.Run
+	}
+	return submit(connID, run) == nil
 }

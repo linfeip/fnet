@@ -25,7 +25,10 @@ const (
 	maxHeaderSize = 10
 )
 
-var errEventDriven = errors.New("fnet/websocket: messages of an event-driven connection are delivered to OnMessage")
+var (
+	errEventDriven   = errors.New("fnet/websocket: messages of an event-driven connection are delivered to OnMessage")
+	errControlTooBig = errors.New("fnet/websocket: control frame payload exceeds 125 bytes")
+)
 
 // Conn is a server-side WebSocket connection. Writes are safe from any
 // goroutine. ReadMessage and Handle are for connections upgraded without an
@@ -37,12 +40,9 @@ type Conn struct {
 	protocol string
 	closed   atomic.Bool
 
-	compressed        bool
-	compressLevel     int
-	compressThreshold int
-	maxDecompressSize int64
-	maxMessageSize    int64
-	onPong            func(c *Conn, data []byte)
+	compressed bool
+	limits     *limits
+	onPong     func(c *Conn, data []byte)
 
 	wmu        sync.Mutex
 	batch      *bufpool.Buffer
@@ -58,11 +58,19 @@ func (c *Conn) IsCompressed() bool { return c.compressed }
 
 // SetMaxDecompressedMessageSize changes the decompressed size limit. Call it
 // before messages flow (e.g. in OnOpen).
-func (c *Conn) SetMaxDecompressedMessageSize(limit int64) { c.maxDecompressSize = limit }
+func (c *Conn) SetMaxDecompressedMessageSize(limit int64) {
+	l := *c.limits
+	l.maxDecompressSize = limit
+	c.limits = share(l)
+}
 
 // SetMaxMessageSize changes the received message size limit. Call it before
 // messages flow (e.g. in OnOpen).
-func (c *Conn) SetMaxMessageSize(limit int64) { c.maxMessageSize = limit }
+func (c *Conn) SetMaxMessageSize(limit int64) {
+	l := *c.limits
+	l.maxMessageSize = limit
+	c.limits = share(l)
+}
 
 // NetConn returns the underlying connection.
 func (c *Conn) NetConn() net.Conn { return c.nc }
@@ -103,8 +111,8 @@ func (c *Conn) SetWriteDeadline(t time.Time) error { return c.nc.SetWriteDeadlin
 // before the connection's write lock is taken.
 func (c *Conn) WriteMessage(op OpCode, payload []byte) error {
 	data, rsv1 := payload, false
-	if c.compressed && (op == OpText || op == OpBinary) && len(payload) >= c.compressThreshold {
-		if z, err := compress(payload, c.compressLevel); err == nil && len(z) < len(payload) {
+	if c.compressed && (op == OpText || op == OpBinary) && len(payload) >= c.limits.compressThreshold {
+		if z, err := compress(payload, c.limits.compressLevel); err == nil && len(z) < len(payload) {
 			data, rsv1 = z, true
 		}
 	}
@@ -125,7 +133,12 @@ func (c *Conn) WritePing(data []byte) error { return c.writeControl(OpPing, data
 // WritePong sends a Pong control frame.
 func (c *Conn) WritePong(data []byte) error { return c.writeControl(OpPong, data) }
 
+// writeControl sends a Ping or Pong. A control frame carries at most 125
+// bytes (RFC 6455 5.5); a longer one would make the peer fail the connection.
 func (c *Conn) writeControl(op OpCode, payload []byte) error {
+	if len(payload) > 125 {
+		return errControlTooBig
+	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	return c.writeFrameLocked(op, payload, false)
@@ -289,7 +302,7 @@ func (c *Conn) ReadMessage() (OpCode, []byte, error) {
 		if h.Length > maxFrameLength {
 			return 0, nil, c.fail(headerError(errFrameTooLarge))
 		}
-		if perr := checkSize(h, len(msg), c.maxMessageSize); perr != nil {
+		if perr := checkSize(h, len(msg), c.limits.maxMessageSize); perr != nil {
 			return 0, nil, c.fail(perr)
 		}
 		if h.OpCode != OpContinuation {
@@ -330,7 +343,7 @@ func readPayload(r io.Reader, msg []byte, length int) ([]byte, error) {
 // connection with the matching status on failure.
 func (c *Conn) decode(op OpCode, deflated bool, msg []byte) ([]byte, error) {
 	if deflated {
-		out, err := decompress(msg, c.maxDecompressSize)
+		out, err := decompress(msg, c.limits.maxDecompressSize)
 		if err != nil {
 			status := ws.StatusProtocolError
 			if errors.Is(err, ErrMessageTooBig) {

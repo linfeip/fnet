@@ -154,8 +154,8 @@ func (h *httpHandler) OnClose(*reactor.Conn, error) {}
 // dispatch hands the connection to a worker, to start serving it, or with s
 // to resume an idle TLS session. Event loop only.
 func (h *httpHandler) dispatch(c *reactor.Conn, s *session) {
+	h.active.Add(1) // first: closeIdle skips a detached connection as active
 	c.Detach()
-	h.active.Add(1)
 	if !pool.Dispatch(h.submit, uint64(c.Fd()), func() { h.serve(c, s) }) {
 		h.active.Add(-1)
 		_ = c.Close() // the custom pool refused the request
@@ -172,6 +172,9 @@ func (h *httpHandler) closeIdle(eng *reactor.Engine) (waiting int) {
 				return // served by a worker (counted in active), or hijacked
 			}
 		case *session:
+			if c.Detached() {
+				return // its next request is being served (counted in active)
+			}
 		default:
 			return // upgraded, e.g. to WebSocket
 		}
@@ -300,6 +303,7 @@ func (s *session) serveOne() outcome {
 	start := time.Now()
 	_ = s.rw.SetReadDeadline(after(start, h.headerTimeout))
 	s.lr.n = int64(h.maxHeader) + 4096 // the reader's buffer may run ahead of the header
+	s.lr.hit = false
 	req, err := http.ReadRequest(s.br)
 	s.lr.n = -1
 	if err != nil {
@@ -308,6 +312,10 @@ func (s *session) serveOne() outcome {
 	}
 	if reason := checkHost(req); reason != "" {
 		s.reply("400 Bad Request", reason)
+		return closeConn
+	}
+	if exp := req.Header.Get("Expect"); exp != "" && !strings.EqualFold(exp, "100-continue") {
+		s.reply("417 Expectation Failed", "") // as net/http does (RFC 9110 10.1.1)
 		return closeConn
 	}
 	_ = s.rw.SetReadDeadline(after(start, h.readTimeout)) // the body

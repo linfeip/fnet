@@ -342,6 +342,7 @@ func (w *responseWriter) writeHeader(body []byte) error {
 	h := w.header
 	w.contentLength = w.declaredLength()
 	w.chunked = h.Get("Transfer-Encoding") == "chunked"
+	w.settleFraming()
 	if h.Get("Date") == "" {
 		h.Set("Date", httpDate())
 	}
@@ -369,6 +370,46 @@ func (w *responseWriter) writeHeader(body []byte) error {
 	err := w.send(hb.Bytes(), body)
 	headPool.Put(hb)
 	return err
+}
+
+// settleFraming makes the framing the handler set consistent, as net/http
+// does: a status without a body (1xx, 204, 304) carries no Content-Length or
+// Transfer-Encoding (304 no Content-Type either); an HTTP/1.0 client knows no
+// transfer coding; chunked wins over a Content-Length, which wins over any
+// other coding; and without a length, a coding other than chunked (identity,
+// once recommended for event streams) is delimited by closing the connection,
+// since only chunked marks where a body ends.
+func (w *responseWriter) settleFraming() {
+	h := w.header
+	te := h.Get("Transfer-Encoding")
+	switch {
+	case !w.allowsContentLength():
+		h.Del("Content-Length")
+		h.Del("Transfer-Encoding")
+		if w.status == http.StatusNotModified {
+			h.Del("Content-Type")
+		}
+		w.contentLength, w.chunked = -1, false
+	case te == "":
+	case w.http10:
+		h.Del("Transfer-Encoding")
+		w.chunked = false
+		w.closeConn = w.closeConn || w.contentLength < 0
+	case w.chunked:
+		if w.contentLength >= 0 {
+			w.srv.logf("fhttp: both Transfer-Encoding %q and Content-Length %d set; dropping the length", te, w.contentLength)
+			h.Del("Content-Length")
+			w.contentLength = -1
+		}
+	case w.contentLength >= 0:
+		h.Del("Transfer-Encoding")
+	case strings.EqualFold(te, "identity"):
+		h.Del("Transfer-Encoding")
+		w.closeConn = true
+	default:
+		h.Add("Transfer-Encoding", "chunked")
+		w.chunked = true
+	}
 }
 
 func (w *responseWriter) writeBody(b []byte) error {
@@ -423,6 +464,9 @@ func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 		return nil, nil, errDoubleHijack
 	}
 	w.hijacked = true
+	// As with net/http, the request's deadlines end with it: a protocol taken
+	// over from here sets its own.
+	_ = w.conn.SetDeadline(time.Time{})
 	bw := writerPool.Get().(*bufio.Writer)
 	bw.Reset(w.conn)
 	w.hc = &hijackedConn{Conn: w.conn, br: w.br, bw: bw, raw: w.raw}

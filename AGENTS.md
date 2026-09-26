@@ -43,13 +43,13 @@ fnet 是 Go 的网络框架：根包 `fnet` 跑自定义 TCP 消息协议（游�
 
 空闲连接只挂在 poller 上，并占连接表里的一个槽。它不持有 goroutine，也不持有 worker。读缓冲放在 reactor 上共享。
 
-`conn` 上多一个字段、或每条连接多一个 goroutine、map、常驻缓冲，都先按 1e6 算清字节和 goroutine，再改，并在说明里写出这笔账。当前每条空闲连接的对象：`reactor.Conn` 240 B；TCP 连接另有 `fnet.Conn` 104 B；事件驱动 WebSocket 另有 `eventConn` 200 B 和 `websocket.Conn` 128 B。worker 服务连接期间另有 `reactor.blocking` 136 B，空闲连接不持有。改动后用 `unsafe.Sizeof` 重新量，并同步这里的数字。
+`conn` 上多一个字段、或每条连接多一个 goroutine、map、常驻缓冲，都先按 1e6 算清字节和 goroutine，再改，并在说明里写出这笔账。当前每条空闲连接的对象：`reactor.Conn` 208 B；TCP 连接另有 `fnet.Conn` 104 B；事件驱动 WebSocket 另有 `eventConn` 128 B 和 `websocket.Conn` 104 B（压缩等级、大小上限、背压阈值等由同配置的连接共享一份）。worker 服务连接期间另有 `reactor.blocking` 136 B，空闲连接不持有。改动后用 `unsafe.Sizeof` 重新量，并同步这里的数字。
 
 ## 热路径
 
 事件循环（`internal/reactor` 的 `Loop`）只做就绪、解析和移交。解析指的是 HTTP 判断请求头是否收齐、WebSocket 解帧和应答控制帧、TCP 用业务的 `Split` 切出完整消息，只找边界，不跑业务。`Split` panic、原地打转或超过 `MaxMessageSize`，都只关掉它自己的连接。
 
-`ServeHTTP`、WebSocket 与 TCP 的业务回调都进 worker pool。同一连接的回调由这条连接自己的排空循环串行执行（同一时刻只调度一个任务），所以一次一个、按到达顺序。`SubmitConn` 只负责按连接选分片，一个分片有多个 worker、谁空闲谁取任务，它本身不保证串行。
+`ServeHTTP`、WebSocket 与 TCP 的业务回调都进 worker pool。同一连接的回调由这条连接自己的排空循环串行执行（同一时刻只调度一个任务），所以一次一个、按到达顺序。`SubmitConn` 只负责按连接选分片（分片锁被占就换下一个，事件循环不在锁上挂起），一个分片有多个 worker、谁空闲谁取任务，它本身不保证串行。
 
 稳定态的 accept、read、write 复用 reactor 缓冲、对象池和 `writev`。一次读出多条消息时，worker 用 `reactor.Conn.Corked` 把这批回复合并成一次写；暂存有上限（1 ms、64 KiB），慢 handler 拖不住它之前的回复和别的协程的广播，这个上限不能去掉。
 

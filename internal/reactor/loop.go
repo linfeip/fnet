@@ -19,10 +19,11 @@ const (
 type taskKind uint8
 
 const (
-	taskResume  taskKind = iota // offer buffered input, then read the socket
-	taskDrained                 // a closing connection has no output left
-	taskClose                   // close the fd, then notify the handler
-	taskNotify                  // notify a handler attached after the close
+	taskRegister taskKind = iota // start polling a newly accepted connection
+	taskResume                   // offer buffered input, then read the socket
+	taskDrained                  // a closing connection has no output left
+	taskClose                    // close the fd, then notify the handler
+	taskNotify                   // notify a handler attached after the close
 )
 
 type task struct {
@@ -68,9 +69,10 @@ func (l *Loop) post(t task) {
 	l.wake()
 }
 
-// wake interrupts the loop if it is blocked (or about to block) in Wait.
+// wake interrupts the loop if it is blocked (or about to block) in Wait. Of
+// the goroutines posting to a waiting loop, only the first wakes it.
 func (l *Loop) wake() {
-	if l.waiting.Load() {
+	if l.waiting.Load() && l.waiting.CompareAndSwap(true, false) {
 		_ = l.poller.Wake()
 	}
 }
@@ -146,6 +148,10 @@ func (l *Loop) runTasks() {
 
 func (l *Loop) run1(t task) {
 	switch t.kind {
+	case taskRegister:
+		if !l.eng.closing.Load() {
+			l.register(t.c)
+		}
 	case taskResume:
 		if !l.eng.closing.Load() {
 			l.resume(t.c)
@@ -161,6 +167,26 @@ func (l *Loop) run1(t task) {
 		}
 	case taskNotify:
 		t.h.OnClose(t.c, t.err)
+	}
+}
+
+// register starts polling a connection the acceptor handed over. Each loop
+// registers its own connections, so a storm of new clients does not queue
+// behind one acceptor's epoll_ctl calls, and a poller's registrations never
+// contend with its Wait. A connection closed before this ran (from OnOpen,
+// say) is skipped: its close was queued first, so its fd may already belong
+// to another connection. Output that filled the socket before registration
+// armed write readiness in vain, so it is armed again.
+func (l *Loop) register(c *Conn) {
+	if c.state.Load()&stClosed != 0 {
+		return
+	}
+	if err := l.poller.Add(c.fd); err != nil {
+		c.abort(err)
+		return
+	}
+	if c.state.Load()&stWriteArmed != 0 {
+		_ = l.poller.EnableWrite(c.fd)
 	}
 }
 
