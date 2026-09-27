@@ -63,8 +63,8 @@ func Accept(lnFD int) (int, netip.AddrPort, error) {
 			}
 			return fd, addr, nil
 		}
-		if err == unix.EINTR || err == unix.ECONNABORTED {
-			continue // interrupted, or the peer gave up while queued
+		if err == unix.EINTR || acceptRetryable(err) {
+			continue // interrupted, or this connection failed while queued
 		}
 		return -1, netip.AddrPort{}, err
 	}

@@ -220,3 +220,14 @@ func skipOnPumpEmulation(t *testing.T) {
 		t.Skip("the Windows socket emulation holds a pump goroutine per connection")
 	}
 }
+
+// skipWithoutWriteBackpressure skips a test of a peer that stops reading: the
+// Windows emulation in internal/netpoll writes synchronously, so the writer
+// waits for the peer instead of queueing (no ErrWriteBufferFull, no drain or
+// write deadline that gives up on it).
+func skipWithoutWriteBackpressure(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows socket emulation writes synchronously: no write backpressure")
+	}
+}

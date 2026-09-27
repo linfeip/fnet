@@ -303,6 +303,10 @@ func (c *Conn) NewBytes() int { return c.loop.fresh }
 // Detached reports whether a blocking reader owns the input.
 func (c *Conn) Detached() bool { return c.blocking.Load() != nil }
 
+// Closing reports whether Close was called (or the connection is gone): its
+// queued output may still be on its way to the peer.
+func (c *Conn) Closing() bool { return c.state.Load()&(stDraining|stClosed) != 0 }
+
 // Handler returns the connection's handler; nil once it is closed.
 func (c *Conn) Handler() Handler {
 	c.mu.Lock()

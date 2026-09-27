@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -50,8 +51,19 @@ func readFrame(t *testing.T, r io.Reader) []byte {
 
 func echo(c *Conn, msg []byte) { _, _ = c.Write(frame(msg)) }
 
+// skipWithoutWriteBackpressure skips a test of a peer that stops reading: the
+// Windows emulation in internal/netpoll writes synchronously, so the writer
+// waits for the peer instead of queueing (no ErrWriteBufferFull, no drain or
+// write deadline that gives up on it).
+func skipWithoutWriteBackpressure(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows socket emulation writes synchronously: no write backpressure")
+	}
+}
+
 // serve starts s on a loopback port and closes it when the test ends.
-func serve(t *testing.T, s *Server) string {
+func serve(t testing.TB, s *Server) string {
 	t.Helper()
 	addrc := make(chan string, 1)
 	s.Listen = func(network, _ string) (net.Listener, error) {
@@ -80,7 +92,7 @@ func serve(t *testing.T, s *Server) string {
 	return addr
 }
 
-func dial(t *testing.T, addr string) net.Conn {
+func dial(t testing.TB, addr string) net.Conn {
 	t.Helper()
 	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
@@ -689,6 +701,7 @@ func TestServerBackpressureBoundsPendingMessages(t *testing.T) {
 }
 
 func TestServerMaxOutboundBytes(t *testing.T) {
+	skipWithoutWriteBackpressure(t)
 	opened := make(chan *Conn, 1)
 	addr := serve(t, &Server{
 		Split:            lengthPrefixed,
@@ -1168,6 +1181,31 @@ func TestServerMessagesOfOneReadKeepTheirBytes(t *testing.T) {
 	for _, w := range want {
 		if s := recv(t, got); s != w {
 			t.Fatalf("got %.8q..., want %.8q...", s, w)
+		}
+	}
+}
+
+// BenchmarkServerEcho is one length-prefixed echo round trip of 1 KiB. The
+// client and the handler allocate nothing, so allocs/op are the server's.
+func BenchmarkServerEcho(b *testing.B) {
+	addr := serve(b, &Server{Split: lengthPrefixed, OnMessage: func(c *Conn, msg []byte) {
+		var hdr [4]byte
+		binary.BigEndian.PutUint32(hdr[:], uint32(len(msg)))
+		_, _ = c.Writev([][]byte{hdr[:], msg})
+	}})
+	c := dial(b, addr)
+	req := frame(make([]byte, 1024))
+	resp := make([]byte, len(req))
+	b.SetBytes(int64(len(req)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := c.Write(req); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := io.ReadFull(c, resp); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

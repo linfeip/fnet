@@ -250,6 +250,13 @@ func TestBlockingTasksFanOut(t *testing.T) {
 			t.Fatalf("round %d: %d of %d blocking tasks started", round, started.Load(), n)
 		}
 		wg.Wait()
+		// The next round is for the parked workers: one still on its way
+		// to park would rightly have the pool start another.
+		for deadline := time.Now().Add(5 * time.Second); p.IdleWorkers() < p.RunningWorkers(); time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: %d of %d workers parked", round, p.IdleWorkers(), p.RunningWorkers())
+			}
+		}
 	}
 	if w := p.RunningWorkers(); w != n {
 		t.Fatalf("%d workers for %d blocking tasks", w, n)
@@ -281,6 +288,75 @@ func TestIdleWorkerTakesTaskFromBusyShard(t *testing.T) {
 	case <-ran:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the task waiting in a busy shard was left there")
+	}
+}
+
+// A task for a shard whose every worker is blocked, with no room for more,
+// runs on another shard at once instead of waiting for one of them.
+func TestSaturatedShardHandsTaskOn(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
+	p := New(Config{MaxWorkers: 2 * minShardWorkers, IdleTimeout: time.Minute})
+	defer p.Close()
+	if len(p.shards) != 2 {
+		t.Fatalf("%d shards, want 2", len(p.shards))
+	}
+	var ids []uint64 // connection ids of shard 0
+	for id := uint64(0); len(ids) < minShardWorkers+1; id++ {
+		if id*0x9e3779b97f4a7c15>>p.shift == 0 {
+			ids = append(ids, id)
+		}
+	}
+	release := make(chan struct{})
+	defer close(release)
+	var blocked atomic.Int32
+	for _, id := range ids[:minShardWorkers] {
+		_ = p.SubmitConn(id, func() {
+			blocked.Add(1)
+			<-release
+		})
+	}
+	for deadline := time.Now().Add(5 * time.Second); blocked.Load() < minShardWorkers; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d tasks started", blocked.Load(), minShardWorkers)
+		}
+	}
+	ran := make(chan struct{})
+	_ = p.SubmitConn(ids[minShardWorkers], func() { close(ran) })
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the task waited behind a saturated shard while another idled")
+	}
+}
+
+// A burst of blocking tasks for one shard, more than it may run, comes in
+// faster than the shard starts workers: the tasks it cannot run go to another
+// shard, instead of waiting in its queue while the other idles. With one P
+// the whole burst is queued before a worker runs, so no worker holds a lock
+// the submitter tries (it would pass that shard over).
+func TestBurstBeyondAShardSpills(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
+	p := New(Config{MaxWorkers: 2 * minShardWorkers, IdleTimeout: time.Minute})
+	defer p.Close()
+	runtime.GOMAXPROCS(1)
+	var id uint64 // a connection of shard 0
+	for id*0x9e3779b97f4a7c15>>p.shift != 0 {
+		id++
+	}
+	const n = 2 * minShardWorkers
+	release := make(chan struct{})
+	defer close(release)
+	var started atomic.Int32
+	for range n {
+		_ = p.SubmitConn(id, func() {
+			started.Add(1)
+			<-release
+		})
+	}
+	for deadline := time.Now().Add(5 * time.Second); started.Load() < n; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d blocking tasks started; the rest wait in a full shard", started.Load(), n)
+		}
 	}
 }
 

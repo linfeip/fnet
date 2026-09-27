@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -512,6 +513,7 @@ func shortenDrain(t *testing.T, d time.Duration) {
 // Close with output queued for a peer that never reads again ends after
 // drainStall instead of holding the connection forever.
 func TestEngineDrainStopsWhenPeerStopsReading(t *testing.T) {
+	skipWithoutWriteBackpressure(t)
 	shortenDrain(t, 300*time.Millisecond)
 	closed := make(chan error, 1)
 	payload := make([]byte, 15<<20) // more than the kernel buffers take
@@ -698,6 +700,7 @@ func TestEngineStopAcceptKeepsConnections(t *testing.T) {
 }
 
 func TestEngineMaxOutbound(t *testing.T) {
+	skipWithoutWriteBackpressure(t)
 	fd, addr, err := netpoll.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -844,5 +847,16 @@ func TestFarCloseDeadlineFiresOnIdleLoop(t *testing.T) {
 	}
 	if late := time.Since(deadline); late < 0 || late > 2*time.Duration(tickNanos)+50*time.Millisecond {
 		t.Fatalf("EOF %v after the deadline", late)
+	}
+}
+
+// skipWithoutWriteBackpressure skips a test of a peer that stops reading: the
+// Windows emulation in internal/netpoll writes synchronously, so the writer
+// waits for the peer instead of queueing (no ErrWriteBufferFull, no drain or
+// write deadline that gives up on it).
+func skipWithoutWriteBackpressure(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows socket emulation writes synchronously: no write backpressure")
 	}
 }

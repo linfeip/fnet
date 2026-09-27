@@ -30,9 +30,9 @@ type Conn struct {
 	dead bool        // event loop only: no more input is taken
 
 	mu       sync.Mutex
-	queue    []message // cut, waiting for OnMessage
-	pending  int       // message bytes queued or being handled
-	since    int64     // unix nanos: when the partial message began, or idleness did
+	queue    *[]message // cut, waiting for OnMessage; from queues, nil while idle
+	pending  int        // message bytes queued or being handled
+	since    int64      // unix nanos: when the partial message began, or idleness did
 	state    uint32
 	closeErr error
 }
@@ -69,6 +69,17 @@ func release(ms []message) {
 	for i := range ms {
 		bufpool.Put(ms[i].buf)
 		ms[i] = message{}
+	}
+}
+
+// queues are the connections' message queues (see bufpool.Queues).
+var queues bufpool.Queues[message]
+
+// releaseQueue releases the messages of q, and gives q back; nil is ignored.
+func releaseQueue(q *[]message) {
+	if q != nil {
+		release(*q)
+		queues.Put(q)
 	}
 }
 
@@ -209,7 +220,7 @@ func (c *Conn) OnClose(_ *reactor.Conn, err error) {
 	c.mu.Lock()
 	c.recordLocked(err)
 	c.state |= csClosed
-	var dropped []message
+	var dropped *[]message
 	if local && c.state&csClosing == 0 {
 		c.state |= csClosing
 		c.quit.Store(true)
@@ -220,7 +231,7 @@ func (c *Conn) OnClose(_ *reactor.Conn, err error) {
 		c.state |= csRunning // stays set: nothing is scheduled after OnClose
 	}
 	c.mu.Unlock()
-	release(dropped)
+	releaseQueue(dropped)
 	switch {
 	case !idle: // the running drain gets to OnClose after the queue
 	case c.h.onClose == nil:
@@ -294,7 +305,12 @@ func (c *Conn) push(batch []message, progressed, partial, done bool, end error) 
 		release(batch)
 		return false
 	}
-	c.queue = append(c.queue, batch...)
+	if len(batch) > 0 {
+		if c.queue == nil {
+			c.queue = queues.Get(len(batch))
+		}
+		*c.queue = append(*c.queue, batch...)
+	}
 	c.pending += size
 	if partial {
 		if c.state&csPartial == 0 || progressed {
@@ -315,7 +331,7 @@ func (c *Conn) push(batch []message, progressed, partial, done bool, end error) 
 		c.state |= csPaused
 		c.raw.PauseRead()
 	}
-	idle := c.state&csRunning == 0 && len(c.queue) == 0
+	idle := c.state&csRunning == 0 && c.queuedLocked() == 0
 	closeNow := done && idle // nothing left to handle: no worker hop just to close
 	if closeNow {
 		c.state |= csClosing
@@ -370,14 +386,15 @@ func (t *drainTask) Run() { (*Conn)(t).drain() }
 
 // drain runs the connection's callbacks on a worker, in order. At most one
 // drain per connection is scheduled or running (csRunning). A handled batch is
-// settled under the same lock that takes the next one, and its emptied array
+// settled under the same lock that takes the next one, and its emptied queue
 // takes the messages that arrive while the next batch is handled. An idle
-// Conn keeps no array.
+// Conn keeps no queue.
 func (c *Conn) drain() {
 	var (
-		spare   []message // the array of the batch just handled, emptied
-		handled int       // that batch's message bytes
+		spare   *[]message // the queue of the batch just handled, emptied
+		handled int        // that batch's message bytes
 	)
+	defer func() { queues.Put(spare) }()
 	for {
 		c.mu.Lock()
 		c.settleLocked(handled)
@@ -388,12 +405,13 @@ func (c *Conn) drain() {
 			c.mu.Unlock()
 			c.callOpen()
 
-		case len(c.queue) > 0 && c.state&csClosing == 0:
+		case c.queuedLocked() > 0 && c.state&csClosing == 0:
 			batch := c.queue
 			c.queue = spare
 			c.mu.Unlock()
-			handled = c.handle(batch)
-			spare = batch[:0]
+			handled = c.handle(*batch)
+			*batch = (*batch)[:0]
+			spare = batch
 
 		case c.state&csClosed != 0:
 			// Gone, and everything it is owed has run: OnClose comes last.
@@ -401,7 +419,7 @@ func (c *Conn) drain() {
 			dropped := c.dropLocked()
 			err := c.closeErr
 			c.mu.Unlock()
-			release(dropped)
+			releaseQueue(dropped)
 			c.callClose(err)
 			c.h.live.Done()
 			return
@@ -421,7 +439,7 @@ func (c *Conn) drain() {
 			}
 			c.rearmLocked()
 			c.mu.Unlock()
-			release(dropped)
+			releaseQueue(dropped)
 			if closeNow {
 				_ = c.raw.Close()
 			}
@@ -511,7 +529,7 @@ func (c *Conn) closeWith(err error) {
 	dropped := c.dropLocked()
 	c.rearmLocked()
 	c.mu.Unlock()
-	release(dropped)
+	releaseQueue(dropped)
 	_ = c.raw.Close()
 }
 
@@ -538,12 +556,23 @@ func (c *Conn) shutdown() {
 	_ = c.raw.Close()
 }
 
-// dropLocked takes the queued messages out, for the caller to release.
-func (c *Conn) dropLocked() []message {
+// queuedLocked returns how many messages are queued.
+func (c *Conn) queuedLocked() int {
+	if c.queue == nil {
+		return 0
+	}
+	return len(*c.queue)
+}
+
+// dropLocked takes the queue out, for the caller to release with
+// releaseQueue.
+func (c *Conn) dropLocked() *[]message {
 	q := c.queue
 	c.queue = nil
-	for i := range q {
-		c.pending -= len(q[i].data)
+	if q != nil {
+		for i := range *q {
+			c.pending -= len((*q)[i].data)
+		}
 	}
 	return q
 }

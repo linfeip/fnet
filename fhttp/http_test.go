@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
@@ -491,7 +492,8 @@ func TestHTTPMalformedRequestsRejected(t *testing.T) {
 		{"negative-content-length", "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n"},
 		{"non-numeric-content-length", "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n"},
 		{"binary-junk", "\x00\x01\x02\x03\xff\xfe\r\n\r\n"},
-		{"bare-crlf", "\r\n\r\n\r\n"},
+		// Empty lines alone are not a request: RFC 9112 2.2 has them ignored
+		// (TestHTTPEmptyLinesBeforeRequestLine).
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1563,11 +1565,13 @@ func TestResponseWriterSwitchesToChunkedPastBuffer(t *testing.T) {
 	if !strings.HasSuffix(out, "0\r\n\r\n") {
 		t.Errorf("missing terminating chunk: ...%q", out[max(0, len(out)-32):])
 	}
-	// Chunk sizes are hex: 60 KiB = 0xf000, 10 KiB = 0x2800.
-	for _, want := range []string{"f000\r\n", "2800\r\n"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("missing chunk size %q", want)
-		}
+	_, body, _ := strings.Cut(out, "\r\n\r\n")
+	got, err := io.ReadAll(httputil.NewChunkedReader(strings.NewReader(body)))
+	if err != nil {
+		t.Fatalf("decode chunked body: %v", err)
+	}
+	if want := string(first) + string(second); string(got) != want {
+		t.Errorf("chunked body is %d bytes, want the %d written, in order", len(got), len(want))
 	}
 }
 
@@ -1729,6 +1733,7 @@ func TestHTTPReadTimeoutDuringBody(t *testing.T) {
 }
 
 func TestHTTPWriteTimeoutSlowClient(t *testing.T) {
+	skipWithoutWriteBackpressure(t)
 	writeErrCh := make(chan error, 1)
 	srv := &Server{
 		WriteTimeout: 100 * time.Millisecond,

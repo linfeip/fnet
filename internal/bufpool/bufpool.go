@@ -104,3 +104,49 @@ func (a *Arena) Release() {
 		a.buf = nil
 	}
 }
+
+// The queues Queues keeps hold from minPooledQueue to maxPooledQueue
+// messages: smaller ones are allocated for each use, and one a burst grew past
+// the maximum is left to the garbage collector.
+const (
+	minPooledQueue = 16
+	maxPooledQueue = 1024
+)
+
+// Queues pools the message queues of connections, which hold one only while
+// messages wait for their worker: one is taken when messages reach an empty
+// connection and given back once the connection is idle again, so an idle
+// connection pays a pointer. The event loops take queues and the workers give
+// them back, on other Ps, so a pooled queue comes from another P's cache: a
+// queue for a single message, the common case of request and reply, is
+// cheaper allocated where it is filled (one small object), and only the
+// queues of bursts, which would allocate an array per read, are pooled.
+type Queues[T any] struct{ p sync.Pool }
+
+// one is a queue for a single message and its array, allocated together.
+type one[T any] struct {
+	s []T
+	a [1]T
+}
+
+// Get returns an empty queue for n messages, the first to be queued.
+func (q *Queues[T]) Get(n int) *[]T {
+	if n <= 1 {
+		o := new(one[T])
+		o.s = o.a[:0]
+		return &o.s
+	}
+	if s, ok := q.p.Get().(*[]T); ok {
+		return s
+	}
+	s := make([]T, 0, max(n, minPooledQueue))
+	return &s
+}
+
+// Put gives back s, whose elements the caller has cleared; nil is ignored.
+func (q *Queues[T]) Put(s *[]T) {
+	if s != nil && cap(*s) >= minPooledQueue && cap(*s) <= maxPooledQueue {
+		*s = (*s)[:0]
+		q.p.Put(s)
+	}
+}

@@ -25,6 +25,9 @@ type message struct {
 // (64 KiB) of 1 KiB messages. A longer run of smaller ones spills to the heap.
 const batchSize = 64
 
+// queues are the connections' message queues (see bufpool.Queues).
+var queues bufpool.Queues[message]
+
 // eventConn drives an event-driven connection. OnData runs on the event loop:
 // it parses frames, enforces RFC 6455, answers control frames, and copies each
 // complete message into a pooled buffer, which the messages that arrived whole
@@ -43,7 +46,7 @@ type eventConn struct {
 
 	// Shared with the worker.
 	mu       sync.Mutex
-	queue    []message // parsed, waiting for the worker; nil while idle
+	queue    *[]message // parsed, waiting for the worker; from queues, nil while idle
 	closeErr error
 	pending  int64
 	running  bool
@@ -253,7 +256,10 @@ func (e *eventConn) flush(msgs []message) {
 		releaseAll(msgs)
 		return
 	}
-	e.queue = append(e.queue, msgs...)
+	if e.queue == nil {
+		e.queue = queues.Get(len(msgs))
+	}
+	*e.queue = append(*e.queue, msgs...)
 	e.pending += size
 	if limit := e.c.limits.maxPending; limit > 0 && e.pending > limit && !e.paused {
 		// Under the lock, so a worker that drains the queue at once cannot
@@ -314,12 +320,12 @@ func (e *eventConn) schedule() {
 // Run drains the queue on a worker (eventConn is its own pool.Task); at most
 // one Run is active per connection.
 // A handled batch is settled under the same lock that takes the next one: its
-// bytes leave pending, and its emptied array takes the messages that arrive
-// while the next batch is handled. An idle connection keeps no array.
+// bytes leave pending, and its emptied queue takes the messages that arrive
+// while the next batch is handled. An idle connection keeps no queue.
 func (e *eventConn) Run() {
 	var (
-		spare   []message // the array of the batch just handled, emptied
-		handled int64     // that batch's payload bytes
+		spare   *[]message // the queue of the batch just handled, emptied
+		handled int64      // that batch's payload bytes
 	)
 	for {
 		e.mu.Lock()
@@ -328,13 +334,16 @@ func (e *eventConn) Run() {
 			e.paused = false
 			e.c.raw.ResumeRead()
 		}
-		if len(e.queue) == 0 {
+		if e.queue == nil || len(*e.queue) == 0 {
 			e.running = false
+			q := e.queue
 			e.queue = nil
 			notify := e.closed && !e.notified
 			e.notified = e.notified || notify
 			err := e.closeErr
 			e.mu.Unlock()
+			queues.Put(q)
+			queues.Put(spare)
 			if notify {
 				e.callClose(err)
 			}
@@ -344,8 +353,9 @@ func (e *eventConn) Run() {
 		e.queue = spare
 		failed := e.failed
 		e.mu.Unlock()
-		handled = e.handle(batch, failed)
-		spare = batch[:0]
+		handled = e.handle(*batch, failed)
+		*batch = (*batch)[:0]
+		spare = batch
 	}
 }
 

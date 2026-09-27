@@ -14,3 +14,7 @@ const KeepAliveInherited = false
 const noDelayInherited = false
 
 const tcpKeepIdle = unix.TCP_KEEPALIVE
+
+// acceptRetryable reports whether accept failed for the connection it took
+// off the queue rather than for the listener: the peer gave up.
+func acceptRetryable(err error) bool { return err == unix.ECONNABORTED }

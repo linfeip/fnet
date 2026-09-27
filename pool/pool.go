@@ -166,6 +166,13 @@ func (p *Pool) SubmitTask(connID uint64, task Task) error {
 // milliseconds to run again, every connection of that loop waits with it, and
 // sync.Mutex then hands the lock from one such waiter to the next (starvation
 // mode). Only when every shard's lock is taken does it wait for shard i.
+//
+// A task queued on a shard whose workers are all taken would wait until a
+// busy one finishes, however long its tasks block, while other shards idle
+// (after a burst of blocking tasks, say): it goes to a shard with room
+// instead, among those whose lock is free; with none, it waits after all.
+// Which shard runs a connection's task does not matter for its order, since a
+// connection has at most one task at a time.
 func (p *Pool) submit(i uint64, task Task) error {
 	n := uint64(len(p.shards))
 	s := &p.shards[i]
@@ -177,7 +184,28 @@ func (p *Pool) submit(i uint64, task Task) error {
 		}
 		s = &p.shards[(i+k)&(n-1)]
 	}
+	if s.fullLocked() {
+		for k := uint64(1); k < n; k++ {
+			v := &p.shards[(i+k)&(n-1)]
+			if v == s || !v.mu.TryLock() {
+				continue
+			}
+			if !v.fullLocked() {
+				s.mu.Unlock()
+				s = v
+				break
+			}
+			v.mu.Unlock()
+		}
+	}
 	return s.submitLocked(task)
+}
+
+// fullLocked reports whether a task queued on the shard would wait for a busy
+// worker to finish: the tasks queued already take every worker on its way,
+// parked, or yet to start.
+func (s *shard) fullLocked() bool {
+	return s.queue.len() >= s.waking+len(s.idle)+s.max-s.running
 }
 
 func (s *shard) submitLocked(task Task) error {

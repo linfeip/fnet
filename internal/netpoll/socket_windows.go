@@ -11,18 +11,24 @@ import (
 )
 
 // Windows has no readiness API the reactor can own sockets with, so this file
-// emulates one on top of the net package. A read pump goroutine per socket
-// buffers what it reads (or accepts) and marks the socket ready on the poller
-// it is registered with. Writes land in an emulated kernel send buffer that a
-// write pump drains; a full buffer reports EAGAIN, exactly like a non-blocking
-// socket. The reactor above runs unchanged; Windows is a development target,
-// not a production one (it costs a goroutine per idle socket).
+// emulates one with the net package. Reading needs the emulation: a read pump
+// goroutine per socket buffers what it reads (or accepts) and marks the socket
+// ready on the poller it is registered with. Writing does not: Write is a
+// plain blocking net.Conn.Write, so a socket is always writable and never
+// reports EAGAIN, and a peer that does not read holds the writer instead of
+// filling the connection's queue. The reactor above runs unchanged; Windows is
+// a development target, not a production one (it costs a goroutine per idle
+// socket, and has no write backpressure).
 
 const (
 	pumpChunk   = 32 << 10  // bytes read per pump iteration
 	pumpBacklog = 256 << 10 // the read pump pauses until the reactor drains below this
-	sendBuffer  = 256 << 10 // emulated kernel send buffer
-	writeStall  = 30 * time.Second
+	// A write that makes no progress for writeStall fails, taking the
+	// connection down: the reactor holds the connection's write lock while it
+	// writes, so an unbounded write would hold Close too. writeChunk is the
+	// progress it measures by.
+	writeStall = 10 * time.Second
+	writeChunk = 64 << 10
 )
 
 type sock struct {
@@ -30,19 +36,14 @@ type sock struct {
 	ln   net.Listener
 	conn net.Conn
 
-	mu        sync.Mutex
-	cond      sync.Cond // the read pump waits here while rbuf is full
-	poller    *winPoller
-	closed    bool
-	eof       bool // the read pump hit EOF or an error
-	writeOn   bool // write readiness requested
-	acceptQ   []net.Conn
-	rbuf      []byte
-	wbuf      []byte // accepted by Write, not yet handed to the write pump
-	inflight  int    // bytes the write pump is sending
-	writing   bool   // a write pump is running
-	shutWrite bool   // CloseWrite was called: half-close once wbuf is sent
-	werr      error  // the write pump failed
+	mu      sync.Mutex
+	cond    sync.Cond // the read pump waits here while rbuf is full
+	poller  *winPoller
+	closed  bool
+	eof     bool // the read pump hit EOF or an error
+	writeOn bool // write readiness requested
+	acceptQ []net.Conn
+	rbuf    []byte
 
 	queued bool // guarded by poller.mu: already on poller.ready
 }
@@ -81,10 +82,6 @@ func lookup(fd int) *sock {
 
 func (s *sock) readableLocked() bool {
 	return len(s.rbuf) > 0 || s.eof || len(s.acceptQ) > 0
-}
-
-func (s *sock) writableLocked() bool {
-	return s.conn != nil && (s.werr != nil || len(s.wbuf)+s.inflight < sendBuffer)
 }
 
 func (s *sock) notify() {
@@ -206,82 +203,36 @@ func Read(fd int, b []byte) (int, error) {
 	return n, nil
 }
 
-// Write copies b into the emulated send buffer. It returns a short count once
-// the buffer fills and EAGAIN while it is full.
+// Write sends b, blocking until the kernel has taken all of it. It fails once
+// the peer takes nothing for writeStall.
 func Write(fd int, b []byte) (int, error) {
 	s := lookup(fd)
 	if s == nil || s.conn == nil {
 		return 0, net.ErrClosed
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.werr != nil {
-		return 0, s.werr
-	}
-	n := min(len(b), sendBuffer-len(s.wbuf)-s.inflight)
-	if n <= 0 {
-		return 0, syscall.EAGAIN
-	}
-	s.wbuf = append(s.wbuf, b[:n]...)
-	if !s.writing {
-		s.writing = true
-		go s.writePump()
+	n := 0
+	for n < len(b) {
+		_ = s.conn.SetWriteDeadline(time.Now().Add(writeStall))
+		m, err := s.conn.Write(b[n:min(len(b), n+writeChunk)])
+		n += m
+		if err != nil {
+			return n, err
+		}
 	}
 	return n, nil
 }
 
-// Writev writes iovs in order, stopping at the first short write.
+// Writev writes iovs in order, stopping at the first error.
 func Writev(fd int, iovs [][]byte) (int, error) {
 	total := 0
 	for _, b := range iovs {
-		if len(b) == 0 {
-			continue
-		}
 		n, err := Write(fd, b)
 		total += n
-		if err != nil || n < len(b) {
-			if total > 0 && IsAgain(err) {
-				err = nil
-			}
+		if err != nil {
 			return total, err
 		}
 	}
 	return total, nil
-}
-
-// writePump sends the send buffer, then half-closes or closes the connection
-// if CloseWrite or Close was called meanwhile (so a response written just
-// before still arrives).
-func (s *sock) writePump() {
-	for {
-		s.mu.Lock()
-		if len(s.wbuf) == 0 || s.werr != nil {
-			s.writing = false
-			closed, shutWrite := s.closed, s.shutWrite
-			s.mu.Unlock()
-			switch {
-			case closed:
-				_ = s.conn.Close()
-			case shutWrite:
-				s.closeWrite()
-			}
-			return
-		}
-		chunk := s.wbuf
-		s.wbuf, s.inflight = nil, len(chunk)
-		s.mu.Unlock()
-
-		_ = s.conn.SetWriteDeadline(time.Now().Add(writeStall))
-		_, err := s.conn.Write(chunk)
-
-		s.mu.Lock()
-		s.inflight = 0
-		if err != nil {
-			s.werr = err
-		}
-		s.mu.Unlock()
-		s.notify()
-	}
 }
 
 // KeepAliveInherited reports whether accepted sockets inherit their listener's
@@ -311,26 +262,17 @@ func SetKeepAlive(fd int, ka KeepAlive) error {
 	return nil
 }
 
-// CloseWrite half-closes the connection once the send buffer is flushed.
+// CloseWrite half-closes the connection: every write has already reached the
+// kernel.
 func CloseWrite(fd int) error {
 	s := lookup(fd)
 	if s == nil || s.conn == nil {
 		return net.ErrClosed
 	}
-	s.mu.Lock()
-	s.shutWrite = true
-	flushing := s.writing // the write pump half-closes once it is done
-	s.mu.Unlock()
-	if !flushing {
-		s.closeWrite()
+	if tc, ok := s.conn.(*net.TCPConn); ok {
+		return tc.CloseWrite()
 	}
 	return nil
-}
-
-func (s *sock) closeWrite() {
-	if tc, ok := s.conn.(*net.TCPConn); ok {
-		_ = tc.CloseWrite()
-	}
 }
 
 // LocalAddr returns the local address of the connection fd.
@@ -363,7 +305,6 @@ func Close(fd int) error {
 	s.closed = true
 	pending := s.acceptQ
 	s.acceptQ = nil
-	flushing := s.writing // the write pump closes the conn once it is done
 	s.cond.Broadcast()
 	s.mu.Unlock()
 	for _, c := range pending {
@@ -371,9 +312,6 @@ func Close(fd int) error {
 	}
 	if s.ln != nil {
 		return s.ln.Close()
-	}
-	if flushing {
-		return nil
 	}
 	return s.conn.Close()
 }

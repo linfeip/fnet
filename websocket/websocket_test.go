@@ -2212,3 +2212,52 @@ func startWSServer(t *testing.T, u *websocket.Upgrader) string {
 	time.Sleep(50 * time.Millisecond)
 	return addr
 }
+
+// BenchmarkWebSocketEventDrivenEchoRaw is BenchmarkWebSocketEventDrivenEcho
+// with a client that allocates nothing, so allocs/op are the server's.
+func BenchmarkWebSocketEventDrivenEchoRaw(b *testing.B) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	upgrader := &websocket.Upgrader{
+		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
+			_ = c.WriteMessage(op, msg)
+		},
+	}
+	srv := &fhttp.Server{Addr: addr, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = upgrader.Upgrade(w, r)
+	})}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, _, err := ws.DefaultDialer.Dial(ctx, "ws://"+addr+"/")
+	if err != nil {
+		b.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	payload := make([]byte, 1024)
+	var req bytes.Buffer
+	if err := ws.WriteFrame(&req, ws.MaskFrame(ws.NewBinaryFrame(payload))); err != nil {
+		b.Fatal(err)
+	}
+	resp := make([]byte, 4+len(payload)) // an unmasked 1 KiB frame: 4-byte header
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := conn.Write(req.Bytes()); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := io.ReadFull(conn, resp); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -57,13 +57,14 @@ Acceptor（accept4）--> 事件循环（epoll / kqueue）---- 空闲连接停在
 ## 核心设计与数据流转
 
 ### 1. 百万连接“零协程常驻”模型
-* **空闲连接**：只挂在事件循环的 epoll/kqueue 上，占分块连接表一个指针槽位加一个 `reactor.Conn`（240 B）。不持有 Goroutine、不持有 Worker、不持有读写缓冲；64 KiB 读缓冲属于事件循环。
+* **空闲连接**：只挂在事件循环的 epoll/kqueue 上，占分块连接表一个指针槽位加一个 `reactor.Conn`（208 B）。不持有 Goroutine、不持有 Worker、不持有读写缓冲；64 KiB 读缓冲属于事件循环。
 * **连接表设计**：分块（2048 槽位/块）原子指针数组，$O(1)$ 查找，扩容时无全局锁争用。
 
 ### 2. HTTP
-* **头部就绪即调度**：头部（`\r\n\r\n`）收齐即交给 WorkerPool，不等 Body。超过 `MaxHeaderBytes`（64 KiB）的头部回 `431`，明文与 TLS 一致；畸形请求回 `400`，与 `net/http` 相同。
+* **头部就绪即调度**：头部（`\r\n\r\n`）收齐即交给 WorkerPool，不等 Body。超过 `MaxHeaderBytes`（64 KiB）的头部回 `431`（仅请求行就超限时回 `414`），明文与 TLS 一致；畸形请求回 `400`，HTTP 版本不是 1.x 的回 `505`，与 `net/http` 相同。
 * **worker 上是阻塞语义**：worker 持有连接期间按普通阻塞 `net.Conn` 语义读写，两个方向都由 TCP 流控兜住：handler 还没读的上传最多缓冲 256 KiB，给慢客户端的下载让 handler 的 `Write` 等待，而不是无限排队。`io.Copy` 两个方向都是恒定内存。
-* **`net/http` 行为**：`Flush` 与 `http.ResponseController`（SSE、流式响应）、客户端断开时取消 `r.Context()`、校验 `Content-Length`（多写返回 `http.ErrContentLength`，少写则关闭连接）、`103 Early Hints` 等 `1xx` 中间响应、handler panic 记入 `ErrorLog`，以及让进行中请求完成的 `Shutdown(ctx)`。
+* **`net/http` 行为**：响应头随第一段 body、`Flush` 或 handler 返回时发出（小响应一次写出并算好 `Content-Length`），`WriteHeader` 之后再改 header 不生效；未设置 `Content-Type` 时自动嗅探；响应 trailer（`Trailer`、`http.TrailerPrefix`）走分块编码，请求 trailer 放进 `r.Trailer`。`Flush` 与 `http.ResponseController`（SSE、流式响应、全双工）、客户端断开时取消 `r.Context()`、校验 `Content-Length`（多写返回 `http.ErrContentLength`，少写则关闭连接）、`103 Early Hints` 等 `1xx` 中间响应、`WriteHeader` 之后 `Hijack` 会先发出该状态、handler panic 记入 `ErrorLog`，以及让进行中请求完成、并等最后一个响应离开进程才返回的 `Shutdown(ctx)`。
+* **RFC 9112 报文边界**：与 `net/http` 相同的 Host 规则（HTTP/1.1 请求没有 Host 或有两个都回 `400`，空 Host 合法）；字段名与冒号之间有空格回 `400`，而不是忽略一个前端可能当成边界字段的头；同时带 `Transfer-Encoding` 与 `Content-Length`、或 HTTP/1.0 带 `Transfer-Encoding` 的请求，响应后关闭连接，藏在 body 后面的请求不会被执行；请求行之前的空行被忽略；`HEAD` 响应只声明 handler 实际写出的 body 长度，不猜一个 0。`fhttp/rfc9112_test.go` 在线路上逐项验证。
 * **回到空闲**：响应写完后连接回到事件循环、释放 worker 协程；已缓冲的流水线请求则留在当前 worker。TLS 会话同样挂回 poller，保留 TLS 状态（TLS 的 keep-alive 需显式开启：设置 `IdleTimeout`）。客户端半关闭（发完请求即 FIN）照样收到完整响应。
 * **超时不占协程**：连接在事件循环手里时，由每个事件循环的时间轮执行两个截止时间：请求头截止（`ReadHeaderTimeout`，默认 30s，从建连或该请求第一个字节算起，慢速滴灌无法续期）和 keep-alive 空闲截止（`IdleTimeout`，默认 2 分钟）。关闭时对端不再读走数据的连接，30s 无进展即强制关闭。
 * **`Expect: 100-continue`**：handler 第一次读 body 时回 `100 Continue`；handler 不读 body 就回复的，回复后关闭连接。
@@ -95,10 +96,10 @@ Acceptor（accept4）--> 事件循环（epoll / kqueue）---- 空闲连接停在
 - **双模 WebSocket 支持**：
   - **事件驱动模式（推荐）**：连接空闲时 0 协程常驻，Reactor 读事件触发解析，业务数据包自动投递到内置工作协程池执行，绝不卡死 IO Reactor 事件循环。
   - **阻塞协程模式**：兼容传统业务模型，保留独立 Goroutine 阻塞 `ReadMessage()` / `WriteMessage()`。
-- **内置工作协程池**：有上限的弹性协程池，按核分片、每片一把锁，事件循环与 worker 很少争锁；事件循环投递时从不等锁，分片锁被占就交给下一个空闲分片。worker 做完一个任务直接取下一个、不停车；停着的 worker 只为没人认领的任务唤醒，每个分片同时最多叫醒两个（其余任务按顺序等已在跑的 worker，每个 worker 取到任务时再叫醒下一个）；只有所有 worker 都忙时才新起一个；worker 停车前先去别的分片拿等着的任务——10 万条繁忙的 WebSocket 连接只需几百个 worker。worker 按需启动（上限 `MaxWorkers`，由各分片均分）、空闲超时退出，超出上限的任务按顺序排队而不是再起协程。HTTP 业务请求（`ServeHTTP`）、WebSocket 与 TCP 业务消息（`OnMessage`）默认都在这里执行，事件循环不被阻塞；同一连接的回调一次一个、按到达顺序执行。任何协程池都可以作为 `WorkerPool` 接入，例如 `pool.Adapt(ants.Submit)`；返回 error 即拒绝该任务并关闭对应连接。
+- **内置工作协程池**：有上限的弹性协程池，按核分片、每片一把锁，事件循环与 worker 很少争锁；事件循环投递时从不等锁，分片锁被占就交给下一个空闲分片。worker 做完一个任务直接取下一个、不停车；停着的 worker 只为没人认领的任务唤醒，每个分片同时最多叫醒两个（其余任务按顺序等已在跑的 worker，每个 worker 取到任务时再叫醒下一个）；只有所有 worker 都忙时才新起一个；worker 停车前先去别的分片拿等着的任务；某分片的 worker 全被占用（比如 handler 阻塞）时，发给它的任务改投还有余量的分片——10 万条繁忙的 WebSocket 连接只需几百个 worker。worker 按需启动（上限 `MaxWorkers`，由各分片均分）、空闲超时退出，超出上限的任务按顺序排队而不是再起协程。HTTP 业务请求（`ServeHTTP`）、WebSocket 与 TCP 业务消息（`OnMessage`）默认都在这里执行，事件循环不被阻塞；同一连接的回调一次一个、按到达顺序执行。任何协程池都可以作为 `WorkerPool` 接入，例如 `pool.Adapt(ants.Submit)`；返回 error 即拒绝该任务并关闭对应连接。
 - **向量化写入 (writev)**：将帧头部与数据负载通过单次系统调用直达网卡，杜绝内存拼包拷贝。
 - **空闲连接内存小**：全局分块无锁连接表（O(1) 访问）、只在 worker 服务期间存在的连接状态、缓冲区自动收缩。
-- **运行平台**：生产运行在 Linux (`epoll`) 上，容量和默认值都按 Linux 设计。macOS (`kqueue`) 行为一致，用于开发。Windows 为基于 `net` 包的开发用仿真（每个 socket 一个泵协程），不用于生产。
+- **运行平台**：生产运行在 Linux (`epoll`) 上，容量和默认值都按 Linux 设计。macOS (`kqueue`) 行为一致，用于开发。Windows 为基于 `net` 包的开发用仿真（每个 socket 一个读泵协程；写直接调用阻塞的 `net.Conn.Write`，没有写背压），不用于生产。
 
 ---
 

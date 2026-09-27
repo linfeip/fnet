@@ -105,7 +105,7 @@ func (p *winPoller) Wait(timeout time.Duration) ([]Event, error) {
 			ev := Event{
 				Fd:       s.id,
 				Readable: !s.closed && s.readableLocked(),
-				Writable: !s.closed && s.writeOn && s.writableLocked(),
+				Writable: !s.closed && s.writeOn && s.conn != nil, // writes block instead of queueing
 				Hup:      !s.closed && s.eof,
 			}
 			s.mu.Unlock()

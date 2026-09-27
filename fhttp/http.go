@@ -15,20 +15,47 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	_ "unsafe" // go:linkname
 
 	"github.com/linfeip/fnet/internal/reactor"
 	"github.com/linfeip/fnet/pool"
 )
 
+// readRequest is the request reader of net/http's server, which
+// http.ReadRequest wraps only to drop the Host header. The server needs that
+// header to tell a request without Host from one with an empty Host (RFC 9112
+// 3.2), as net/http's server does. net/http keeps it reachable by name
+// (go.dev/issue/67401).
+//
+//go:linkname readRequest net/http.readRequest
+func readRequest(b *bufio.Reader) (*http.Request, error)
+
 // maxBodyDrain is how much of a request body the handler left unread is
 // discarded to keep the connection alive; larger leftovers close it.
 const maxBodyDrain = 256 << 10
 
-// errorHeaders completes the status line of the error responses sent to bad
-// requests, like net/http's.
-const errorHeaders = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
+// errorResponse is the response to a request that is not served, worded like
+// net/http's, with the Date an origin server sends (RFC 9110 6.6.1). The
+// connection closes after it.
+func errorResponse(status, reason string) []byte {
+	body := status
+	if reason != "" {
+		body += ": " + reason
+	}
+	return []byte("HTTP/1.1 " + status + "\r\nContent-Type: text/plain; charset=utf-8\r\nDate: " + httpDate() +
+		"\r\nConnection: close\r\n\r\n" + body)
+}
 
-var headerTooLarge = []byte("HTTP/1.1 431 Request Header Fields Too Large" + errorHeaders + "431 Request Header Fields Too Large")
+// blankPrefix returns how many CR and LF bytes b starts with: empty lines a
+// server ignores before a request line (RFC 9112 2.2), which old clients send
+// after a request body.
+func blankPrefix(b []byte) int {
+	n := 0
+	for n < len(b) && (b[n] == '\r' || b[n] == '\n') {
+		n++
+	}
+	return n
+}
 
 // headerComplete reports whether b holds the blank line that ends a request
 // header ("\r\n\r\n" or "\n\n", as textproto reads it).
@@ -132,12 +159,26 @@ func (h *httpHandler) OnOpen(c *reactor.Conn) {
 // OnData runs on the event loop with everything buffered so far; only the
 // bytes new since the last call are searched for the end of the header.
 func (h *httpHandler) OnData(c *reactor.Conn, data []byte) int {
-	if h.tlsConfig != nil || headerComplete(data[max(0, len(data)-c.NewBytes()-3):]) {
+	if h.tlsConfig != nil {
 		h.dispatch(c, nil)
 		return 0
 	}
-	if len(data) > h.maxHeader {
-		_, _ = c.Write(headerTooLarge) // a header that never ends, slowly or not
+	skip := blankPrefix(data)
+	if skip == len(data) {
+		return skip // empty lines between requests: the connection is still idle
+	}
+	if headerComplete(data[max(skip, len(data)-c.NewBytes()-3):]) {
+		h.dispatch(c, nil) // the worker skips the empty lines too
+		return 0
+	}
+	if len(data)-skip > h.maxHeader {
+		// A header that never ends, slowly or not; 414 if its request line
+		// alone is too long (RFC 9112 3).
+		status := "431 Request Header Fields Too Large"
+		if bytes.IndexByte(data[skip:], '\n') < 0 {
+			status = "414 URI Too Long"
+		}
+		_, _ = c.Write(errorResponse(status, ""))
 		_ = c.Close()
 		return 0
 	}
@@ -163,25 +204,27 @@ func (h *httpHandler) dispatch(c *reactor.Conn, s *session) {
 }
 
 // closeIdle closes the connections waiting for a request that has not begun,
-// for Shutdown, and reports how many HTTP connections are still waiting.
+// for Shutdown, and reports how many HTTP connections are still waiting: for
+// a request that has begun, or for their last response to reach the peer.
 func (h *httpHandler) closeIdle(eng *reactor.Engine) (waiting int) {
 	eng.ForEach(func(c *reactor.Conn) {
 		switch hh := c.Handler().(type) {
 		case *httpHandler:
-			if hh != h || c.Detached() {
-				return // served by a worker (counted in active), or hijacked
+			if hh != h {
+				return
 			}
 		case *session:
-			if c.Detached() {
-				return // its next request is being served (counted in active)
-			}
 		default:
 			return // upgraded, e.g. to WebSocket
 		}
-		waiting++
-		if c.Buffered() == 0 {
+		switch {
+		case c.Closing(): // flushing its last response
+		case c.Detached():
+			return // served by a worker (counted in active), or hijacked
+		case c.Buffered() == 0:
 			_ = c.Close()
 		}
+		waiting++
 	})
 	return waiting
 }
@@ -304,16 +347,30 @@ func (s *session) serveOne() outcome {
 	_ = s.rw.SetReadDeadline(after(start, h.headerTimeout))
 	s.lr.n = int64(h.maxHeader) + 4096 // the reader's buffer may run ahead of the header
 	s.lr.hit = false
-	req, err := http.ReadRequest(s.br)
+	for { // empty lines before the request line are ignored (RFC 9112 2.2)
+		if b, err := s.br.Peek(1); err != nil || b[0] != '\r' && b[0] != '\n' {
+			break
+		}
+		_, _ = s.br.Discard(1)
+	}
+	ahead, _ := s.br.Peek(s.br.Buffered())
+	s.lr.lf = bytes.IndexByte(ahead, '\n') >= 0
+	te, cl := framingFields(ahead) // readRequest removes both from the header
+	req, err := readRequest(s.br)
 	s.lr.n = -1
 	if err != nil {
 		s.refuse(err)
 		return closeConn
 	}
-	if reason := checkHost(req); reason != "" {
+	if !supportedVersion(req) {
+		s.reply("505 HTTP Version Not Supported", "unsupported protocol version")
+		return closeConn
+	}
+	if reason := checkHeader(req); reason != "" {
 		s.reply("400 Bad Request", reason)
 		return closeConn
 	}
+	delete(req.Header, "Host") // promoted to req.Host, as net/http does
 	if exp := req.Header.Get("Expect"); exp != "" && !strings.EqualFold(exp, "100-continue") {
 		s.reply("417 Expectation Failed", "") // as net/http does (RFC 9110 10.1.1)
 		return closeConn
@@ -326,14 +383,20 @@ func (s *session) serveOne() outcome {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s.c.NotifyInputEnd(cancel)
-	req = req.WithContext(ctx)
+	// In place, not the copy WithContext returns: the body reader stores the
+	// request's trailers in the Request it was read with.
+	*req = *req.WithContext(ctx)
 	req.RemoteAddr = s.c.RemoteAddrString()
 	req.TLS = s.tlsState
 
 	w := newResponseWriter(h, s.rw, s.br, s.raw)
 	w.isHead = req.Method == http.MethodHead
 	w.http10 = !req.ProtoAtLeast(1, 1)
-	w.closeConn = req.Close || s.raw == nil && h.idleTimeout <= 0
+	w.closeConn = req.Close || s.raw == nil && h.idleTimeout <= 0 ||
+		// Framing a front end may have read otherwise: chunked with a
+		// Content-Length, or any Transfer-Encoding from an HTTP/1.0 client.
+		// Nothing after the body can be trusted (RFC 9112 6.1).
+		len(req.TransferEncoding) > 0 && cl || w.http10 && te
 	var body *requestBody
 	if req.Body != http.NoBody {
 		body = &requestBody{src: req.Body}
@@ -406,7 +469,8 @@ func (s *session) nextBuffered() bool {
 			return true
 		}
 		ahead, _ := s.br.Peek(n)
-		return headerComplete(ahead)
+		ahead = ahead[blankPrefix(ahead):]
+		return len(ahead) > 0 && headerComplete(ahead)
 	}
 	if s.raw != nil {
 		return false
@@ -419,15 +483,20 @@ func (s *session) nextBuffered() bool {
 }
 
 // refuse answers a request that could not be read, like net/http: 431 for a
-// header over the limit, 501 for an unknown transfer coding, 400 for the
-// rest. A peer that left, or went quiet past the deadline, gets nothing.
+// header over the limit (414 when its request line is, RFC 9112 3), 501 for
+// an unknown transfer coding, 400 for the rest. A peer that left, or went
+// quiet past the deadline, gets nothing.
 func (s *session) refuse(err error) {
 	var ne net.Error
 	switch {
+	case s.lr.hit && !s.lr.lf:
+		s.reply("414 URI Too Long", "")
 	case s.lr.hit:
 		s.reply("431 Request Header Fields Too Large", "")
 	case err == io.EOF, err == io.ErrUnexpectedEOF, errors.Is(err, net.ErrClosed), errors.As(err, &ne) && ne.Timeout():
-	case strings.Contains(err.Error(), "unsupported transfer encoding"):
+	case strings.Contains(err.Error(), "transfer encoding"):
+		// net/http's unsupportedTEError: a coding other than chunked, or
+		// several Transfer-Encoding lines.
 		s.reply("501 Not Implemented", "unsupported transfer encoding")
 	default:
 		s.reply("400 Bad Request", "")
@@ -436,26 +505,84 @@ func (s *session) refuse(err error) {
 
 // reply sends an error response to a request that is not served.
 func (s *session) reply(status, reason string) {
-	body := status
-	if reason != "" {
-		body += ": " + reason
-	}
 	_ = s.rw.SetWriteDeadline(time.Now().Add(time.Second))
-	_, _ = io.WriteString(s.rw, "HTTP/1.1 "+status+errorHeaders+body)
+	_, _ = s.rw.Write(errorResponse(status, reason))
 }
 
-// checkHost applies the Host rules net/http's server adds to ReadRequest's
-// (RFC 9112 3.2): an HTTP/1.1 request names its host, validly. ReadRequest
-// has already refused several Host headers and moved the one into req.Host.
-// It returns why the request is refused, or "".
-func checkHost(req *http.Request) string {
+// supportedVersion reports whether the server speaks the request's protocol,
+// as net/http's does: HTTP/1.x, and the HTTP/2 connection preface, which a
+// handler may take over (h2c). Anything else gets 505 (RFC 9110 15.6.6).
+func supportedVersion(req *http.Request) bool {
+	return req.ProtoMajor == 1 ||
+		req.ProtoMajor == 2 && req.ProtoMinor == 0 && req.Method == "PRI" && req.RequestURI == "*"
+}
+
+// checkHeader applies the rules net/http's server adds to readRequest's, and
+// returns why the request is refused, or "". An HTTP/1.1 request carries a
+// Host header, even when its target is in absolute form, and a well-formed
+// one, which may be empty (RFC 9112 3.2); readRequest has refused several
+// already. Field names are tokens: textproto lets a space before the colon
+// through, which RFC 9112 5.1 has refused, since a front end may read
+// "Transfer-Encoding :" as the framing header this server would ignore.
+// (textproto has checked the field values.)
+func checkHeader(req *http.Request) string {
+	hosts, ok := req.Header["Host"]
 	switch {
-	case req.ProtoAtLeast(1, 1) && req.Host == "" && req.Method != http.MethodConnect:
+	case req.ProtoAtLeast(1, 1) && (!ok || len(hosts) == 0) && req.Method != http.MethodConnect && req.Method != "PRI":
 		return "missing required Host header"
-	case !validHost(req.Host):
+	case len(hosts) == 1 && !validHost(hosts[0]):
 		return "malformed Host header"
 	}
+	for k := range req.Header {
+		if !validFieldName(k) {
+			return "invalid header name"
+		}
+	}
 	return ""
+}
+
+// validFieldName reports whether k is a token (RFC 9110 5.1, 5.6.2).
+func validFieldName(k string) bool {
+	if k == "" {
+		return false
+	}
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+var (
+	transferEncodingField = []byte("transfer-encoding:")
+	contentLengthField    = []byte("content-length:")
+)
+
+// framingFields reports whether the request header at the start of b has a
+// Transfer-Encoding and a Content-Length field. readRequest drops both, and
+// they matter together (see serveOne). A header that runs past b may hold
+// either.
+func framingFields(b []byte) (te, cl bool) {
+	for {
+		i := bytes.IndexByte(b, '\n')
+		if i < 0 {
+			return true, true
+		}
+		b = b[i+1:]
+		switch {
+		case len(b) > 0 && b[0] == '\n', len(b) > 1 && b[0] == '\r' && b[1] == '\n':
+			return te, cl // the end of the header
+		case len(b) >= 18 && (b[0]|0x20) == 't':
+			te = te || bytes.EqualFold(b[:18], transferEncodingField)
+		case len(b) >= 15 && (b[0]|0x20) == 'c':
+			cl = cl || bytes.EqualFold(b[:15], contentLengthField)
+		}
+	}
 }
 
 // validHost reports whether h is made of the bytes a Host header may hold: a
@@ -478,6 +605,7 @@ type limitReader struct {
 	r   io.Reader
 	n   int64 // bytes left; < 0 means no limit
 	hit bool  // the limit was reached
+	lf  bool  // the request line is complete: a line feed went by
 }
 
 func (l *limitReader) Read(p []byte) (int, error) {
@@ -491,6 +619,7 @@ func (l *limitReader) Read(p []byte) (int, error) {
 	n, err := l.r.Read(p)
 	if l.n > 0 {
 		l.n -= int64(n)
+		l.lf = l.lf || bytes.IndexByte(p[:n], '\n') >= 0
 	}
 	return n, err
 }
@@ -534,7 +663,7 @@ func (b *requestBody) Close() error {
 // bodies beyond maxBodyDrain, and on a body the client was never told to send
 // (100-continue answered with a final response), which may never arrive.
 func (b *requestBody) drain() bool {
-	if b.expect && !b.started {
+	if b.expect && !b.started && !b.w.sent100 {
 		return false
 	}
 	n, err := io.CopyN(io.Discard, b.src, maxBodyDrain+1)

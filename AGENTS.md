@@ -23,7 +23,7 @@ fnet 是 Go 的网络框架：根包 `fnet` 跑自定义 TCP 消息协议（游�
 **本项目主要运行在 Linux 上。** 生产部署、百万连接容量、性能和默认值都以 Linux 为准：epoll（边沿触发）、`accept4`、`writev`，以及由监听 socket 继承给新连接的 TCP keep-alive 选项。默认不设 `SO_REUSEPORT`（误启动的第二个实例应当失败，而不是悄悄分走连接）；需要时由业务通过 `Listen` 自己打开。
 
 - macOS（kqueue）：行为正确、能编译、测试能过，用于开发；不为它做性能取舍。
-- Windows：基于 `net` 包的开发用仿真，每个 socket 一个泵 goroutine。只保证能编译、测试能过，不代表生产行为，也不承担容量。不为 Windows 仿真上的表现去改 reactor 或默认值。
+- Windows：基于 `net` 包的开发用仿真，每个 socket 一个读泵 goroutine，写直接调用阻塞的 `net.Conn.Write`（没有写背压：对端不读时写者等待，10s 无进展则连接失败）。只保证能编译、测试能过，依赖写背压的测试在 Windows 上跳过；不代表生产行为，也不承担容量。不为 Windows 仿真上的表现去改 reactor 或默认值。
 - 平台差异只留在 `internal/netpoll` 的 poller、socket、writev 实现文件里；reactor 及以上的非测试代码不出现 `runtime.GOOS` 或平台 build tag。
 - 百万连接要靠部署方调高 fd 上限等系统参数，代码不能假设已经调好：fd 耗尽（EMFILE）时 accept 退避重试，不空转，也不退出。
 - 开发机不是 Linux 时，本机 `go test ./...` 通过不代表 epoll 路径正确。动到 netpoll、reactor 或连接生命周期时，至少跑 `GOOS=linux go vet ./...`，并用 `GOOS=linux go test -c` 交叉编译改动包的测试；能在 Linux（CI、WSL、容器）上跑 `go test -race ./...` 就跑。没在 Linux 上跑过的，在说明里写明。
@@ -43,7 +43,7 @@ fnet 是 Go 的网络框架：根包 `fnet` 跑自定义 TCP 消息协议（游�
 
 空闲连接只挂在 poller 上，并占连接表里的一个槽。它不持有 goroutine，也不持有 worker。读缓冲放在 reactor 上共享。
 
-`conn` 上多一个字段、或每条连接多一个 goroutine、map、常驻缓冲，都先按 1e6 算清字节和 goroutine，再改，并在说明里写出这笔账。当前每条空闲连接的对象：`reactor.Conn` 208 B；TCP 连接另有 `fnet.Conn` 104 B；事件驱动 WebSocket 另有 `eventConn` 128 B 和 `websocket.Conn` 104 B（压缩等级、大小上限、背压阈值等由同配置的连接共享一份）。worker 服务连接期间另有 `reactor.blocking` 136 B，空闲连接不持有。改动后用 `unsafe.Sizeof` 重新量，并同步这里的数字。
+`conn` 上多一个字段、或每条连接多一个 goroutine、map、常驻缓冲，都先按 1e6 算清字节和 goroutine，再改，并在说明里写出这笔账。当前每条空闲连接的对象：`reactor.Conn` 208 B；TCP 连接另有 `fnet.Conn` 88 B；事件驱动 WebSocket 另有 `eventConn` 112 B 和 `websocket.Conn` 104 B（压缩等级、大小上限、背压阈值等由同配置的连接共享一份）。worker 服务连接期间另有 `reactor.blocking` 136 B，空闲连接不持有。改动后用 `unsafe.Sizeof` 重新量，并同步这里的数字。
 
 ## 热路径
 
