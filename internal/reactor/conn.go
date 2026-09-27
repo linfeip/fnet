@@ -81,9 +81,9 @@ type EOFHandler interface {
 // queued, then flushed by the loop, when the kernel buffer is full. Conn
 // implements net.Conn.
 //
-// The inbound side comes first and the outbound side last: mu, which the loop
-// takes for every read, and wmu, which a worker takes for every write, then
-// never share a cache line, in one Conn or between neighbours.
+// Inbound fields come first and outbound fields last, so mu (taken by the loop
+// on every read) and wmu (taken on every write) never share a cache line,
+// within a Conn or across neighbours.
 type Conn struct {
 	// Inbound side.
 	mu       sync.Mutex
@@ -127,11 +127,10 @@ type blocking struct {
 	writing   bool      // guarded by wmu: a write is in progress
 }
 
-// input is the inbound bytes a connection keeps between reads: what its
-// handler left unconsumed, a partial message say, or what a blocking reader
-// has not read yet. A connection has one only while it keeps such bytes, or
-// while a blocking reader, which will want the space again, owns the input:
-// an idle connection pays a pointer for it.
+// input holds the inbound bytes kept between reads: what the handler left
+// unconsumed (a partial message), or what a blocking reader has not read yet.
+// It exists only while there are such bytes or a blocking reader owns the
+// input, so an idle connection pays just the pointer.
 type input struct {
 	b     []byte
 	off   int   // b[off:] is not consumed yet
@@ -140,12 +139,17 @@ type input struct {
 
 func (in *input) unread() []byte { return in.b[in.off:] }
 
-// add appends p, first moving what is left to the front when the consumed
-// prefix is large or larger than what is left.
+// compact moves the bytes not consumed yet to the front of b.
+func (in *input) compact() {
+	n := copy(in.b, in.b[in.off:])
+	in.b, in.off = in.b[:n], 0
+}
+
+// add appends p, compacting first when the consumed prefix is large or larger
+// than what is left.
 func (in *input) add(p []byte) {
-	if unread := len(in.b) - in.off; in.off > 0 && (in.off > compactAfter || in.off >= unread) {
-		copy(in.b, in.b[in.off:])
-		in.b, in.off = in.b[:unread], 0
+	if in.off > 0 && (in.off > compactAfter || in.off >= len(in.b)-in.off) {
+		in.compact()
 	}
 	in.b = append(in.b, p...)
 }
@@ -160,8 +164,7 @@ func (in *input) consume(n int) bool {
 		return false
 	}
 	if in.off > compactAfter && in.off >= unread {
-		copy(in.b, in.b[in.off:])
-		in.b, in.off = in.b[:unread], 0
+		in.compact()
 	}
 	return true
 }
@@ -186,27 +189,22 @@ func newConn(fd int, l *Loop, ln *Listener, raddr netip.AddrPort, h Handler) *Co
 // the Conn and suitable as a worker-affinity key.
 func (c *Conn) Fd() int { return c.fd }
 
+// setState and clearState only load when there is nothing to change, so the
+// common no-op does not write the state's cache line.
 func (c *Conn) setState(bit uint32) {
-	for {
-		s := c.state.Load()
-		if s&bit != 0 || c.state.CompareAndSwap(s, s|bit) {
-			return
-		}
+	if c.state.Load()&bit == 0 {
+		c.state.Or(bit)
 	}
 }
 
-// clearState clears bit and returns the state it left behind, or ok=false if
-// bit was already clear.
+// clearState clears bit and returns the state it left behind, and whether bit
+// was set.
 func (c *Conn) clearState(bit uint32) (uint32, bool) {
-	for {
-		s := c.state.Load()
-		if s&bit == 0 {
-			return s, false
-		}
-		if c.state.CompareAndSwap(s, s&^bit) {
-			return s &^ bit, true
-		}
+	if s := c.state.Load(); s&bit == 0 {
+		return s, false
 	}
+	old := c.state.And(^bit)
+	return old &^ bit, old&bit != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -333,11 +331,9 @@ func (c *Conn) Unread(b []byte) {
 // the connection.
 func (c *Conn) SetCloseDeadline(t time.Time) { c.setDeadline(unixNano(t)) }
 
-// setDeadline arms the close deadline. A loop whose wheel was empty may be
-// asleep for up to pollTimeout, so it is only woken for a deadline sooner than
-// that: a later one is on the wheel when the loop next wakes. Most deadlines
-// (a request header's, a keep-alive's) are seconds away, and a wake costs a
-// system call.
+// setDeadline arms the close deadline. A loop with an empty wheel may sleep up
+// to pollTimeout, so it is woken (a system call) only for a deadline sooner
+// than that; most, such as header and keep-alive timeouts, are seconds away.
 func (c *Conn) setDeadline(d int64) {
 	if c.loop != nil && c.loop.wheel.set(c, d) && d-time.Now().UnixNano() < int64(pollTimeout) {
 		c.loop.wake()
@@ -892,14 +888,13 @@ func (c *Conn) flushLocked() (bool, error) {
 	return pending > 0, nil
 }
 
-// Corked runs fn with the connection's output corked: writes from any
-// goroutine are held and leave together, in one write, when fn returns, so
-// the replies to a burst of messages share one system call. A cork holds at
-// most maxCorked bytes (and never more than MaxOutbound), for at most
-// maxCorkDelay: if fn runs longer, a slow handler say, what is held goes out
-// then and later writes go out as they come, so neither the replies written
-// before it nor another goroutine's writes (a broadcast) wait for fn. Only a
-// handler-owned connection is corked; a blocking writer (see Detach) is not.
+// Corked runs fn with the output corked: writes from any goroutine are held
+// and sent in one write when fn returns, so the replies to a burst share one
+// system call. The cork holds at most maxCorked bytes (never more than
+// MaxOutbound) for at most maxCorkDelay; then what is held is sent and later
+// writes go out at once, so a slow fn delays neither earlier replies nor other
+// goroutines' writes (a broadcast). Blocking writers (see Detach) are never
+// corked.
 func (c *Conn) Corked(fn func()) {
 	k := corkTimers.Get().(*corkTimer)
 	k.c.Store(c)
@@ -961,11 +956,10 @@ func (c *Conn) Close() error {
 	return nil
 }
 
-// shutdown closes the connection once its queued output is flushed and records
-// err for OnClose. A peer that stops reading cannot hold the flush open: it
-// ends after drainStall without progress. Like a kernel send buffer after
-// close(2), the flush ignores the write deadline, which only governs Write
-// calls (tls.Conn.Close moves it to "now" before closing the connection).
+// shutdown records err for OnClose and closes the connection once its queued
+// output is flushed; a peer that takes nothing for drainStall is dropped. Like
+// a kernel send buffer after close(2), the flush ignores the write deadline,
+// which governs Write calls only (tls.Conn.Close sets it to now before closing).
 func (c *Conn) shutdown(err error) {
 	c.wmu.Lock()
 	if c.state.Load()&(stClosed|stDraining) != 0 {
@@ -1003,11 +997,10 @@ func (c *Conn) drainDeadline() int64 {
 }
 
 // drained finishes closing a connection whose output is flushed. If the peer
-// has finished sending too, the socket closes at once. Otherwise the sending
-// side is shut down, so the peer reads EOF right after the last byte, and the
-// peer gets lingerTimeout to finish while whatever it still sends is read and
-// dropped: closing a socket with unread input sends a reset, which can destroy
-// output the peer has not read yet. Loop goroutine only.
+// is done sending too, the socket closes now. Otherwise it half-closes, so the
+// peer reads EOF after the last byte, and the peer gets lingerTimeout to finish
+// while its input is read and dropped: closing with unread input sends a RST,
+// which can destroy output the peer has not read yet. Loop goroutine only.
 func (c *Conn) drained() {
 	switch st := c.state.Load(); {
 	case st&(stClosed|stLinger) != 0:

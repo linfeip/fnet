@@ -112,12 +112,10 @@ func (l *Loop) run() {
 		}
 		l.expireDeadlines()
 		if read {
-			// The workers the input just woke are queued on this goroutine's
-			// P, and Wait is about to hold that P in a system call until the
-			// runtime hands it on, after which the loop waits behind them for
-			// a P of its own. Yielding first runs them here at once: when the
-			// CPU is saturated, the loops no longer take turns stalling for
-			// milliseconds, and every connection's input waits about as long.
+			// The workers this input woke are queued on this P, and Wait would
+			// hold the P in a system call until the runtime hands it off,
+			// leaving the loop to queue behind them for a P. Running them now
+			// keeps loops from stalling for milliseconds on a saturated CPU.
 			runtime.Gosched()
 		}
 	}
@@ -170,13 +168,11 @@ func (l *Loop) run1(t task) {
 	}
 }
 
-// register starts polling a connection the acceptor handed over. Each loop
-// registers its own connections, so a storm of new clients does not queue
-// behind one acceptor's epoll_ctl calls, and a poller's registrations never
-// contend with its Wait. A connection closed before this ran (from OnOpen,
-// say) is skipped: its close was queued first, so its fd may already belong
-// to another connection. Output that filled the socket before registration
-// armed write readiness in vain, so it is armed again.
+// register starts polling a connection the acceptor handed over. Loops
+// register their own connections, so a connect storm does not queue behind the
+// acceptor's epoll_ctl calls. A connection closed before this ran (from
+// OnOpen, say) is skipped: its fd may already belong to another. Write
+// readiness armed before registration was lost, so it is armed again.
 func (l *Loop) register(c *Conn) {
 	if c.state.Load()&stClosed != 0 {
 		return

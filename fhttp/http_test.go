@@ -2001,6 +2001,31 @@ func TestHTTPLargeUnreadBodyClosesConnection(t *testing.T) {
 	}
 }
 
+// An unread body of up to maxBodyDrain bytes is discarded to keep the
+// connection; one byte more closes it.
+func TestHTTPUnreadBodyDrainLimit(t *testing.T) {
+	addr := startHTTPFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ignored")
+	})
+	for _, size := range []int{maxBodyDrain, maxBodyDrain + 1} {
+		c := dialRaw(t, addr)
+		c.write(fmt.Sprintf("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n%s", size, strings.Repeat("b", size)))
+		if got := readBody(t, c.readResponse("POST")); got != "ignored" {
+			t.Fatalf("size %d: body = %q", size, got)
+		}
+		if size <= maxBodyDrain {
+			c.write("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+			readBody(t, c.readResponse("GET"))
+		} else {
+			_ = c.c.SetReadDeadline(time.Now().Add(testIOTimeout))
+			if _, err := c.br.ReadByte(); err == nil || isTimeout(err) {
+				t.Fatalf("size %d: connection stayed open (err=%v)", size, err)
+			}
+		}
+		c.close()
+	}
+}
+
 // TestHTTP10LargeResponseNotChunked: HTTP/1.0 has no chunked encoding, so a
 // body too large to buffer is delimited by closing the connection.
 func TestHTTP10LargeResponseNotChunked(t *testing.T) {

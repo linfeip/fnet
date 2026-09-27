@@ -213,11 +213,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
-// markStopping makes the closes that follow report ErrServerClosed, and
-// returns the handler. Called after run.Stop: ListenAndServe sets the handler
-// before it starts the engine, so once Stop has returned an engine the
-// handler is there, even if ListenAndServe was still starting when Close or
-// Shutdown began.
+// markStopping makes later closes report ErrServerClosed and returns the
+// handler. It runs after run.Stop: ListenAndServe sets the handler before it
+// starts the engine, so if Stop returned an engine, the handler exists.
 func (s *Server) markStopping() *handler {
 	s.mu.Lock()
 	h := s.h

@@ -517,14 +517,13 @@ func supportedVersion(req *http.Request) bool {
 		req.ProtoMajor == 2 && req.ProtoMinor == 0 && req.Method == "PRI" && req.RequestURI == "*"
 }
 
-// checkHeader applies the rules net/http's server adds to readRequest's, and
-// returns why the request is refused, or "". An HTTP/1.1 request carries a
-// Host header, even when its target is in absolute form, and a well-formed
-// one, which may be empty (RFC 9112 3.2); readRequest has refused several
-// already. Field names are tokens: textproto lets a space before the colon
-// through, which RFC 9112 5.1 has refused, since a front end may read
-// "Transfer-Encoding :" as the framing header this server would ignore.
-// (textproto has checked the field values.)
+// checkHeader applies the checks net/http's server adds to readRequest and
+// returns why the request is refused, or "". An HTTP/1.1 request needs a Host
+// header (readRequest already refuses several), well-formed but possibly
+// empty, even with an absolute-form target (RFC 9112 3.2). Field names must be
+// tokens: textproto accepts a space before the colon, which RFC 9112 5.1
+// forbids, since a front end may take "Transfer-Encoding :" as framing this
+// server ignores. textproto has checked the values.
 func checkHeader(req *http.Request) string {
 	hosts, ok := req.Header["Host"]
 	switch {
@@ -666,6 +665,7 @@ func (b *requestBody) drain() bool {
 	if b.expect && !b.started && !b.w.sent100 {
 		return false
 	}
-	n, err := io.CopyN(io.Discard, b.src, maxBodyDrain+1)
-	return n <= maxBodyDrain && (err == nil || err == io.EOF)
+	// io.EOF only when the body ended short of maxBodyDrain+1 bytes.
+	_, err := io.CopyN(io.Discard, b.src, maxBodyDrain+1)
+	return err == io.EOF
 }

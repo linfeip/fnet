@@ -30,11 +30,10 @@ var queues bufpool.Queues[message]
 
 // eventConn drives an event-driven connection. OnData runs on the event loop:
 // it parses frames, enforces RFC 6455, answers control frames, and copies each
-// complete message into a pooled buffer, which the messages that arrived whole
-// in the same read share. Messages run on the worker pool, one
-// task at a time per connection, so OnMessage calls stay ordered and never
-// stall the loop. A slow consumer pauses reading (backpressure) instead of
-// buffering without bound.
+// complete message into pooled buffers shared by the messages of one read.
+// Messages run on the worker pool, one task at a time per connection, so
+// OnMessage calls stay ordered and never stall the loop. A slow consumer
+// pauses reading instead of buffering without bound.
 type eventConn struct {
 	c       *Conn
 	handler EventHandler
@@ -318,10 +317,9 @@ func (e *eventConn) schedule() {
 }
 
 // Run drains the queue on a worker (eventConn is its own pool.Task); at most
-// one Run is active per connection.
-// A handled batch is settled under the same lock that takes the next one: its
-// bytes leave pending, and its emptied queue takes the messages that arrive
-// while the next batch is handled. An idle connection keeps no queue.
+// one Run is active per connection. A handled batch is settled under the lock
+// that takes the next one, and its emptied queue is reused for the messages
+// that arrive meanwhile. An idle connection keeps no queue.
 func (e *eventConn) Run() {
 	var (
 		spare   *[]message // the queue of the batch just handled, emptied
@@ -389,13 +387,7 @@ func (e *eventConn) handle(batch []message, failed bool) (size int64) {
 // deliver decodes one message and calls OnMessage. A decode failure or a
 // handler panic closes the connection and is returned.
 func (e *eventConn) deliver(m *message) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("fnet/websocket: panic in a callback for %s: %v\n%s", e.c.RemoteAddr(), r, debug.Stack())
-			_ = e.c.CloseWithStatus(ws.StatusInternalServerError, "")
-			err = errHandlerPanic
-		}
-	}()
+	defer e.recoverCallback(&err)
 	if m.op == OpPong {
 		e.handler.OnPong(e.c, m.data)
 		return nil
@@ -410,6 +402,16 @@ func (e *eventConn) deliver(m *message) (err error) {
 	return nil
 }
 
+// recoverCallback, deferred around a callback, turns its panic into a logged
+// 1011 close and errHandlerPanic in *err.
+func (e *eventConn) recoverCallback(err *error) {
+	if r := recover(); r != nil {
+		log.Printf("fnet/websocket: panic in a callback for %s: %v\n%s", e.c.RemoteAddr(), r, debug.Stack())
+		_ = e.c.CloseWithStatus(ws.StatusInternalServerError, "")
+		*err = errHandlerPanic
+	}
+}
+
 func releaseAll(ms []message) {
 	for i := range ms {
 		bufpool.Put(ms[i].buf)
@@ -421,13 +423,7 @@ func releaseAll(ms []message) {
 // connection the event loop cannot drive (TLS, or a foreign http.Server).
 func (e *eventConn) serveBlocking() {
 	err := e.c.Handle(func(op OpCode, msg []byte) (err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("fnet/websocket: panic in OnMessage for %s: %v\n%s", e.c.RemoteAddr(), r, debug.Stack())
-				_ = e.c.CloseWithStatus(ws.StatusInternalServerError, "")
-				err = errHandlerPanic
-			}
-		}()
+		defer e.recoverCallback(&err)
 		if e.handler.OnMessage != nil {
 			e.handler.OnMessage(e.c, op, msg)
 		}
@@ -437,9 +433,9 @@ func (e *eventConn) serveBlocking() {
 	e.callClose(err)
 }
 
-// callClose runs OnClose. A panic in it is logged, like one in OnMessage, and
-// goes no further: the connection is gone already, and the goroutine may be
-// one of its own (serveBlocking), where nothing else would recover it.
+// callClose runs OnClose. A panic in it is logged and goes no further: the
+// connection is gone, and on serveBlocking's goroutine nothing else would
+// recover it.
 func (e *eventConn) callClose(err error) {
 	if e.handler.OnClose == nil {
 		return

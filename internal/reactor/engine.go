@@ -44,11 +44,10 @@ type Config struct {
 }
 
 // defaultLoops is a third of the Ps, rounded up. The loops only read, frame
-// and hand over, a small share of the CPU next to what the workers do with
-// each message. Loops beyond that share would spend their time queued for a P,
-// each waiting its own turn, which spreads the latency of their connections,
-// and would read further ahead of the workers, keeping input in the process
-// that the kernel would otherwise hold.
+// and hand over, a small share of the CPU next to the workers. More loops
+// would queue for Ps, spreading their connections' latency, and read further
+// ahead of the workers, holding in memory input the kernel would otherwise
+// keep.
 func defaultLoops() int { return (runtime.GOMAXPROCS(0) + 2) / 3 }
 
 // Engine accepts connections on its listeners and spreads them round-robin
@@ -63,14 +62,13 @@ type Engine struct {
 	maxOutbound int
 	table       table
 	next        atomic.Uint64
-	noAccept    atomic.Bool    // StopAccept or Close: the accept loop is done
+	noAccept    atomic.Bool    // StopAccept or Close: the accept loop is done; set under mu
 	closing     atomic.Bool    // Close: the event loops are done
 	wg          sync.WaitGroup // loop goroutines
 
-	mu            sync.Mutex
-	serving       chan struct{} // closed when Serve returns; nil until Serve starts
-	acceptStopped bool
-	closed        bool
+	mu      sync.Mutex
+	serving chan struct{} // closed when Serve returns; nil until Serve starts
+	closed  bool
 }
 
 // New starts the event loops for the given listeners. The engine owns the
@@ -138,7 +136,7 @@ func New(cfg Config, listeners []Listener, h Handler) (*Engine, error) {
 // Serve runs the accept loop until StopAccept or Close. It returns nil then.
 func (e *Engine) Serve() error {
 	e.mu.Lock()
-	if e.acceptStopped {
+	if e.noAccept.Load() {
 		e.mu.Unlock()
 		return nil
 	}
@@ -209,15 +207,14 @@ func (e *Engine) accept(ln *Listener) bool {
 // StopAccept is idempotent and safe before Serve.
 func (e *Engine) StopAccept() {
 	e.mu.Lock()
-	if e.acceptStopped {
+	if e.noAccept.Load() {
 		e.mu.Unlock()
 		return
 	}
-	e.acceptStopped = true
+	e.noAccept.Store(true)
 	serving := e.serving
 	e.mu.Unlock()
 
-	e.noAccept.Store(true)
 	_ = e.acceptor.Wake()
 	if serving != nil {
 		<-serving

@@ -7,12 +7,10 @@ import (
 	"unsafe"
 )
 
-// Reads, writes and accepts on a non-blocking socket never block, so on Linux
-// they are raw system calls, without the scheduler handshake of a blocking one
-// (entersyscall and exitsyscall). Besides its cost, that handshake lets the
-// runtime hand the caller's P to another thread once a call has lasted a
-// sysmon tick, 20µs or so, which a loopback writev can take; with the CPU
-// saturated the caller then queues for a P again before it can go on.
+// I/O on a non-blocking socket never blocks, so on Linux it uses raw system
+// calls and skips entersyscall/exitsyscall. That handshake costs time, and a
+// call that outlasts a sysmon tick (~20µs, as a loopback writev can) loses its
+// P; with the CPU saturated the caller then waits to get one back.
 
 // Read reads from a non-blocking fd. n == 0 with a nil error means EOF.
 func Read(fd int, b []byte) (int, error) {

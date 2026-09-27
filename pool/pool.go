@@ -28,10 +28,9 @@ const minShardWorkers = 256
 
 // Config configures a Pool. Zero fields take the defaults.
 type Config struct {
-	// MaxWorkers bounds the goroutines running tasks. The shards share it out
-	// equally, and a task whose shard has all of its part busy waits, in
-	// submission order, for one of them to finish. 0 means 1024 per
-	// GOMAXPROCS, and at least 4096.
+	// MaxWorkers bounds the goroutines running tasks; the shards share it
+	// equally. Once every worker is busy, tasks wait in submission order. 0
+	// means 1024 per GOMAXPROCS, and at least 4096.
 	MaxWorkers int
 	// IdleTimeout is how long a worker without a task waits for one before
 	// exiting (it exits within half as long again), so an idle pool holds no
@@ -40,34 +39,31 @@ type Config struct {
 }
 
 // Pool is a bounded, elastic goroutine pool. Workers start on demand, up to
-// MaxWorkers, and exit once idle for IdleTimeout; tasks beyond the bound queue
-// instead of spawning more goroutines. A panicking task is logged and does not
-// take its worker down. Submit never blocks.
+// MaxWorkers, and exit after IdleTimeout idle; tasks beyond the bound queue
+// instead of spawning goroutines. A panicking task is logged and does not take
+// its worker down. Submit never blocks.
 //
-// The pool is split into shards, one per core or so, each with its own lock,
-// queue and workers, so that event loops and workers on different cores rarely
-// meet on a lock. SubmitConn sends a connection's tasks to one shard, unless
-// its lock is taken, and then to the next free one; each shard is given an
-// equal part of MaxWorkers, at least minShardWorkers.
+// The pool is split into shards (about one per core), each with its own lock,
+// queue and workers, so loops and workers on different cores rarely share a
+// lock. Each shard gets an equal part of MaxWorkers, at least minShardWorkers.
+// SubmitConn sends a connection's tasks to one shard, or to the next one while
+// that shard's lock is taken.
 //
-// A shard keeps as few workers as keep its queue moving: a worker that
-// finishes a task takes the next one without parking, a parked worker is woken
-// only for a task no other worker is coming for, and no more than two at a
-// time, and a new one is started only when every worker the shard has is
-// busy, one at a time. Under load the busy workers carry the tasks, in order;
-// a burst, or tasks that block, bring in more, each worker that takes a task
-// getting the next one moving. A worker about to park first takes a task
-// another shard has waiting, so no shard's queue waits behind its own busy
-// workers while others idle.
+// A shard keeps as few workers as keep its queue moving. A worker that
+// finishes a task takes the next without parking; a parked worker is woken
+// only for a task no worker is coming for, at most maxWaking at a time; a new
+// one starts only when all are busy. A burst, or tasks that block, still fan
+// out: each worker that takes a task gets the next one moving. A worker about
+// to park first steals a task waiting in another shard.
 type Pool struct {
 	shards []shard
 	shift  uint // 64 - log2(len(shards)): an index is the top bits of a hash
 }
 
-// shard is one independent part of a Pool. Every decision is made under mu: to
-// queue a task, to wake or start a worker for it, and to retire one. So a
-// queued task always has a worker coming for it (woken, starting, or busy and
-// about to look again), and none is ever waiting on a worker that left.
+// shard is one part of a Pool. Queuing a task, waking or starting a worker for
+// it, and retiring one all happen under mu, so a queued task always has a
+// worker coming (woken, starting, or busy and about to look again), never one
+// that left.
 type shard struct {
 	pool    *Pool
 	mu      sync.Mutex
@@ -161,18 +157,16 @@ func (p *Pool) SubmitTask(connID uint64, task Task) error {
 }
 
 // submit queues task on shard i, or on the next shard whose lock is free. The
-// submitter is usually an event loop, which must not park behind a worker
-// holding the lock: with the CPU saturated a parked goroutine waits
-// milliseconds to run again, every connection of that loop waits with it, and
-// sync.Mutex then hands the lock from one such waiter to the next (starvation
-// mode). Only when every shard's lock is taken does it wait for shard i.
+// submitter is usually an event loop, which must not park on a lock: on a
+// saturated CPU a parked goroutine waits milliseconds to run again, with all
+// of the loop's connections, and sync.Mutex starvation mode then hands the
+// lock from one such waiter to the next. Only when every lock is taken does it
+// wait for shard i.
 //
-// A task queued on a shard whose workers are all taken would wait until a
-// busy one finishes, however long its tasks block, while other shards idle
-// (after a burst of blocking tasks, say): it goes to a shard with room
-// instead, among those whose lock is free; with none, it waits after all.
-// Which shard runs a connection's task does not matter for its order, since a
-// connection has at most one task at a time.
+// If that shard is full (every worker busy), the task goes to a shard with
+// room whose lock is free, rather than wait behind blocked tasks while other
+// shards idle. The shard does not affect a connection's order: a connection
+// has at most one task at a time.
 func (p *Pool) submit(i uint64, task Task) error {
 	n := uint64(len(p.shards))
 	s := &p.shards[i]
@@ -220,22 +214,18 @@ func (s *shard) submitLocked(task Task) error {
 	return nil
 }
 
-// maxWaking bounds the workers a shard has on their way to its queue. A woken
-// worker is runnable, and with the CPU saturated it waits for a P behind every
-// other runnable goroutine, the event loops included; waking one for each task
-// that arrives meanwhile would only lengthen that wait, and turn the queue,
-// which is served in order, into run queues, which are not. So the tasks
-// beyond maxWaking wait in the queue for the workers already running, or on
-// their way, each of which gets the next one moving when it takes a task: a
-// burst of tasks that block still fans out, one hop at a time.
+// maxWaking bounds the workers a shard has on their way to its queue. On a
+// saturated CPU a woken worker waits for a P behind every runnable goroutine,
+// loops included; waking one per task would lengthen that wait and turn the
+// ordered queue into unordered run queues. Tasks beyond maxWaking wait for the
+// workers running or on their way, each of which wakes the next when it takes
+// a task, so a burst of blocking tasks still fans out.
 const maxWaking = 2
 
-// wakeLocked gets workers on their way to the queue: a parked worker for each
-// queued task no worker is coming for yet, up to maxWaking at a time, or, with
-// none parked, a new worker while the shard has room, one at a time: a pool
-// grows only while every worker it has is busy. With every worker busy the
-// first to finish looks at the queue. The caller wakes or starts the worker
-// with start, after unlocking.
+// wakeLocked picks a worker for queued tasks no worker is coming for: a parked
+// one (up to maxWaking on their way), or, with none parked and room left, a
+// new one, one at a time, so the shard grows only while all are busy. The
+// caller passes the result to start after unlocking.
 func (s *shard) wakeLocked() (w *worker, spawn bool) {
 	switch {
 	case s.waking >= min(s.queue.len(), maxWaking):
@@ -319,11 +309,10 @@ func (s *shard) work() {
 	}
 }
 
-// steal takes a task queued in a shard other than from, if there is one. It
-// passes over a shard whose lock is taken: meanwhile the stealing worker counts
-// as on its way to its own shard, so a task queued there would wait for
-// another shard's lock, and that shard's own workers are about to take its
-// task anyway.
+// steal takes a task queued in a shard other than from. It skips shards whose
+// lock is taken: the stealer still counts as on its way to its own shard, so
+// waiting would stall that shard's new tasks, and a locked shard's own workers
+// are about to take its task anyway.
 func (p *Pool) steal(from *shard) Task {
 	n := len(p.shards)
 	start := int(rand.Uint64() >> p.shift)

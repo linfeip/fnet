@@ -162,9 +162,7 @@ func (c *Conn) OnData(_ *reactor.Conn, data []byte) int {
 		return len(data)
 	}
 	var buf [batchSize]message
-	var a bufpool.Arena
-	batch, off, final, err := c.cut(data, false, buf[:0], &a)
-	a.Release()
+	batch, off, final, err := c.cut(data, false, buf[:0])
 	if err == nil && len(data)-off > c.h.maxMessage {
 		err = ErrMessageTooLarge // a partial message already beyond the limit
 	}
@@ -192,9 +190,7 @@ func (c *Conn) OnEOF(_ *reactor.Conn, rest []byte) {
 	}
 	c.dead = true
 	var buf [batchSize]message
-	var a bufpool.Arena
-	batch, off, _, err := c.cut(rest, true, buf[:0], &a)
-	a.Release()
+	batch, off, _, err := c.cut(rest, true, buf[:0])
 	if err != nil {
 		release(batch)
 		c.closeWith(err)
@@ -222,8 +218,7 @@ func (c *Conn) OnClose(_ *reactor.Conn, err error) {
 	c.state |= csClosed
 	var dropped *[]message
 	if local && c.state&csClosing == 0 {
-		c.state |= csClosing
-		c.quit.Store(true)
+		c.setClosingLocked()
 		dropped = c.dropLocked()
 	}
 	idle := c.state&csRunning == 0
@@ -242,13 +237,15 @@ func (c *Conn) OnClose(_ *reactor.Conn, err error) {
 }
 
 // cut runs Split over data and appends a copy of each message it yields to
-// batch, the copies sharing the arena's buffers. It returns the batch, how much
-// was consumed, whether Split ended the input with bufio.ErrFinalToken, and why
-// the connection must close, if it must. A panic in Split closes only this
-// connection.
-func (c *Conn) cut(data []byte, atEOF bool, into []message, a *bufpool.Arena) (batch []message, off int, final bool, err error) {
+// into, the copies of one read sharing pooled buffers. It returns the batch,
+// how much was consumed, whether Split ended the input with
+// bufio.ErrFinalToken, and why the connection must close, if it must. A panic
+// in Split closes only this connection.
+func (c *Conn) cut(data []byte, atEOF bool, into []message) (batch []message, off int, final bool, err error) {
 	batch = into
+	var a bufpool.Arena
 	defer func() {
+		a.Release()
 		if r := recover(); r != nil {
 			err = newPanicError(r)
 		}
@@ -334,8 +331,7 @@ func (c *Conn) push(batch []message, progressed, partial, done bool, end error) 
 	idle := c.state&csRunning == 0 && c.queuedLocked() == 0
 	closeNow := done && idle // nothing left to handle: no worker hop just to close
 	if closeNow {
-		c.state |= csClosing
-		c.quit.Store(true)
+		c.setClosingLocked()
 	}
 	start := !idle && c.state&csRunning == 0
 	if start {
@@ -386,9 +382,8 @@ func (t *drainTask) Run() { (*Conn)(t).drain() }
 
 // drain runs the connection's callbacks on a worker, in order. At most one
 // drain per connection is scheduled or running (csRunning). A handled batch is
-// settled under the same lock that takes the next one, and its emptied queue
-// takes the messages that arrive while the next batch is handled. An idle
-// Conn keeps no queue.
+// settled under the lock that takes the next one, and its emptied queue is
+// reused for the messages that arrive meanwhile. An idle Conn keeps no queue.
 func (c *Conn) drain() {
 	var (
 		spare   *[]message // the queue of the batch just handled, emptied
@@ -430,8 +425,7 @@ func (c *Conn) drain() {
 			// here, after the replies written so far are flushed.
 			closeNow := c.state&(csInputDone|csClosing) == csInputDone
 			if closeNow {
-				c.state |= csClosing
-				c.quit.Store(true)
+				c.setClosingLocked()
 			}
 			c.state &^= csRunning
 			if c.state&csPartial == 0 {
@@ -523,8 +517,7 @@ func (c *Conn) closeWith(err error) {
 		c.mu.Unlock()
 		return
 	}
-	c.state |= csClosing
-	c.quit.Store(true)
+	c.setClosingLocked()
 	c.recordLocked(err)
 	dropped := c.dropLocked()
 	c.rearmLocked()
@@ -549,11 +542,17 @@ func (c *Conn) shutdown() {
 		c.mu.Unlock()
 		return // the drain closes it when done
 	}
-	c.state |= csClosing
-	c.quit.Store(true)
+	c.setClosingLocked()
 	c.rearmLocked()
 	c.mu.Unlock()
 	_ = c.raw.Close()
+}
+
+// setClosingLocked marks a close from this side: the messages not handled yet
+// are skipped.
+func (c *Conn) setClosingLocked() {
+	c.state |= csClosing
+	c.quit.Store(true)
 }
 
 // queuedLocked returns how many messages are queued.

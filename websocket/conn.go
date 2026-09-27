@@ -201,24 +201,22 @@ func (c *Conn) writeFrameLocked(op OpCode, payload []byte, rsv1 bool) error {
 	return c.writev(hdr[:hn], payload)
 }
 
-// writev sends a frame header and payload as one unit. hdr does not escape:
-// the event-driven path keeps it on the caller's stack, and the others, which
-// hand their buffers to an interface, send a copy.
+// writev sends a frame header and payload as one unit. hdr is on the caller's
+// stack, so an interface call gets a copy of it rather than make it escape.
 func (c *Conn) writev(hdr, payload []byte) error {
 	if c.raw != nil {
 		_, err := c.raw.Writev([][]byte{hdr, payload})
 		return err
 	}
-	var h [maxHeaderSize]byte
-	parts := [][]byte{h[:copy(h[:], hdr)], payload}
-	if vw, ok := c.nc.(interface{ Writev([][]byte) (int, error) }); ok {
-		_, err := vw.Writev(parts)
+	vw, ok := c.nc.(interface{ Writev([][]byte) (int, error) })
+	if !ok {
+		buf := bufpool.Join(hdr, payload)
+		_, err := c.nc.Write(buf.B)
+		bufpool.Put(buf)
 		return err
 	}
-	buf := bufpool.Get(len(parts[0]) + len(payload))
-	copy(buf.B[copy(buf.B, parts[0]):], payload)
-	_, err := c.nc.Write(buf.B)
-	bufpool.Put(buf)
+	var h [maxHeaderSize]byte
+	_, err := vw.Writev([][]byte{h[:copy(h[:], hdr)], payload})
 	return err
 }
 

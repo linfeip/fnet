@@ -16,6 +16,17 @@ func TestGetPut(t *testing.T) {
 	Put(nil)
 }
 
+func TestJoin(t *testing.T) {
+	b := Join([]byte("head"), nil, []byte{}, []byte("-body"))
+	if string(b.B) != "head-body" {
+		t.Fatalf("Join = %q", b.B)
+	}
+	Put(b)
+	if b := Join(); len(b.B) != 0 {
+		t.Fatalf("Join() len = %d", len(b.B))
+	}
+}
+
 func BenchmarkGetPut1K(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {

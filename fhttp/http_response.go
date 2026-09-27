@@ -59,11 +59,10 @@ var (
 // http.ResponseController. It is not safe for concurrent use, like net/http's,
 // and fails once the handler has returned.
 //
-// Like net/http's, it sends nothing until it must: the header leaves with the
-// first body bytes, when a Flush asks for it, or when the handler returns, so a
-// small response is one write with a computed Content-Length. A body is held
-// back up to maxBufferedBody unless the handler framed it itself (set
-// Content-Length or Transfer-Encoding), which streams every Write.
+// Like net/http's, it sends nothing until it must: when the body outgrows
+// maxBufferedBody, on Flush, or when the handler returns, so a small response
+// is one write with a computed Content-Length. A body the handler framed
+// itself (Content-Length or Transfer-Encoding) streams every Write.
 type responseWriter struct {
 	srv  *httpHandler
 	conn net.Conn      // response stream: the reactor conn, or TLS on top of it
@@ -125,11 +124,12 @@ func (w *responseWriter) held() []byte {
 	return w.body.Bytes()
 }
 
-func (w *responseWriter) hold(b []byte) {
+// hold returns the buffer the body is held back in.
+func (w *responseWriter) hold() *bytes.Buffer {
 	if w.body == nil {
 		w.body = bodyPool.Get().(*bytes.Buffer)
 	}
-	w.body.Write(b)
+	return w.body
 }
 
 // bodyAllowed reports whether the status lets a response carry a body: not
@@ -257,7 +257,7 @@ func (w *responseWriter) Write(b []byte) (int, error) {
 			// Content-Type.
 			w.discarded += int64(len(b))
 			if n := sniffLen - len(w.held()); n > 0 {
-				w.hold(b[:min(n, len(b))])
+				w.hold().Write(b[:min(n, len(b))])
 			}
 		}
 		return len(b), nil
@@ -277,7 +277,7 @@ func (w *responseWriter) Write(b []byte) (int, error) {
 	}
 	framed := w.hasFraming()
 	if !framed && len(w.held())+len(b) <= maxBufferedBody {
-		w.hold(b)
+		w.hold().Write(b)
 		return len(b), nil
 	}
 	if cl := w.declaredLength(); cl >= 0 && int64(len(w.held())+len(b)) > cl {
@@ -285,11 +285,7 @@ func (w *responseWriter) Write(b []byte) (int, error) {
 		return 0, http.ErrContentLength
 	}
 	w.streaming = !framed // outgrew the buffer: stream the rest
-	err := w.writeHeader(w.held(), b)
-	if w.body != nil {
-		w.body.Reset()
-	}
-	if err != nil {
+	if err := w.writeHeader(w.held(), b); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -301,10 +297,7 @@ func (w *responseWriter) WriteString(s string) (int, error) {
 	if !w.done.Load() && !w.hijacked && !w.wroteHeader && !w.bodyless() && len(s) > 0 &&
 		len(w.held())+len(s) <= maxBufferedBody && !w.hasFraming() {
 		w.wroteStatus = true
-		if w.body == nil {
-			w.body = bodyPool.Get().(*bytes.Buffer)
-		}
-		return w.body.WriteString(s)
+		return w.hold().WriteString(s)
 	}
 	return w.Write([]byte(s))
 }
@@ -325,11 +318,7 @@ func (w *responseWriter) FlushError() error {
 	}
 	w.wroteStatus = true
 	w.streaming = !w.hasFraming()
-	err := w.writeHeader(w.held())
-	if w.body != nil {
-		w.body.Reset()
-	}
-	return err
+	return w.writeHeader(w.held())
 }
 
 // SetReadDeadline sets the deadline for reading the request body, for
@@ -352,11 +341,10 @@ func (w *responseWriter) finish() error {
 		return nil
 	}
 	if !w.wroteHeader {
-		// The whole response is known: header and body leave in one write,
-		// with its length, unless trailers follow the body, which takes
-		// chunked encoding. A HEAD response states the length of the body its
-		// handler wrote; one that wrote nothing may have left it out because
-		// it saw HEAD, so no length is claimed then (RFC 9110 8.6).
+		// The whole response is known: send it in one write with its length,
+		// or chunked if trailers follow. A HEAD response states the length its
+		// handler wrote; a handler that wrote nothing may have skipped the
+		// body for HEAD, so then no length is claimed (RFC 9110 8.6).
 		if w.bodyAllowed() && !w.hasFraming() {
 			n := int64(len(w.held()))
 			if w.isHead {
@@ -389,10 +377,9 @@ func (w *responseWriter) finish() error {
 	return nil
 }
 
-// writeHeader sends the status line and header block, followed in the same
-// write by body, the first bytes of the body: what was held back, and the
-// write that set it going. A HEAD response only looks at them, for its
-// Content-Type.
+// writeHeader sends the status line and header block, and in the same write
+// body: the first body bytes (what was held back, plus the Write that
+// triggered this). A HEAD response only sniffs them for its Content-Type.
 func (w *responseWriter) writeHeader(body ...[]byte) error {
 	w.wroteHeader = true
 	h := w.hdr()
@@ -412,9 +399,9 @@ func (w *responseWriter) writeHeader(body ...[]byte) error {
 	if !w.bodyless() {
 		for i, b := range body {
 			if w.contentLength >= 0 && int64(total+len(b)) > w.contentLength {
-				// A Content-Length set after the body was held back, and
-				// smaller: what goes beyond it is not sent, as net/http
-				// refuses it, and the connection ends with the response.
+				// A smaller Content-Length set after the body was held:
+				// send no more than it (net/http refuses the excess) and
+				// close after the response.
 				body[i], body = b[:w.contentLength-int64(total)], body[:i+1]
 				total = int(w.contentLength)
 				w.closeConn = true
@@ -458,16 +445,22 @@ func (w *responseWriter) writeHeader(body ...[]byte) error {
 	}
 	err := w.send(parts[:np]...)
 	headPool.Put(hb)
+	if w.body != nil {
+		w.body.Reset() // no longer held: sent, or dropped (bodyless response, Hijack)
+	}
 	return err
 }
 
 // settleFraming makes the framing the handler set consistent, as net/http
-// does, te being the Transfer-Encoding it set: a status without a body (1xx,
-// 204, 304) carries no Content-Length or Transfer-Encoding (304 no
-// Content-Type either); an HTTP/1.0 client knows no transfer coding; chunked
-// wins over a Content-Length, which wins over any other coding; identity (once
-// recommended for event streams) means no coding. A body of unknown length is
-// chunked, or, where that cannot be, delimited by closing the connection.
+// does (te is the handler's Transfer-Encoding):
+//
+//   - a bodyless status (1xx, 204, 304) gets no Content-Length or
+//     Transfer-Encoding, and 304 no Content-Type either;
+//   - an HTTP/1.0 client gets no transfer coding;
+//   - chunked beats Content-Length, which beats any other coding;
+//   - identity means no coding.
+//
+// A body of unknown length is chunked, or else ends with the connection.
 func (w *responseWriter) settleFraming(te string) {
 	h := w.hdr()
 	switch {
@@ -504,11 +497,10 @@ func (w *responseWriter) settleFraming(te string) {
 	}
 }
 
-// settleConnection makes the Connection header say what happens next: close
-// after this response, or keep the connection open. A handler's keep-alive
-// does not survive a close it cannot see (a closing request, a server
-// shutting down, a body the connection's end delimits); a 101, or a header a
-// hijacker goes on from (a 2xx to CONNECT, say), keeps the handler's.
+// settleConnection makes the Connection header match what happens next. A
+// handler's keep-alive is overridden when the connection closes anyway (a
+// closing request, shutdown, a close-delimited body); a 101 or a hijacked
+// response (a 2xx to CONNECT) keeps the header the handler set.
 func (w *responseWriter) settleConnection() {
 	h := w.hdr()
 	conn := h.Get("Connection")
@@ -526,12 +518,10 @@ func (w *responseWriter) settleConnection() {
 	}
 }
 
-// declareTrailers notes the trailer fields the header declares, and returns
-// the header keys to leave out of the header block, nil when there are none:
-// the http.TrailerPrefix ones, and, when a trailer section follows, the
-// declared ones. The header goes out late, so a trailer value the handler set
-// after writing the body is already in the map; it belongs in the trailer
-// section alone.
+// declareTrailers records the trailer fields the header declares and returns
+// the keys to leave out of the header block (nil if none): the
+// http.TrailerPrefix ones, and the declared ones when a trailer section
+// follows, since the header goes out late and may already hold their values.
 func (w *responseWriter) declareTrailers() map[string]bool {
 	var exclude map[string]bool
 	skip := func(k string) {
@@ -628,22 +618,17 @@ func (w *responseWriter) send(parts ...[]byte) error {
 		}
 		return nil
 	}
-	buf := bufpool.Get(total)
-	off := 0
-	for _, p := range parts {
-		off += copy(buf.B[off:], p)
-	}
+	buf := bufpool.Join(parts...)
 	_, err := w.conn.Write(buf.B)
 	bufpool.Put(buf)
 	return err
 }
 
 // Hijack implements http.Hijacker. As with net/http, a status the handler set
-// goes out first, with the header (a 101, say, or a 200 to CONNECT, for a
-// protocol the hijacker then speaks); the hijacker owns what follows, so the
-// header gets no framing and no Connection of fhttp's (RFC 9110 9.3.6). A
-// body not sent yet is dropped. Bytes the request reader buffered ahead are
-// served first by the returned connection.
+// (a 101, or a 200 to CONNECT) goes out first with the header, but without
+// fhttp's framing or Connection headers: the hijacker owns what follows (RFC
+// 9110 9.3.6). A body not sent yet is dropped. The returned connection first
+// serves the bytes the request reader buffered ahead.
 func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if w.done.Load() {
 		return nil, nil, errFinished
@@ -694,15 +679,7 @@ func (hc *hijackedConn) Writev(iovs [][]byte) (int, error) {
 	if hc.raw != nil {
 		return hc.raw.Writev(iovs)
 	}
-	total := 0
-	for _, b := range iovs {
-		total += len(b)
-	}
-	buf := bufpool.Get(total)
-	off := 0
-	for _, b := range iovs {
-		off += copy(buf.B[off:], b)
-	}
+	buf := bufpool.Join(iovs...)
 	n, err := hc.Conn.Write(buf.B)
 	bufpool.Put(buf)
 	return n, err

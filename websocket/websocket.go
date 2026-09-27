@@ -13,6 +13,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync/atomic"
 
@@ -192,14 +193,7 @@ func (u *Upgrader) handshake(w http.ResponseWriter, r *http.Request) (*Conn, err
 	}
 	up := ws.HTTPUpgrader{Header: u.Header}
 	if len(u.Subprotocols) > 0 {
-		up.Protocol = func(proto string) bool {
-			for _, sp := range u.Subprotocols {
-				if sp == proto {
-					return true
-				}
-			}
-			return false
-		}
+		up.Protocol = func(proto string) bool { return slices.Contains(u.Subprotocols, proto) }
 	}
 	var ext wsflate.Extension
 	if u.EnableCompression {
@@ -247,10 +241,9 @@ func (u *Upgrader) handshake(w http.ResponseWriter, r *http.Request) (*Conn, err
 	return c, nil
 }
 
-// limits are the numeric settings a connection takes from its Upgrader. They
-// never change once made, so a connection points to them rather than holding
-// a copy: the connections upgraded one after another with the same settings
-// share one (see share).
+// limits are a connection's numeric settings from its Upgrader. They never
+// change once made, so consecutive connections with the same settings share
+// one copy (see share) instead of each holding its own.
 type limits struct {
 	compressLevel     int
 	compressThreshold int

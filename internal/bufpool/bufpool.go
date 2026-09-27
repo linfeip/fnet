@@ -14,9 +14,8 @@ const (
 
 	// maxArena bounds the buffer an Arena starts for the rest of a read.
 	maxArena = 16 << 10
-	// tickets is how many holds an Arena takes on each buffer it starts, one
-	// for each copy it may make: a copy then costs no atomic operation, and
-	// Release gives back the ones not used.
+	// tickets is how many holds an Arena takes up front on each buffer, so a
+	// copy costs no atomic operation; Release returns the unused ones.
 	tickets = 1 << 30
 )
 
@@ -67,11 +66,25 @@ func drop(b *Buffer, holds int32) {
 	tiers[b.tier].Put(b)
 }
 
-// Arena copies the payloads cut from one read into shared buffers, so that a
-// read carrying many messages costs one Get and one Put rather than one each.
-// A buffer goes back to the pool once its last copy is released: one message
-// held up keeps the rest of its buffer (at most maxArena, or its own size) in
-// use until then.
+// Join returns a buffer holding parts back to back, for a caller that sends
+// them in one write.
+func Join(parts ...[]byte) *Buffer {
+	n := 0
+	for _, p := range parts {
+		n += len(p)
+	}
+	b := Get(n)
+	off := 0
+	for _, p := range parts {
+		off += copy(b.B[off:], p)
+	}
+	return b
+}
+
+// Arena copies the messages cut from one read into shared buffers, so a read
+// carrying many messages costs one Get and one Put rather than one each. A
+// buffer returns to the pool once its last copy is released, so one message
+// held up keeps its whole buffer (at most maxArena, or its own size) alive.
 type Arena struct {
 	buf    *Buffer
 	used   int
@@ -105,22 +118,18 @@ func (a *Arena) Release() {
 	}
 }
 
-// The queues Queues keeps hold from minPooledQueue to maxPooledQueue
-// messages: smaller ones are allocated for each use, and one a burst grew past
-// the maximum is left to the garbage collector.
+// Queues pools queues of minPooledQueue to maxPooledQueue messages; smaller
+// ones are allocated, larger ones left to the garbage collector.
 const (
 	minPooledQueue = 16
 	maxPooledQueue = 1024
 )
 
-// Queues pools the message queues of connections, which hold one only while
-// messages wait for their worker: one is taken when messages reach an empty
-// connection and given back once the connection is idle again, so an idle
-// connection pays a pointer. The event loops take queues and the workers give
-// them back, on other Ps, so a pooled queue comes from another P's cache: a
-// queue for a single message, the common case of request and reply, is
-// cheaper allocated where it is filled (one small object), and only the
-// queues of bursts, which would allocate an array per read, are pooled.
+// Queues pools connections' message queues. A connection holds a queue only
+// while messages wait for its worker, so an idle one pays a pointer. Loops take
+// queues and workers return them on other Ps, so a pooled queue comes out of
+// another P's cache: a single-message queue (request and reply) is cheaper
+// allocated as one small object, and only burst queues are pooled.
 type Queues[T any] struct{ p sync.Pool }
 
 // one is a queue for a single message and its array, allocated together.

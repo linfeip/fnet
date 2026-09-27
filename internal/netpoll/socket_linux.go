@@ -15,11 +15,10 @@ const noDelayInherited = true
 
 const tcpKeepIdle = unix.TCP_KEEPIDLE
 
-// acceptRetryable reports whether accept failed for the connection it took
-// off the queue rather than for the listener, so the next one may be fine:
-// the peer gave up, or, since Linux reports a new socket's pending network
-// errors this way, one of those accept(2) says to retry like EAGAIN (and
-// EPERM, a firewall refusing the connection).
+// acceptRetryable reports whether accept failed for the queued connection
+// rather than the listener, so the next one may succeed: the peer gave up, a
+// firewall refused it (EPERM), or it had a pending network error, which
+// accept(2) on Linux returns and says to retry like EAGAIN.
 func acceptRetryable(err error) bool {
 	switch err {
 	case unix.ECONNABORTED, unix.EPROTO, unix.ENETDOWN, unix.ENOPROTOOPT, unix.EHOSTDOWN,
