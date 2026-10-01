@@ -1,397 +1,372 @@
 package websocket
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"net"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
-	"github.com/gobwas/ws"
+	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/internal/bytepool"
+	"github.com/linfeip/fnet/internal/units"
 
-	"github.com/linfeip/fnet/internal/bufpool"
-	"github.com/linfeip/fnet/internal/reactor"
+	"github.com/gobwas/ws"
+	"github.com/gobwas/ws/wsutil"
 )
 
+// maxCorkBytes is the upper bound of the cork buffer (see Conn.cork).
+const maxCorkBytes = 64 * units.KB
+
+// The values of Conn.phase: OnOpen runs on the goroutine of the upgrade request, while OnData and OnClose are
+// invoked from fnet's tasks; they must not be invoked before OnOpen returns, and they must not block a goroutine of
+// the executor. The zero value means already opened.
 const (
-	// maxBatch is the largest frame coalesced into a write batch; bigger
-	// frames flush the batch and go out on their own.
-	maxBatch = 64 << 10
-	// maxHeaderSize is the largest header of a server frame, which is unmasked.
-	maxHeaderSize = 10
+	phaseOpened      int32 = iota // OnOpen has returned
+	phaseOpening                  // OnOpen has not returned yet; set by Upgrade during the handshake
+	phaseClosedEarly              // the connection closed before OnOpen returned; Upgrade invokes Handler.OnClose after OnOpen returns
 )
 
 var (
-	errEventDriven   = errors.New("fnet/websocket: messages of an event-driven connection are delivered to OnMessage")
-	errControlTooBig = errors.New("fnet/websocket: control frame payload exceeds 125 bytes")
+	errMessageTooBig = errors.New("websocket: message too big")
+	errHandlerPanic  = errors.New("websocket: handler panic")
 )
 
-// Conn is a server-side WebSocket connection. Writes are safe from any
-// goroutine. ReadMessage and Handle are for connections upgraded without an
-// OnMessage callback.
+// Conn is a WebSocket connection. Except for SetContext, all methods can be called concurrently from any goroutine.
+//
+// The field order also accounts for alignment: small fields fill the gaps left by fields such as sync.Mutex (4-byte
+// alignment), so that Conn stays in the smallest possible size class (see TestConnSize).
 type Conn struct {
-	nc       net.Conn      // hijacked connection, or the reactor conn in event mode
-	raw      *reactor.Conn // set in event mode
-	br       io.Reader     // blocking reads; nil in event mode
-	protocol string
-	closed   atomic.Bool
+	connection     fnet.Conn
+	handler        Handler
+	maxMessageSize int
+	messageTimeout time.Duration
+	idleTimeout    time.Duration
+	ctx            any
 
-	compressed bool
-	limits     *limits
-	onPong     func(c *Conn, data []byte)
+	phase   atomic.Int32 // the progress of OnOpen (phaseOpening and so on), see Upgrade
+	closing atomic.Bool  // close frame sent or connection closed: set under writeMu, read lock-free by OnData; later data is all dropped
 
-	wmu        sync.Mutex
-	batch      *bufpool.Buffer
-	batchDepth int32
-	batchLen   int32 // at most maxBatch
+	// The following fields are accessed only in fnet's callbacks (OnData, OnClose): callbacks of one connection run
+	// serially
+	reader          bytes.Reader    // used by ws.ReadHeader to parse frame headers
+	message         bytepool.Buffer // the fragmented message being reassembled (already unmasked)
+	messageOpCode   ws.OpCode       // the type of the message field; 0 (ws.OpContinuation) means there is no unfinished message
+	receiving       bool            // the current deadline belongs to a message (or frame) that has not been received in full
+	messageFinished bool            // a data message was received in full during this OnData
+
+	writeMu     sync.Mutex             // guarantees that no frame is sent after the close frame
+	closeErr    error                  // the reason for closing; determined when closing is set and never changed afterwards
+	frameHeader [ws.MaxHeaderSize]byte // the frame-header encoding buffer, used while holding writeMu
+	segments    [2][]byte              // frame header and payload, Writev's argument (no per-frame allocation), used while holding writeMu
+	// The cork buffer; nil means no corking is in progress. Used while holding writeMu. A pointer rather than a
+	// slice is stored so that Conn stays in a smaller size class.
+	corkBuffer *bytepool.Buffer
 }
 
-// Subprotocol returns the negotiated subprotocol, or "".
-func (c *Conn) Subprotocol() string { return c.protocol }
+// LocalAddr returns the local address; after the connection is closed (including inside OnClose) it returns nil,
+// see fnet.Conn.LocalAddr.
+func (c *Conn) LocalAddr() net.Addr { return c.connection.LocalAddr() }
 
-// IsCompressed reports whether permessage-deflate is active.
-func (c *Conn) IsCompressed() bool { return c.compressed }
+// RemoteAddr returns the peer address.
+func (c *Conn) RemoteAddr() net.Addr { return c.connection.RemoteAddr() }
 
-// SetMaxDecompressedMessageSize changes the decompressed size limit. Call it
-// before messages flow (e.g. in OnOpen).
-func (c *Conn) SetMaxDecompressedMessageSize(limit int64) {
-	l := *c.limits
-	l.maxDecompressSize = limit
-	c.limits = share(l)
+// Context returns the user data bound to the connection.
+func (c *Conn) Context() any { return c.ctx }
+
+// SetContext binds user data; it should be called from a callback (callbacks of one connection run serially).
+func (c *Conn) SetContext(ctx any) { c.ctx = ctx }
+
+// WriteMessage sends a message as a single frame; op is usually ws.OpText or ws.OpBinary. Like fnet.Conn.Write it
+// does not block, and the caller may reuse data once it returns; it returns net.ErrClosed when a close frame has
+// been sent or the connection has closed.
+// When several frames arrive in one OnData, the frames written while they are being processed (including those
+// written by other goroutines) are corked first and written out all at once afterwards.
+func (c *Conn) WriteMessage(op ws.OpCode, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.closing.Load() {
+		return net.ErrClosed
+	}
+	if c.corkBuffer != nil {
+		return c.writeCorked(op, data)
+	}
+	return c.writeFrame(op, data)
 }
 
-// SetMaxMessageSize changes the received message size limit. Call it before
-// messages flow (e.g. in OnOpen).
-func (c *Conn) SetMaxMessageSize(limit int64) {
-	l := *c.limits
-	l.maxMessageSize = limit
-	c.limits = share(l)
+// Close sends a close frame (1000) and then closes the connection. After Close returns, OnMessage is no longer
+// called: messages not yet processed in the same batch and data arriving afterwards are all discarded, while a
+// callback that is already running is unaffected.
+func (c *Conn) Close() error {
+	c.closeWith(ws.StatusNormalClosure, nil)
+	return nil
 }
 
-// NetConn returns the underlying connection.
-func (c *Conn) NetConn() net.Conn { return c.nc }
-
-// LocalAddr returns the local network address.
-func (c *Conn) LocalAddr() net.Addr { return c.nc.LocalAddr() }
-
-// RemoteAddr returns the remote network address.
-func (c *Conn) RemoteAddr() net.Addr { return c.nc.RemoteAddr() }
-
-// SetDeadline sets the read and write deadlines.
-func (c *Conn) SetDeadline(t time.Time) error {
-	_ = c.SetReadDeadline(t)
-	return c.SetWriteDeadline(t)
+// closeWith sends a close frame (without a status code when code is 0) and then closes the connection; err is the
+// recorded reason for closing. Only the first call takes effect.
+// After sending it does not wait for the peer's close frame in reply; fnet first finishes sending the data already
+// written, then closes the socket.
+func (c *Conn) closeWith(code ws.StatusCode, err error) {
+	c.writeMu.Lock()
+	if c.closing.Load() {
+		c.writeMu.Unlock()
+		return
+	}
+	c.closing.Store(true)
+	c.closeErr = err
+	var body []byte
+	if !code.Empty() {
+		body = ws.NewCloseFrameBody(code, "")
+	}
+	c.uncorkLocked() // the corked frames go out before the close frame
+	c.writeFrame(ws.OpClose, body)
+	c.writeMu.Unlock()
+	c.connection.Close()
 }
 
-// SetReadDeadline sets the read deadline: a blocking ReadMessage fails once it
-// passes. On an event-driven connection, which nobody reads, the connection
-// closes at t unless the deadline is moved first (OnClose gets
-// os.ErrDeadlineExceeded): pushing it forward on each message or Pong makes a
-// liveness timeout.
-func (c *Conn) SetReadDeadline(t time.Time) error {
-	if c.raw != nil && c.br == nil {
-		c.raw.SetCloseDeadline(t)
+// writeFrame sends one unfragmented, unmasked frame and requires the caller to hold writeMu. The frame header and
+// the payload are written with a single writev, so the payload needs no copy.
+func (c *Conn) writeFrame(op ws.OpCode, payload []byte) error {
+	c.segments = [2][]byte{appendFrameHeader(c.frameHeader[:0], op, len(payload)), payload}
+	_, err := c.connection.Writev(c.segments[:])
+	c.segments[1] = nil // stop referencing the caller's payload
+	return err
+}
+
+// writeCorked sends a message as one frame: it is appended to the cork buffer; when it does not fit, it is written
+// out together with the already corked frames in a single writev, and this frame is not copied.
+// The caller must hold writeMu and corking must be in progress.
+//
+// Not inlined: WriteMessage is on the call chain of every Echo message, and the initial stack is very small when the
+// Executor starts a new goroutine per task; if the local variables here were merged into the caller's stack frame,
+// every message would trigger one stack growth (measured at about 17% more CPU per message).
+//
+//go:noinline
+func (c *Conn) writeCorked(op ws.OpCode, payload []byte) error {
+	b := c.corkBuffer
+	header := appendFrameHeader(c.frameHeader[:0], op, len(payload))
+	if b.Len()+len(header)+len(payload) <= maxCorkBytes {
+		b.Append(header)
+		b.Append(payload)
 		return nil
 	}
-	return c.nc.SetReadDeadline(t)
+	_, err := c.connection.Writev([][]byte{b.Bytes(), header, payload})
+	b.Reset()
+	return err
 }
 
-// SetWriteDeadline sets the write deadline.
-func (c *Conn) SetWriteDeadline(t time.Time) error { return c.nc.SetWriteDeadline(t) }
-
-// ---------------------------------------------------------------------------
-// Writing
-// ---------------------------------------------------------------------------
-
-// WriteMessage sends one data message. Compression, when negotiated, happens
-// before the connection's write lock is taken.
-func (c *Conn) WriteMessage(op OpCode, payload []byte) error {
-	data, rsv1 := payload, false
-	if c.compressed && (op == OpText || op == OpBinary) && len(payload) >= c.limits.compressThreshold {
-		if z, err := compress(payload, c.limits.compressLevel); err == nil && len(z) < len(payload) {
-			data, rsv1 = z, true
-		}
+// cork starts corking and does nothing when corking is already in progress: frames written afterwards (including
+// those written by other goroutines) go into the cork buffer first and are written out all at once by uncork.
+// The cork buffer is borrowed large enough in one go, according to the expected size bytes.
+func (c *Conn) cork(size int) {
+	c.writeMu.Lock()
+	if c.corkBuffer == nil {
+		b := bytepool.Get(min(size, maxCorkBytes))
+		c.corkBuffer = &b
 	}
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	return c.writeFrameLocked(op, data, rsv1)
+	c.writeMu.Unlock()
 }
 
-// WriteText sends a text message.
-func (c *Conn) WriteText(text string) error { return c.WriteMessage(OpText, []byte(text)) }
-
-// WriteBinary sends a binary message.
-func (c *Conn) WriteBinary(payload []byte) error { return c.WriteMessage(OpBinary, payload) }
-
-// WritePing sends a Ping control frame.
-func (c *Conn) WritePing(data []byte) error { return c.writeControl(OpPing, data) }
-
-// WritePong sends a Pong control frame.
-func (c *Conn) WritePong(data []byte) error { return c.writeControl(OpPong, data) }
-
-// writeControl sends a Ping or Pong. A control frame carries at most 125
-// bytes (RFC 6455 5.5); a longer one would make the peer fail the connection.
-func (c *Conn) writeControl(op OpCode, payload []byte) error {
-	if len(payload) > 125 {
-		return errControlTooBig
-	}
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	return c.writeFrameLocked(op, payload, false)
+// uncork writes out the corked frames and ends corking.
+func (c *Conn) uncork() {
+	c.writeMu.Lock()
+	c.uncorkLocked()
+	c.writeMu.Unlock()
 }
 
-// BeginBatch starts coalescing written frames; EndBatch sends them in one
-// write. Batches nest. Control frames are never delayed by a batch.
-func (c *Conn) BeginBatch() {
-	c.wmu.Lock()
-	c.batchDepth++
-	c.wmu.Unlock()
-}
-
-// EndBatch closes the innermost batch and flushes when it was the outermost.
-func (c *Conn) EndBatch() error {
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	if c.batchDepth == 0 {
-		return nil
-	}
-	if c.batchDepth--; c.batchDepth > 0 {
-		return nil
-	}
-	return c.flushBatchLocked()
-}
-
-func (c *Conn) flushBatchLocked() error {
-	b, n := c.batch, int(c.batchLen)
+// uncorkLocked is the same as uncork but requires the caller to hold writeMu; it does nothing when no corking is in
+// progress.
+func (c *Conn) uncorkLocked() {
+	b := c.corkBuffer
 	if b == nil {
-		return nil
+		return
 	}
-	c.batch, c.batchLen = nil, 0
-	var err error
-	if n > 0 {
-		_, err = c.nc.Write(b.B[:n]) // the reactor conn copies what it cannot send now
+	if b.Len() > 0 {
+		c.connection.Write(b.Bytes())
 	}
-	bufpool.Put(b)
-	return err
+	b.Release()
+	c.corkBuffer = nil
 }
 
-func (c *Conn) writeFrameLocked(op OpCode, payload []byte, rsv1 bool) error {
-	var hdr [maxHeaderSize]byte
-	hn := putHeader(hdr[:], op, len(payload), rsv1)
-	if size := hn + len(payload); c.batchDepth > 0 && !op.IsControl() && size <= maxBatch {
-		if c.batch != nil && int(c.batchLen)+size > len(c.batch.B) {
-			if err := c.flushBatchLocked(); err != nil {
-				return err
-			}
-		}
-		if c.batch == nil {
-			c.batch = bufpool.Get(maxBatch)
-		}
-		c.batchLen += int32(copy(c.batch.B[c.batchLen:], hdr[:hn]))
-		c.batchLen += int32(copy(c.batch.B[c.batchLen:], payload))
-		return nil
-	}
-	if err := c.flushBatchLocked(); err != nil { // keep frames in order
-		return err
-	}
-	return c.writev(hdr[:hn], payload)
-}
-
-// writev sends a frame header and payload as one unit. hdr is on the caller's
-// stack, so an interface call gets a copy of it rather than make it escape.
-func (c *Conn) writev(hdr, payload []byte) error {
-	if c.raw != nil {
-		_, err := c.raw.Writev([][]byte{hdr, payload})
-		return err
-	}
-	vw, ok := c.nc.(interface{ Writev([][]byte) (int, error) })
-	if !ok {
-		buf := bufpool.Join(hdr, payload)
-		_, err := c.nc.Write(buf.B)
-		bufpool.Put(buf)
-		return err
-	}
-	var h [maxHeaderSize]byte
-	_, err := vw.Writev([][]byte{h[:copy(h[:], hdr)], payload})
-	return err
-}
-
-// ---------------------------------------------------------------------------
-// Closing
-// ---------------------------------------------------------------------------
-
-// Close sends a normal Close frame and closes the connection once queued
-// output is flushed.
-func (c *Conn) Close() error { return c.closeWith(closeNormal) }
-
-// CloseWithStatus sends a Close frame with the given status and reason, then
-// closes the connection.
-func (c *Conn) CloseWithStatus(status ws.StatusCode, reason string) error {
-	return c.closeWith(ws.NewCloseFrameBody(status, reason))
-}
-
-func (c *Conn) closeWith(body []byte) error {
-	if !c.closed.CompareAndSwap(false, true) {
-		return nil
-	}
-	c.wmu.Lock()
-	c.batchDepth = 0
-	_ = c.writeFrameLocked(OpClose, body, false)
-	c.wmu.Unlock()
-	return c.nc.Close()
-}
-
-func (c *Conn) fail(e *protocolError) error {
-	_ = c.CloseWithStatus(e.code, e.reason)
-	return e
-}
-
-// ---------------------------------------------------------------------------
-// Blocking reads
-// ---------------------------------------------------------------------------
-
-// ReadMessage reads the next data message, answering Ping and Close frames
-// itself. The returned payload belongs to the caller.
-func (c *Conn) ReadMessage() (OpCode, []byte, error) {
-	if c.br == nil {
-		return 0, nil, errEventDriven
-	}
-	var (
-		op         OpCode
-		deflated   bool
-		msg        []byte
-		fragmented bool
-	)
-	for {
-		h, err := ws.ReadHeader(c.br)
-		if err != nil {
-			return 0, nil, err
-		}
-		if perr := checkHeader(h, c.compressed, fragmented); perr != nil {
-			return 0, nil, c.fail(perr)
-		}
-		if h.OpCode.IsControl() {
-			payload := make([]byte, h.Length)
-			if _, err := io.ReadFull(c.br, payload); err != nil {
-				return 0, nil, err
-			}
-			ws.Cipher(payload, h.Mask, 0)
-			switch h.OpCode {
-			case OpPing:
-				_ = c.writeControl(OpPong, payload)
-			case OpPong:
-				if c.onPong != nil {
-					c.onPong(c, payload)
-				}
-			case OpClose:
-				echo, perr := checkClosePayload(payload)
-				if perr != nil {
-					return 0, nil, c.fail(perr)
-				}
-				_ = c.closeWith(echo)
-				return 0, nil, io.EOF
-			}
-			continue
-		}
-		if h.Length > maxFrameLength {
-			return 0, nil, c.fail(headerError(errFrameTooLarge))
-		}
-		if perr := checkSize(h, len(msg), c.limits.maxMessageSize); perr != nil {
-			return 0, nil, c.fail(perr)
-		}
-		if h.OpCode != OpContinuation {
-			op, deflated = h.OpCode, c.compressed && h.Rsv1()
-		}
-		n := len(msg)
-		if msg, err = readPayload(c.br, msg, int(h.Length)); err != nil {
-			return 0, nil, err
-		}
-		ws.Cipher(msg[n:], h.Mask, 0)
-		if fragmented = !h.Fin; fragmented {
-			continue
-		}
-		if msg, err = c.decode(op, deflated, msg); err != nil {
-			return 0, nil, err
-		}
-		return op, msg, nil
+// appendFrameHeader appends a frame header with FIN=1, RSV of 0 and no mask (RFC 6455 5.2); the payload length is
+// encoded in 7, 16 or 64 bits.
+func appendFrameHeader(b []byte, op ws.OpCode, length int) []byte {
+	b = append(b, 0x80|byte(op))
+	switch {
+	case length <= 125:
+		return append(b, byte(length))
+	case length <= 0xffff:
+		return binary.BigEndian.AppendUint16(append(b, 126), uint16(length))
+	default:
+		return binary.BigEndian.AppendUint64(append(b, 127), uint64(length))
 	}
 }
 
-// readPayload appends length bytes from r to msg. msg grows with what
-// arrives, not with what the frame header claims, so a peer cannot make the
-// server allocate a whole message it never sends.
-func readPayload(r io.Reader, msg []byte, length int) ([]byte, error) {
-	for length > 0 {
-		chunk := min(length, 64<<10)
-		n := len(msg)
-		msg = slices.Grow(msg, chunk)[:n+chunk]
-		if _, err := io.ReadFull(r, msg[n:]); err != nil {
-			return msg[:n], err
-		}
-		length -= chunk
+// OnData implements fhttp.Protocol: it processes inbound data frame by frame and returns the number of consumed
+// bytes. An unfragmented message goes straight to the OnMessage callback, with the payload being a slice of data,
+// neither queued nor copied. When data still holds further frames, the frames written while processing them are
+// corked first and written out all at once afterwards (see cork).
+//
+// When a callback panics, the corked frames are written out and the connection is closed with 1011; the panic
+// propagates upwards, so fnet closes the connection and the executor recovers it.
+func (c *Conn) OnData(data []byte) int {
+	// The connection is not read before OnOpen returns (see Upgrade), and a legitimate peer sends data only after
+	// receiving the 101; data that arrives early stays in the engine and is processed the next time data arrives
+	// after OnOpen has returned.
+	if c.phase.Load() != phaseOpened {
+		return 0
 	}
-	return msg, nil
+	done := false
+	defer func() {
+		if !done {
+			c.uncork()
+			c.closeWith(ws.StatusInternalServerError, errHandlerPanic)
+		}
+	}()
+	consumed := 0
+	for !c.closing.Load() { // after Close in a callback or a protocol error, the rest of the batch is not processed
+		n := c.readFrame(data[consumed:])
+		if n == 0 {
+			break
+		}
+		consumed += n
+	}
+	c.uncork()
+	done = true
+	if c.closing.Load() { // already closing (close frame received, protocol error or local Close): discard all later data
+		return len(data)
+	}
+	c.updateDeadline(c.messageOpCode != 0 || consumed < len(data))
+	return consumed
 }
 
-// decode inflates a message and validates text as UTF-8, closing the
-// connection with the matching status on failure.
-func (c *Conn) decode(op OpCode, deflated bool, msg []byte) ([]byte, error) {
-	if deflated {
-		out, err := decompress(msg, c.limits.maxDecompressSize)
-		if err != nil {
-			status := ws.StatusProtocolError
-			if errors.Is(err, ErrMessageTooBig) {
-				status = ws.StatusMessageTooBig
-			}
-			_ = c.CloseWithStatus(status, "")
-			return nil, err
-		}
-		msg = out
+// updateDeadline sets the connection's deadline according to the receive state. When there is an incomplete message
+// or frame (pending), messageTimeout applies from when it started being received; fragments and control frames
+// arriving in the meantime do not extend it, and the timer is only restarted for the next message once a data
+// message has been received in full. Otherwise the connection is idle and idleTimeout applies.
+func (c *Conn) updateDeadline(pending bool) {
+	finished := c.messageFinished
+	c.messageFinished = false
+	switch {
+	case !pending: // set every time: this also overrides a deadline fhttp may have set before the upgrade (see fhttp.Upgrade)
+		c.receiving = false
+		c.connection.SetDeadline(deadlineAfter(c.idleTimeout))
+	case !c.receiving || finished:
+		c.receiving = true
+		c.connection.SetDeadline(deadlineAfter(c.messageTimeout))
 	}
-	if op == OpText && !utf8.Valid(msg) {
-		return nil, c.fail(&protocolError{ws.StatusInvalidFramePayloadData, "invalid UTF-8 in text message"})
-	}
-	return msg, nil
 }
 
-// ReadText reads the next message, which must be text.
-func (c *Conn) ReadText() (string, error) {
-	op, data, err := c.ReadMessage()
+// deadlineAfter returns the instant timeout from now; timeout<=0 means no limit and the zero value is returned.
+func deadlineAfter(timeout time.Duration) time.Time {
+	if timeout <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(timeout)
+}
+
+// readFrame processes the one frame at the start of data and returns the frame's length; it returns 0 when the frame
+// is incomplete, leaving the data in the engine to be processed once it has all arrived.
+func (c *Conn) readFrame(data []byte) int {
+	c.reader.Reset(data)
+	h, err := ws.ReadHeader(&c.reader)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return 0
+	}
+	state := ws.StateServerSide
+	if c.messageOpCode != 0 {
+		state = state.Set(ws.StateFragmented)
+	}
+	if err == nil {
+		err = ws.CheckHeader(h, state)
+	}
 	if err != nil {
-		return "", err
+		c.closeWith(ws.StatusProtocolError, err)
+		return 0
 	}
-	if op != OpText {
-		return "", fmt.Errorf("fnet/websocket: expected text message, got op=%v", op)
+	// Check the length before the payload has all arrived, so the engine does not buffer data for an oversized
+	// frame. Written as a subtraction to avoid overflow when h.Length is very large.
+	if !h.OpCode.IsControl() && h.Length > int64(c.maxMessageSize-c.message.Len()) {
+		c.closeWith(ws.StatusMessageTooBig, errMessageTooBig)
+		return 0
 	}
-	return string(data), nil
+	start := len(data) - c.reader.Len()
+	if int64(len(data)-start) < h.Length {
+		return 0
+	}
+	end := start + int(h.Length)
+	payload := data[start:end]
+	ws.Cipher(payload, h.Mask, 0) // unmask in place: this data is consumed right now
+	if end < len(data) {
+		c.cork(len(data) - start) // more data follows: cork frames from callbacks; OnData writes them all at once when done
+	}
+
+	switch h.OpCode {
+	case ws.OpPing:
+		c.WriteMessage(ws.OpPong, payload)
+	case ws.OpPong:
+	case ws.OpClose:
+		c.onCloseFrame(payload)
+	default: // data frames
+		if h.Fin && h.OpCode != ws.OpContinuation { // an unfragmented message: the payload needs no copy, deliver it directly
+			c.deliver(h.OpCode, payload)
+			break
+		}
+		if h.OpCode != ws.OpContinuation {
+			c.messageOpCode = h.OpCode
+		}
+		c.message.Append(payload)
+		if h.Fin { // the last fragment has arrived, deliver the reassembled message
+			c.deliver(c.messageOpCode, c.message.Bytes())
+			c.message.Release()
+			c.messageOpCode = 0
+		}
+	}
+	return end
 }
 
-// ReadBinary reads the next message, which must be binary.
-func (c *Conn) ReadBinary() ([]byte, error) {
-	op, data, err := c.ReadMessage()
-	if err != nil {
-		return nil, err
+// onCloseFrame handles the peer's close frame: it replies with the same status code and then closes the connection
+// (RFC 6455 5.5.1).
+func (c *Conn) onCloseFrame(payload []byte) {
+	if len(payload) == 0 { // no status code counts as 1005 (RFC 6455 7.1.5); reply with a close frame without a status code too
+		c.closeWith(0, wsutil.ClosedError{Code: ws.StatusNoStatusRcvd})
+		return
 	}
-	if op != OpBinary {
-		return nil, fmt.Errorf("fnet/websocket: expected binary message, got op=%v", op)
+	code, reason := ws.ParseCloseFrameData(payload)
+	if err := ws.CheckCloseFrameData(code, reason); err != nil {
+		c.closeWith(ws.StatusProtocolError, err)
+		return
 	}
-	return data, nil
+	c.closeWith(code, wsutil.ClosedError{Code: code, Reason: reason})
 }
 
-// Handle calls onMessage for each message until the connection closes or
-// onMessage returns an error.
-func (c *Conn) Handle(onMessage func(op OpCode, payload []byte) error) error {
-	for {
-		op, msg, err := c.ReadMessage()
-		if err != nil {
-			return err
-		}
-		if err := onMessage(op, msg); err != nil {
-			return err
-		}
+// deliver validates one complete message and calls OnMessage; data is valid only within the callback.
+func (c *Conn) deliver(op ws.OpCode, data []byte) {
+	c.messageFinished = true
+	if op == ws.OpText && !utf8.Valid(data) {
+		c.closeWith(ws.StatusInvalidFramePayloadData, wsutil.ErrInvalidUTF8)
+		return
+	}
+	c.handler.OnMessage(c, op, data)
+}
+
+// OnClose implements fhttp.Protocol: it calls Handler.OnClose after the connection is closed. fnet guarantees that
+// it is the connection's last callback and that all messages received earlier have already been delivered.
+func (c *Conn) OnClose(err error) {
+	c.message.Release()
+	c.writeMu.Lock()
+	if !c.closing.Load() { // the close was not initiated locally: the reason given by the engine wins
+		c.closing.Store(true)
+		c.closeErr = err
+	}
+	c.writeMu.Unlock()
+	// Engine-initiated closes, such as server shutdown or deadline expiry, can happen before OnOpen returns: leave
+	// the callback to Upgrade after OnOpen returns, so that OnClose really is the last callback.
+	if !c.phase.CompareAndSwap(phaseOpening, phaseClosedEarly) {
+		c.handler.OnClose(c, c.closeErr)
 	}
 }

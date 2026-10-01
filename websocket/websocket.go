@@ -1,320 +1,186 @@
-// Package websocket implements RFC 6455 WebSocket (with RFC 7692
-// permessage-deflate) on fnet connections.
+// Package websocket is a WebSocket (RFC 6455) server built on fhttp; the frame format and protocol validation use
+// github.com/gobwas/ws.
 //
-// With an OnMessage callback a connection is event-driven: after the upgrade
-// it lives on fnet's event loop, holds no goroutine while idle, and each
-// message runs on the worker pool. Without one, Upgrade returns a Conn for
-// blocking ReadMessage loops.
+// A connection's data is read and processed by fnet's executor (see fnet.Options.Executor, taskpool.DefaultTaskPool
+// by default) in the connection's task: splitting frames, unmasking, replying to ping and close frames, and
+// invoking the Handler in order. For an unfragmented message the payload is taken straight from the read buffer,
+// with no copy and no queueing; a fragmented message is delivered once it has been reassembled in full. An idle
+// connection occupies no goroutine.
+//
+// When the application cannot keep up, the connection is not read again until the callback returns; the data stays
+// in the kernel buffer and TCP flow control makes the peer slow down (backpressure).
+//
+// The handshake is completed by calling Upgrade from fhttp's http.Handler, after which websocket takes over the
+// connection. Every message must be received in full within MessageTimeout; the idle timeout is off by default (see
+// Options). Extensions (such as permessage-deflate) are not supported; outgoing messages are always a single frame.
 package websocket
 
 import (
-	"bytes"
-	"compress/flate"
-	"errors"
-	"io"
+	"crypto/sha1"
+	"encoding/base64"
 	"net/http"
-	"slices"
 	"strings"
-	"sync/atomic"
+	"time"
 
-	"github.com/gobwas/httphead"
+	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/fhttp"
+	"github.com/linfeip/fnet/internal/units"
+
 	"github.com/gobwas/ws"
-	"github.com/gobwas/ws/wsflate"
-
-	"github.com/linfeip/fnet/internal/reactor"
 )
 
-// Opcodes, re-exported from gobwas/ws.
-const (
-	OpContinuation = ws.OpContinuation
-	OpText         = ws.OpText
-	OpBinary       = ws.OpBinary
-	OpClose        = ws.OpClose
-	OpPing         = ws.OpPing
-	OpPong         = ws.OpPong
-)
-
-// OpCode is a frame opcode.
-type OpCode = ws.OpCode
-
-// StatusCode is a close status (RFC 6455 7.4).
-type StatusCode = ws.StatusCode
-
-// Close statuses, re-exported from gobwas/ws.
-const (
-	StatusNormalClosure           = ws.StatusNormalClosure
-	StatusGoingAway               = ws.StatusGoingAway
-	StatusProtocolError           = ws.StatusProtocolError
-	StatusUnsupportedData         = ws.StatusUnsupportedData
-	StatusInvalidFramePayloadData = ws.StatusInvalidFramePayloadData
-	StatusPolicyViolation         = ws.StatusPolicyViolation
-	StatusMessageTooBig           = ws.StatusMessageTooBig
-	StatusInternalServerError     = ws.StatusInternalServerError
-)
-
-const (
-	// DefaultMaxDecompressedMessageSize (16 MiB) guards against deflate bombs.
-	DefaultMaxDecompressedMessageSize int64 = 16 << 20
-	// DefaultMaxMessageSize (32 MiB) bounds a received message.
-	DefaultMaxMessageSize int64 = 32 << 20
-	// DefaultMaxPendingMessageBytes (64 KiB) of messages waiting for a worker
-	// pause reading from the connection.
-	DefaultMaxPendingMessageBytes int64 = 64 << 10
-	// DefaultLowPendingMessageBytes (16 KiB): reading resumes below this.
-	DefaultLowPendingMessageBytes int64 = 16 << 10
-	// DefaultCompressionThreshold is the smallest message worth compressing.
-	DefaultCompressionThreshold = 128
-)
-
-// ErrMessageTooBig is returned when a message inflates past the limit.
-var ErrMessageTooBig = errors.New("fnet/websocket: decompressed message exceeds maximum allowed size (possible compression bomb)")
-
-// Upgrader performs the WebSocket handshake.
-type Upgrader struct {
-	// Subprotocols lists the supported subprotocols.
-	Subprotocols []string
-	// CheckOrigin rejects the request when it returns false. Nil accepts all.
-	CheckOrigin func(r *http.Request) bool
-	// Header is added to the 101 response.
-	Header http.Header
-
-	// EnableCompression negotiates permessage-deflate with clients that ask.
-	EnableCompression bool
-	// CompressionLevel is the flate level (-2..9); 0 means flate.DefaultCompression.
-	CompressionLevel int
-	// CompressionThreshold is the smallest message compressed; 0 means 128.
-	CompressionThreshold int
-
-	// MaxDecompressedMessageSize bounds an inflated message: 0 means 16 MiB,
-	// negative disables the limit.
-	MaxDecompressedMessageSize int64
-	// MaxMessageSize bounds a received message: 0 means 32 MiB, negative
-	// disables the limit.
-	MaxMessageSize int64
-	// MaxPendingMessageBytes of messages waiting for a worker pause reading
-	// until they drain to a quarter of it: 0 means 64 KiB, negative disables.
-	MaxPendingMessageBytes int64
-
-	// WorkerPool runs OnMessage (e.g. p.SubmitConn for a *pool.Pool p, or
-	// pool.Adapt(ants.Submit)). It is called on an event loop and must not
-	// block; an error refuses the task and closes that connection. Defaults
-	// to pool.Default().
-	WorkerPool func(connID uint64, task func()) error
-
-	// Setting OnMessage makes Upgrade event-driven; see EventHandler.
-	OnOpen    func(c *Conn)
-	OnMessage func(c *Conn, op OpCode, payload []byte)
-	OnClose   func(c *Conn, err error)
-	// OnPong, if set, receives the Pong frames, in both modes; see
-	// EventHandler.
-	OnPong func(c *Conn, data []byte)
+// Handler receives the event callbacks of a WebSocket connection. OnMessage and OnClose run on a goroutine of
+// fnet's executor and must return quickly: when several frames arrive at once, the frames written while they are
+// being processed are merged into a single write (see Conn.WriteMessage), so one blocking callback delays replies
+// already written earlier in the same batch; the connection is not read again until the callback returns, and the
+// callback also occupies a goroutine of the executor (the default taskpool.DefaultTaskPool has about as many
+// workers as there are CPUs), slowing down the callbacks of other connections. Time-consuming logic should be
+// handed off to another goroutine.
+// Callbacks of one connection always run serially: OnOpen first, OnClose last and only once.
+// After a local Close, a close frame from the peer or a protocol error, OnMessage is no longer called: messages not
+// yet processed in the same batch and data arriving afterwards are all discarded.
+// When a callback panics the connection is closed with 1011 and only OnClose is called afterwards; the panic
+// propagates upwards and is recovered by the executor (a panic in OnOpen is recovered by fhttp).
+type Handler interface {
+	// OnOpen is called after a successful handshake and runs on the goroutine that called Upgrade.
+	OnOpen(c *Conn)
+	// OnMessage is called after a complete message has been received (fragments already reassembled); op is
+	// ws.OpText or ws.OpBinary. data is valid only within this callback (it may be the engine's read buffer), so
+	// copy it if you need to keep it.
+	OnMessage(c *Conn, op ws.OpCode, data []byte)
+	// OnClose is called after the connection has closed and all previously received messages have been delivered.
+	// err is the reason for closing: nil for a local Close; wsutil.ClosedError when the peer sent a close frame;
+	// the corresponding error on a protocol error; io.EOF when the peer disconnected outright;
+	// os.ErrDeadlineExceeded on timeout (see Options), in which case no close frame is sent.
+	OnClose(c *Conn, err error)
 }
 
-// EventHandler holds the callbacks of an event-driven connection.
-//
-//   - OnOpen runs once, in the upgrading HTTP handler, before any OnMessage.
-//   - OnMessage runs on the worker pool, one call at a time per connection and
-//     in arrival order, so it may block on databases or downstream calls.
-//     payload is only valid during the call; copy what must outlive it.
-//   - OnClose runs once, on the worker pool, after the messages that arrived
-//     before the close.
-//   - OnPong, if set, runs on the worker pool for each Pong frame, in order
-//     with the messages: with a server-side Ping and SetReadDeadline it tells
-//     live peers from vanished ones.
-//
-// A panic in OnMessage closes the connection with status 1011.
-type EventHandler struct {
-	OnOpen    func(c *Conn)
-	OnMessage func(c *Conn, op OpCode, payload []byte)
-	OnClose   func(c *Conn, err error)
-	OnPong    func(c *Conn, data []byte)
+// Options are the WebSocket parameters; the zero value is the default configuration.
+type Options struct {
+	// MaxMessageSize is the maximum number of bytes of a single message (after fragments are reassembled); when
+	// <=0 it is 1MB. When exceeded, the connection is closed with 1009.
+	MaxMessageSize int
+	// MessageTimeout is the maximum time from the first byte of a message (or of a frame) until it has been
+	// received in full (including all fragments); fragments and control frames arriving in the meantime do not
+	// extend it. When 0 it is 30s, when <0 it is unlimited.
+	MessageTimeout time.Duration
+	// IdleTimeout is the maximum time without receiving any frame while there is no incomplete message; when <=0
+	// it is unlimited (the default).
+	// To detect idle connections, the server can send a ping periodically (WriteMessage(ws.OpPing, nil)); the pong
+	// the client replies with refreshes the timer.
+	IdleTimeout time.Duration
 }
 
-// DefaultUpgrader is an Upgrader with default settings.
-var DefaultUpgrader = &Upgrader{}
-
-// Upgrade upgrades with DefaultUpgrader.
-func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
-	return DefaultUpgrader.Upgrade(w, r)
-}
-
-// UpgradeEvent upgrades with DefaultUpgrader in event-driven mode.
-func UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventHandler) (*Conn, error) {
-	return DefaultUpgrader.UpgradeEvent(w, r, h)
-}
-
-// Upgrade upgrades the request. With OnMessage set the connection is
-// event-driven; otherwise the returned Conn is read with ReadMessage.
-func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
-	if u.OnMessage != nil {
-		return u.UpgradeEvent(w, r, EventHandler{OnOpen: u.OnOpen, OnMessage: u.OnMessage, OnClose: u.OnClose, OnPong: u.OnPong})
+func (o Options) withDefaults() Options {
+	if o.MaxMessageSize <= 0 {
+		o.MaxMessageSize = units.MB
 	}
-	return u.handshake(w, r)
+	if o.MessageTimeout == 0 {
+		o.MessageTimeout = 30 * time.Second
+	}
+	return o
 }
 
-// UpgradeEvent upgrades the request and drives the connection with h. On an
-// fhttp server the connection moves onto the event loop and the HTTP handler
-// should return; it then holds no goroutine while idle. Where the loop cannot
-// read the stream (TLS, or another HTTP server) a goroutine delivers the same
-// callbacks.
-func (u *Upgrader) UpgradeEvent(w http.ResponseWriter, r *http.Request, h EventHandler) (*Conn, error) {
-	c, err := u.handshake(w, r)
+// Upgrade completes the WebSocket handshake inside fhttp's http.Handler and hands the connection to h; by the time
+// it returns, h.OnOpen has finished running on the current goroutine.
+// Headers already set in w.Header() (such as Sec-WebSocket-Protocol and Set-Cookie) are written into the 101
+// response as well.
+// w must not be used after this call; when the handshake fails, the corresponding HTTP error has already been
+// replied and the error is returned.
+func Upgrade(w http.ResponseWriter, r *http.Request, h Handler, opts Options) error {
+	key, err := checkHandshake(r)
 	if err != nil {
-		return nil, err
-	}
-	c.onPong = h.OnPong
-	e := &eventConn{c: c, handler: h, submit: u.WorkerPool}
-
-	if hc, ok := c.nc.(interface{ Unwrap() *reactor.Conn }); ok {
-		c.raw = hc.Unwrap()
-	}
-	if c.raw == nil {
-		if h.OnOpen != nil {
-			h.OnOpen(c)
+		if err == ws.ErrHandshakeUpgradeRequired {
+			w.Header().Set("Sec-WebSocket-Version", "13")
 		}
-		go e.serveBlocking()
-		return c, nil
+		http.Error(w, err.Error(), err.(*ws.ConnectionRejectedError).StatusCode())
+		return err
 	}
-	c.nc, c.br = c.raw, nil
-	if h.OnOpen != nil {
-		h.OnOpen(c)
-	}
-	c.raw.Attach(e) // frames flow from here on, strictly after OnOpen
-	return c, nil
-}
+	header := w.Header()
+	header.Set("Upgrade", "websocket")
+	header.Set("Connection", "Upgrade")
+	header.Set("Sec-WebSocket-Accept", acceptKey(key))
 
-func (u *Upgrader) handshake(w http.ResponseWriter, r *http.Request) (*Conn, error) {
-	if u.CheckOrigin != nil && !u.CheckOrigin(r) {
-		http.Error(w, "origin not allowed", http.StatusForbidden)
-		return nil, errors.New("fnet/websocket: origin not allowed")
-	}
-	if err := checkUpgrade(w, r); err != nil {
-		return nil, err
-	}
-	up := ws.HTTPUpgrader{Header: u.Header}
-	if len(u.Subprotocols) > 0 {
-		up.Protocol = func(proto string) bool { return slices.Contains(u.Subprotocols, proto) }
-	}
-	var ext wsflate.Extension
-	if u.EnableCompression {
-		ext.Parameters = wsflate.DefaultParameters
-		up.Negotiate = func(opt httphead.Option) (httphead.Option, error) {
-			if bytes.Equal(opt.Name, wsflate.ExtensionNameBytes) {
-				return ext.Negotiate(opt)
-			}
-			return httphead.Option{}, nil
-		}
-	}
-	nc, brw, hs, err := up.Upgrade(r, w)
-	if err != nil {
-		if nc != nil {
-			// The upgrader hijacked the connection before failing (a bad
-			// subprotocol or extension offer) and answered: the connection is
-			// ours to close.
-			_ = nc.Close()
-		}
-		return nil, err
-	}
-
-	var br io.Reader = nc
-	if brw != nil && brw.Reader != nil {
-		br = brw.Reader // it may hold bytes read ahead of the handshake
-	}
-	maxPending := orDefault(u.MaxPendingMessageBytes, DefaultMaxPendingMessageBytes)
+	opts = opts.withDefaults()
 	c := &Conn{
-		nc:       nc,
-		br:       br,
-		protocol: hs.Protocol,
-		limits: share(limits{
-			compressLevel:     orDefault(u.CompressionLevel, flate.DefaultCompression),
-			compressThreshold: orDefault(u.CompressionThreshold, DefaultCompressionThreshold),
-			maxDecompressSize: orDefault(u.MaxDecompressedMessageSize, DefaultMaxDecompressedMessageSize),
-			maxMessageSize:    orDefault(u.MaxMessageSize, DefaultMaxMessageSize),
-			maxPending:        maxPending,
-			lowPending:        maxPending / 4,
-		}),
-		onPong: u.OnPong,
+		handler:        h,
+		maxMessageSize: opts.MaxMessageSize,
+		messageTimeout: opts.MessageTimeout,
+		idleTimeout:    opts.IdleTimeout,
 	}
-	if u.EnableCompression {
-		_, c.compressed = ext.Accepted()
+	c.phase.Store(phaseOpening)
+	err = fhttp.Upgrade(w, func(nc fnet.Conn) fhttp.Protocol {
+		c.connection = nc
+		nc.PauseRead()                               // no reads until OnOpen returns: peer data sent after the 101 waits in the kernel
+		nc.SetDeadline(deadlineAfter(c.idleTimeout)) // set before the protocol switch; cannot race with OnData in a callback
+		return c
+	})
+	if err != nil {
+		if err == http.ErrNotSupported { // not an fhttp connection; other errors are already handled by fhttp
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return err
 	}
-	return c, nil
+	opened := false
+	defer func() {
+		if !opened { // OnOpen panicked: close the connection with 1011; the panic propagates upwards and is recovered by fhttp
+			c.closeWith(ws.StatusInternalServerError, errHandlerPanic)
+		}
+		// After OnOpen returns (panic included): resume reading; if the engine closed the connection before OnOpen
+		// returned (see Conn.OnClose), make up for the missing OnClose
+		if c.phase.CompareAndSwap(phaseOpening, phaseOpened) {
+			c.connection.ResumeRead()
+		} else {
+			h.OnClose(c, c.closeErr)
+		}
+	}()
+	h.OnOpen(c)
+	opened = true
+	return nil
 }
 
-// limits are a connection's numeric settings from its Upgrader. They never
-// change once made, so consecutive connections with the same settings share
-// one copy (see share) instead of each holding its own.
-type limits struct {
-	compressLevel     int
-	compressThreshold int
-	maxDecompressSize int64
-	maxMessageSize    int64
-	maxPending        int64 // queued message bytes that pause reading; <= 0 disables
-	lowPending        int64 // ...and the level at which reading resumes
-}
-
-// lastLimits are the limits made last, for the next connection with the same
-// ones to share.
-var lastLimits atomic.Pointer[limits]
-
-// share returns limits equal to l: the ones made last if they are, otherwise
-// a new copy, which becomes the last.
-func share(l limits) *limits {
-	if p := lastLimits.Load(); p != nil && *p == l {
-		return p
-	}
-	p := &l
-	lastLimits.Store(p)
-	return p
-}
-
-func orDefault[T int | int64](v, def T) T {
-	if v == 0 {
-		return def
-	}
-	return v
-}
-
-// checkUpgrade refuses, with a plain HTTP error, a request that is not a
-// WebSocket handshake (RFC 6455 4.2.1): the checks the upgrader makes only
-// after hijacking the connection, which would leave a refused connection
-// hijacked and open.
-func checkUpgrade(w http.ResponseWriter, r *http.Request) error {
-	var err error
-	switch v := r.Header.Get("Sec-WebSocket-Version"); {
+// checkHandshake validates the handshake request per RFC 6455 4.2.1 (Host has already been validated by fhttp) and
+// returns the Sec-WebSocket-Key.
+// Every error it returns is a *ws.ConnectionRejectedError carrying a response status code.
+func checkHandshake(r *http.Request) (key string, err error) {
+	switch {
 	case r.Method != http.MethodGet:
-		err = ws.ErrHandshakeBadMethod
+		return "", ws.ErrHandshakeBadMethod
 	case !r.ProtoAtLeast(1, 1):
-		err = ws.ErrHandshakeBadProtocol
-	case r.Host == "":
-		err = ws.ErrHandshakeBadHost
+		return "", ws.ErrHandshakeBadProtocol
 	case !strings.EqualFold(r.Header.Get("Upgrade"), "websocket"):
-		err = ws.ErrHandshakeBadUpgrade
-	case !hasToken(r.Header.Get("Connection"), "upgrade"):
-		err = ws.ErrHandshakeBadConnection
-	case len(r.Header.Get("Sec-WebSocket-Key")) != 24:
-		err = ws.ErrHandshakeBadSecKey
-	case v == "":
-		err = ws.ErrHandshakeBadSecVersion
-	case v != "13":
-		w.Header().Set("Sec-WebSocket-Version", "13")
-		err = ws.ErrHandshakeUpgradeRequired
+		return "", ws.ErrHandshakeBadUpgrade
+	case !hasToken(r.Header["Connection"], "upgrade"):
+		return "", ws.ErrHandshakeBadConnection
+	}
+	switch r.Header.Get("Sec-WebSocket-Version") {
+	case "13":
+	case "":
+		return "", ws.ErrHandshakeBadSecVersion
 	default:
-		return nil
+		return "", ws.ErrHandshakeUpgradeRequired
 	}
-	code := http.StatusBadRequest
-	if rej, ok := err.(*ws.ConnectionRejectedError); ok {
-		code = rej.StatusCode()
+	if key = r.Header.Get("Sec-WebSocket-Key"); len(key) != 24 { // base64 of a 16-byte random value
+		return "", ws.ErrHandshakeBadSecKey
 	}
-	http.Error(w, err.Error(), code)
-	return err
+	return key, nil
 }
 
-// hasToken reports whether the comma-separated list v holds token, in any case.
-func hasToken(v, token string) bool {
-	for t := range strings.SplitSeq(v, ",") {
-		if strings.EqualFold(strings.TrimSpace(t), token) {
-			return true
+// acceptKey computes Sec-WebSocket-Accept (RFC 6455 4.2.2).
+func acceptKey(key string) string {
+	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+// hasToken reports whether the comma-separated header values contain token (case-insensitive).
+func hasToken(values []string, token string) bool {
+	for _, v := range values {
+		for v != "" {
+			var t string
+			t, v, _ = strings.Cut(v, ",")
+			if strings.EqualFold(strings.TrimSpace(t), token) {
+				return true
+			}
 		}
 	}
 	return false

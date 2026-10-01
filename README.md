@@ -2,104 +2,48 @@
 
 English | [中文](README.zh-CN.md)
 
-A production-grade, ultra-high-performance networking framework for Go — custom TCP protocols, HTTP/HTTPS and WebSocket — engineered for **million-level concurrent connections (1M Conns)** with minimal memory footprint and extreme CPU efficiency.
+A high-performance, event-driven network library for Go, built for large numbers of concurrent connections with a small memory footprint: a TCP engine, an `net/http`-compatible HTTP/1.x server and a WebSocket server, all on the same set of event loops.
 
-I/O is driven by native multi-reactor pollers. **Linux (epoll) is the production target**; macOS (kqueue) is supported for development, and Windows runs an emulation for development only. It adheres strictly to RFC 6455 and Go's standard `net/http` contracts without compromising on real-world business requirements, and serves your own TCP protocols (game servers, gateways, IM, RPC) with the same event loops.
+I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, kqueue on macOS**. Other platforms (such as Windows) get the same API on top of the standard library, with one goroutine per connection.
 
 ---
 
 ## ⚡ Highlights
 
-- 🚀 **1 Million Concurrent Connections**: Built to hold a million live WebSocket connections in one process with a compact per-connection memory footprint.
-- 🔥 **High Throughput & Low CPU**: Multi-reactor pollers keep echo and fan-out workloads fast while using few cores.
-- ⚡ **Rapid Handshake**: Non-blocking `accept4` and a shared connection table keep mass connect storms cheap.
-- 🧵 **Zero-Goroutine Idle Connections**: Idle sockets stay on the poller and do not occupy goroutines or stacks.
-- 🎮 **Custom TCP Protocols**: `fnet.Server` frames your protocol on the event loop (`Split`, e.g. a Netty-style `LengthField`) and runs `OnMessage` on workers, one message at a time per connection, so handlers may block on databases.
-- 🛡️ **Full Standards & Business Compliance**: Complete RFC 6455 support (payload unmasking, Ping/Pong/Close control frames, Origin check, Subprotocols), full TLS/HTTPS support, and standard `http.Handler` compatibility.
+- 🚀 **Built for a million connections**: about 1KB of user-space memory per idle HTTP keep-alive connection in our benchmark.
+- 🧵 **Zero-goroutine idle connections**: idle sockets stay on the poller and hold no goroutine and no buffer; the read buffer is borrowed only while a task is reading.
+- ⚡ **Direct, concurrency-safe writes**: `Conn.Write` / `Writev` can be called from any goroutine, never block, and go straight to the socket (`writev` for header + payload).
+- 🔌 **Custom TCP protocols**: implement `OnOpen` / `OnData` / `OnClose`, and tell the engine how many bytes you consumed.
+- 🛡️ **Standards compatible**: use `http.Handler` / `http.ServeMux` as is; WebSocket follows RFC 6455 (frame parsing by gobwas/ws).
+- ⏱️ **Deadline-style timeouts**: slow clients cannot hold a connection by trickling bytes.
 
 ---
 
 ## 🏗️ Architecture
 
-Layers that each do one job, plus the worker pool that runs business code:
+| Package | Responsibility |
+| --- | --- |
+| `fnet` | TCP engine: main/sub-reactors, one task per connection, concurrency-safe writes (`Handler`, `Conn`, `Options`) |
+| `fhttp` | HTTP/1.x server on `fnet`: request dispatch, `http.Handler`, protocol upgrade |
+| `websocket` | WebSocket server on `fhttp`: handshake, framing, message callbacks, write coalescing |
+| `taskpool` | Per-CPU sharded lock-free goroutine pool, the default executor of connection tasks |
+| `poll` | epoll / kqueue wrapper |
+| `internal/bytepool` | Size-class byte buffer pool |
 
-| Layer | Package | Responsibility |
-|---|---|---|
-| Platform | `internal/netpoll` | epoll / kqueue / Windows emulation, raw non-blocking socket calls. The only platform-specific code. |
-| Reactor | `internal/reactor` | Acceptor, event loops, connection table, per-connection input/output buffering, backpressure, close. Moves bytes only. |
-| TCP protocols | `fnet` | `Server` for message protocols: `Split` frames on the loop, `OnOpen` / `OnMessage` / `OnClose` on workers; backpressure, timeouts, half-close, graceful `Shutdown`. |
-| HTTP | `fhttp` | `Server` lifecycle and listeners; HTTP/1.x: decide when a request is ready, run `ServeHTTP` on a worker, keep-alive, TLS, hijack. |
-| WebSocket | `websocket` | Handshake, RFC 6455 framing and control frames, permessage-deflate, event-driven message queue. |
-| Worker pool | `pool` | Sharded goroutine pool that runs `ServeHTTP` and `OnMessage`; shared by `fnet`, `fhttp` and `websocket`, no networking code. |
-
-Protocols plug into the reactor through one interface, `reactor.Handler` (`OnData` / `OnClose`, run on the event loop). A connection's input is either delivered to its handler on the loop (idle, zero goroutines) or *detached* to a blocking reader on a worker (`net.Conn` semantics for `net/http` and TLS), and handed back with `Attach`.
+Dependencies are one-way: `websocket → fhttp → fnet → poll`, and `fnet → taskpool`.
 
 ```text
-Client
-  |
-  v
-Acceptor (accept4) --> Event loop (epoll / kqueue) ---- idle connection waits here, 0 goroutines
-                          |
-                          +-- HTTP: header complete --> Detach --> worker: ServeHTTP --> Attach (back to idle)
-                          |
-                          +-- TCP: Split cuts messages on the loop --> pooled message --> worker: OnMessage
-                          |
-                          +-- WebSocket: frames parsed on the loop --> pooled message --> worker: OnMessage
-                          |                  |
-                          |                  +-- too many queued bytes --> pause reading
-                          v
-                    Output: direct (writev) write; kernel buffer full --> queued, flushed by the loop
-                            replies to a burst of messages --> held (<= 1 ms) --> one write
+listener ─▶ main reactor (accept) ── round-robin ─▶ sub-reactor 0 … N-1   (each: 1 goroutine + 1 epoll/kqueue)
+                                                          │ a connection has events
+                                                          ▼
+                 executor (taskpool): one task per connection at a time
+                 read (borrowed buffer) → OnData → flush the send buffer → close, OnClose
 ```
 
----
-
-## Core Design Principles
-
-### 1. 1M Conns "Zero-Goroutine While Idle"
-* **Idle Connections**: Live sockets wait on the event loop's epoll/kqueue set and take one pointer slot in the chunked connection table plus one `reactor.Conn` (208 B). Idle connections hold **no goroutine, no worker, and no read/write buffer**; the 64 KiB read buffer belongs to the event loop.
-* **Lock-Free Chunked Table**: 2048-entry atomic pointer chunks give $O(1)$ lookups without global lock contention while growing.
-
-### 2. HTTP
-* **Dispatch On A Complete Header**: The event loop dispatches a connection to the worker pool as soon as a complete header (`\r\n\r\n`) is buffered, without waiting for the body. A header over `MaxHeaderBytes` (64 KiB) gets `431` (`414` when the request line alone is over it), in plaintext and TLS alike; a malformed request gets `400`, and an HTTP version other than 1.x `505`, like `net/http`.
-* **Blocking Semantics On The Worker**: While a worker owns the connection it reads and writes with ordinary blocking `net.Conn` semantics, and TCP flow control holds both directions: an upload the handler is not reading yet stops at 256 KiB buffered, and a download to a slow client makes the handler's `Write` wait instead of queueing without bound. `io.Copy` streams with constant memory either way.
-* **`net/http` Behavior**: The header goes out with the first body bytes, on `Flush`, or when the handler returns (a small response is one write with a computed `Content-Length`), and header changes after `WriteHeader` have no effect; `Content-Type` is sniffed when not set; response trailers (`Trailer`, `http.TrailerPrefix`) ride on chunked encoding, and request trailers land in `r.Trailer`. `Flush` and `http.ResponseController` (Server-Sent Events, streaming, full duplex), `r.Context()` canceled when the client goes away, `Content-Length` enforced (`http.ErrContentLength`; a short body closes the connection), `1xx` interim responses such as `103 Early Hints`, `Hijack` after `WriteHeader` sending that status first, handler panics logged to `ErrorLog`, and `Shutdown(ctx)` that lets the requests in progress finish and returns once their last responses have left the process.
-* **RFC 9112 Framing**: `net/http`'s Host rules (an HTTP/1.1 request without a Host header, or with two, gets `400`; an empty one is valid); a space before a field's colon gets `400` instead of an ignored field a front end may have read as framing; a request with both `Transfer-Encoding` and `Content-Length`, or with `Transfer-Encoding` from an HTTP/1.0 client, closes the connection after its response, so nothing smuggled behind its body is served; empty lines before a request line are ignored; a `HEAD` response states the length of the body its handler wrote, never a guessed zero. `fhttp/rfc9112_test.go` checks each on the wire.
-* **Back To Idle**: After a response the connection returns to the event loop and the worker goroutine is released; a pipelined request that is already buffered keeps the worker. Over TLS the session idles on the poller too, keeping its TLS state (keep-alive is opt-in there: set `IdleTimeout`). A client half-close (request, then FIN) still gets its whole response.
-* **Timeouts Without Goroutines**: While the event loop holds a connection, a per-loop timing wheel enforces the header deadline (`ReadHeaderTimeout`, default 30s, counted from accept or from a request's first byte, so a slow-loris drip cannot extend it) and the keep-alive idle deadline (`IdleTimeout`, default 2 min). A closing connection whose peer stops taking output is dropped after 30s without progress.
-* **`Expect: 100-continue`**: answered with `100 Continue` when the handler first reads the body; a handler that replies without reading it gets the connection closed afterwards.
-
-### 3. WebSocket
-* **Parsing On The Loop, Business On Workers**: Frames are parsed and unmasked on the event loop, Ping/Close are answered there, and each complete message is copied into a pooled buffer and queued; the messages that arrive whole in one read share a buffer (up to 16 KiB), so a burst costs one pool round trip, not one per message. `OnMessage` runs on the worker pool, one call at a time per connection, in order; `OnClose` follows the messages that arrived before the close.
-* **Tiered Buffer Pool**: Pooled buffers from 128 B to 16 MiB; a large frame streams into its message buffer as bytes arrive, so memory follows what was received, not what a header claims.
-* **Backpressure**: When a connection's queued message bytes exceed the threshold (default 64 KiB), reading pauses and TCP flow control slows the sender.
-* **Liveness**: On an event-driven connection `SetReadDeadline` closes the connection at the deadline unless it is moved, and `OnPong` sees the peer's Pongs: ping from the server, move the deadline on each Pong, and a vanished peer is dropped.
-
-### 4. TCP Message Protocols
-* **Framing On The Loop, Business On Workers**: `Split` (with `bufio.SplitFunc` semantics) runs on the event loop and only finds message boundaries; each complete message is copied into a pooled buffer, shared (up to 16 KiB) by the messages cut from one read. `OnOpen`, `OnMessage` and `OnClose` run on the worker pool, one call at a time per connection, in order. A partial message stays with the reactor (bounded by `MaxMessageSize`, default 1 MiB) and never holds a worker; a panicking or looping `Split` closes only its own connection.
-* **Backpressure Both Ways**: Received messages waiting for `OnMessage` above `MaxPendingMessageBytes` (64 KiB) pause reading. Output queued for a peer that does not read is capped by `MaxOutboundBytes` (16 MiB by default; broadcast-heavy servers set it near 256 KiB to drop stalled players in seconds); `Write` fails with `ErrWriteBufferFull` instead of growing.
-* **Timeouts Count Only The Peer**: `ReadTimeout` (30s) runs from a message's first byte, so trickling cannot extend it; `IdleTimeout` is a heartbeat timeout (off by default). Time spent in handlers or paused by backpressure never counts. TCP keep-alive (60s idle, then 4 probes 15s apart) drops peers that vanished without closing.
-* **Closing**: A peer that closes or half-closes still has the messages it sent handled and the replies flushed; `OnClose` gets `io.EOF`. A close from this side drops messages not handled yet. `Shutdown(ctx)` stops accepting, lets every connection finish what it received, and returns once every `OnClose` has run.
-
-### 5. Output
-* **Direct Writes**: Writers go straight to the socket; only what the kernel does not accept is queued and flushed by the event loop. On an event-driven connection (TCP messages, event-driven WebSocket) a write never blocks: the queue is capped (16 MiB by default) and a full one fails with `ErrWriteBufferFull`, the sign of a peer too slow to keep up; a write into an empty queue is always taken whole, so a message is never cut short on the wire. While a worker owns the connection (HTTP, a hijacked or blocking WebSocket connection) writes wait as on a blocking socket.
-* **Closing Without Resets**: A close flushes the queued output, then half-closes and gives the peer 500 ms to finish, reading and dropping what it still sends, so the close never turns into a reset that destroys a response the peer has not read yet.
-* **Replies To A Burst Share A Write**: When several messages arrive together (one read yields a batch), the worker holds the connection's output while it handles them, so their replies, and anything another goroutine writes meanwhile, leave in one system call. Nothing is held longer than 1 ms or beyond 64 KiB: a slow handler in the batch holds back neither the replies before it nor a broadcast. A single message is answered with a direct write, as before.
-* **`writev`**: Frame or response headers and payloads leave in a single `writev` call without an intermediate copy.
-
----
-
-## Features
-
-- **Standard `net/http` API**: Direct drop-in for `http.Handler` / `http.ServeMux` via `fhttp.ListenAndServe` and `fhttp.ListenAndServeTLS`.
-- **Multi-Reactor Architecture**: One acceptor (`accept4` on Linux) distributes sockets round-robin across the event loops, which register them with their own pollers. By default there is one loop per three cores: the loops only read and frame, and more of them would only wait for the scheduler, each in its own turn, and read further ahead of the workers.
-- **Dual WebSocket Modes**:
-  - **Event-Driven**: Zero goroutines while idle; frame parsing happens in the reactor, and business callbacks (`OnMessage`) are automatically offloaded to a high-performance sharded worker pool to keep the I/O event loop unblocked.
-  - **Blocking/Goroutine**: Full `net.Conn` stream compatibility for traditional request-response and blocking loops.
-- **Built-in Worker Pool**: A bounded, elastic goroutine pool, split into per-core shards with a lock each so event loops and workers rarely contend; an event loop never waits for a lock, but hands a task whose shard is locked to the next free one. A worker that finishes a task takes the next one without parking, a parked worker is woken only for a task no other worker is coming for, and no more than two per shard at a time (the rest wait in order for the workers already running, each of which gets the next one moving), a new one starts only while every worker is busy, a worker about to park first takes a task another shard has waiting, and a task for a shard whose workers are all taken (by handlers that block, say) goes to a shard with room: a few hundred workers carry 100k busy WebSocket connections. Workers exit when idle, and tasks beyond `MaxWorkers` (shared out between the shards) wait in order instead of spawning goroutines. HTTP requests (`ServeHTTP`), WebSocket messages and TCP messages (`OnMessage`) run on it by default, keeping the event loops free; each connection runs its callbacks one at a time, in arrival order. Any pool plugs in as `WorkerPool`, e.g. `pool.Adapt(ants.Submit)`; an error refuses the task and closes that connection.
-- **Vector I/O (`writev`)**: Stack-allocated header framing merged with payload into single syscall writes to eliminate intermediate buffer copies.
-- **Small Idle Connections**: Chunked lock-free connection tables, state that exists only while a worker serves a connection, and auto-compacting buffers.
-- **Platforms**: Linux (`epoll`) is what production runs on and what capacity and defaults are tuned for. macOS/Darwin (`kqueue`) behaves the same and is meant for development. Windows runs a development emulation on top of the `net` package (one read-pump goroutine per socket; writes are plain blocking `net.Conn.Write` calls, so there is no write backpressure); it is not for production.
+- **One task per connection**: reading, callbacks and closing run serially in the connection's task, so the callbacks of one connection never overlap and stay in order. There is no goroutine per connection and no inbound queue.
+- **Zero-copy reads, kernel backpressure**: data is handed to `OnData` straight from a borrowed buffer. A connection is not read again until its callback returns, so a slow handler is throttled by TCP flow control instead of piling up memory.
+- **HTTP**: the callback only looks for the end of the header (`\r\n\r\n`); parsing is left to `http.ReadRequest`, and the Handler runs on a goroutine that exists only while the connection has pending requests.
+- **WebSocket**: frames are split and unmasked inside the connection's task and passed to `OnMessage` without a message queue; replies written while handling a batch of frames are coalesced into one write.
 
 ---
 
@@ -109,144 +53,87 @@ Acceptor (accept4) --> Event loop (epoll / kqueue) ---- idle connection waits he
 go get github.com/linfeip/fnet
 ```
 
-Requires Go 1.26+ (the `go` directive in `go.mod`). Deploy on Linux; a million connections also need raised fd limits (`ulimit -n`, `fs.nr_open`, `fs.file-max`).
+Requires Go 1.23+. For a large number of connections, raise the fd limits (`ulimit -n`, `fs.nr_open`, `fs.file-max`).
 
 ---
 
 ## Quickstart
 
-### Custom TCP Protocol
-
-A game server speaking `| len uint32 | payload |`:
+### TCP
 
 ```go
-package main
+type echo struct{}
 
-import (
-	"encoding/binary"
-	"log"
-	"time"
+func (echo) OnOpen(c fnet.Conn)                  {}
+func (echo) OnData(c fnet.Conn, data []byte) int { c.Write(data); return len(data) } // returns the number of bytes consumed
+func (echo) OnClose(c fnet.Conn, err error)      {}
 
-	"github.com/linfeip/fnet"
-)
-
-func main() {
-	srv := &fnet.Server{
-		Addr:        ":7001",
-		Split:       fnet.LengthField{Size: 4, Strip: 4}.Split, // OnMessage gets the payload
-		IdleTimeout: 30 * time.Second,                          // heartbeat timeout
-		OnOpen:      func(c *fnet.Conn) { c.SetContext(newSession(c)) },
-		OnMessage: func(c *fnet.Conn, msg []byte) {
-			// A worker, one message at a time per connection: it may query a database.
-			reply := c.Context().(*session).handle(msg)
-			var hdr [4]byte
-			binary.BigEndian.PutUint32(hdr[:], uint32(len(reply)))
-			if _, err := c.Writev([][]byte{hdr[:], reply}); err != nil {
-				c.Close()
-			}
-		},
-		OnClose: func(c *fnet.Conn, err error) { c.Context().(*session).save() },
-	}
-	log.Fatal(srv.ListenAndServe())
+srv, err := fnet.NewServer(":9000", echo{}, fnet.Options{})
+if err != nil {
+	log.Fatal(err)
 }
+log.Fatal(srv.Serve())
 ```
 
-`Split` answers one question on the event loop: is there a whole message at the start of the bytes received so far, and how long is it? `LengthField` covers length-prefixed headers the way Netty's `LengthFieldBasedFrameDecoder` does (`Offset`, `Size` 1/2/3/4/8, `Order`, `Adjust`, `Strip`), `bufio.ScanLines` covers line protocols, and any `bufio.SplitFunc` works. `msg` is only valid during `OnMessage`; decoding it (e.g. `proto.Unmarshal`) copies it. `Write` never blocks and may be called from any goroutine, e.g. a room broadcasting the same buffer to every player.
-
-### HTTP & HTTPS
+### HTTP
 
 ```go
-package main
-
-import (
-	"io"
-	"log"
-	"net/http"
-
-	"github.com/linfeip/fnet/fhttp"
-)
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "hello from fnet\n")
-	})
-
-	// Plain HTTP
-	log.Fatal(fhttp.ListenAndServe(":8080", mux))
-}
+mux := http.NewServeMux()
+mux.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
+	io.WriteString(w, "hello world")
+})
+log.Fatal(fhttp.ListenAndServe(":8080", mux))
 ```
 
-Configuring HTTPS with timeouts:
+### WebSocket
 
 ```go
-srv := &fhttp.Server{
-	Addr:         ":8443",
-	Handler:      mux,
-	ReadTimeout:  5 * time.Second,
-	WriteTimeout: 10 * time.Second,
-	IdleTimeout:  60 * time.Second,
-}
-log.Fatal(srv.ListenAndServeTLS("cert.pem", "key.pem"))
+type echo struct{}
+
+func (echo) OnOpen(c *websocket.Conn)                               {}
+func (echo) OnMessage(c *websocket.Conn, op ws.OpCode, data []byte) { c.WriteMessage(op, data) } // a complete message
+func (echo) OnClose(c *websocket.Conn, err error)                   {}
+
+mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+	websocket.Upgrade(w, r, echo{}, websocket.Options{})
+})
 ```
 
----
-
-### WebSocket (Event-Driven, Zero Goroutine)
-
-Provide `OnMessage` callback in `websocket.Upgrader`. Idle connections do not hold any goroutines.
-
-```go
-package main
-
-import (
-	"log"
-	"net/http"
-
-	"github.com/linfeip/fnet/fhttp"
-	"github.com/linfeip/fnet/websocket"
-)
-
-func main() {
-	upgrader := &websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-		OnOpen: func(c *websocket.Conn) {
-			log.Printf("connected: %s", c.RemoteAddr())
-		},
-		OnMessage: func(c *websocket.Conn, op websocket.OpCode, msg []byte) {
-			// Echo frame back to peer
-			_ = c.WriteMessage(op, msg)
-		},
-		OnClose: func(c *websocket.Conn, err error) {
-			log.Printf("disconnected: %v", err)
-		},
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		if _, err := upgrader.Upgrade(w, r); err != nil {
-			log.Printf("upgrade error: %v", err)
-		}
-		// Returning here hands the socket to the event loop.
-	})
-
-	log.Fatal(fhttp.ListenAndServe(":8081", mux))
-}
-```
-
-> **Traditional Goroutine Mode**: Omit `OnMessage` from `Upgrader`. `Upgrade(w, r)` then returns a standard `*websocket.Conn` supporting blocking `ReadMessage()` / `WriteMessage()` loops.
+Callbacks run on the executor (`taskpool.DefaultTaskPool` by default, replaceable through `fnet.Options.Executor`), so they must return quickly. Timeouts and limits are set in `fnet.Options`, `fhttp.Options` and `websocket.Options`; see their doc comments.
 
 ---
 
 ## Examples
 
-Run the bundled examples:
-
 ```bash
-go run ./example                 # HTTP on :8080 & HTTPS on :8443
-go run ./example/websocket       # High-concurrency echo WebSocket on :8081
-go run ./example/tcp -bots 3     # Chat-room game server on :7001 with three bots
+go run ./examples/echo        # TCP echo
+go run ./examples/http        # HTTP
+go run ./examples/websocket   # WebSocket echo
 ```
+
+---
+
+## Benchmarks
+
+macOS, 10 cores, wrk and the server on the same machine, hello world Handler:
+
+| Scenario | fhttp | net/http |
+| --- | --- | --- |
+| `wrk -t4 -c256 -d10s` throughput | about 211k req/s | about 209k req/s |
+| 15000 idle keep-alive connections, RSS increase | 13MB (about 1KB/connection) | 271MB (about 19KB/connection) |
+| Goroutines with 15000 idle connections | 12 | 15003 |
+
+Throughput is on par because most CPU goes to system calls (the loopback stack); the gain is memory and goroutine count with many connections.
+
+---
+
+## Limitations
+
+- The send buffer has no upper bound and there is no write timeout: a client that never reads makes it grow.
+- No TLS or HTTP/2. HTTP requests with a body are not supported (413) and responses are fully buffered (no `http.Flusher` / `http.Hijacker`).
+- WebSocket: no permessage-deflate; messages are always sent as a single frame.
+- Half-close is not supported: after EOF the connection is closed once the buffered data has been sent.
+- The kqueue path is fully tested on macOS; the epoll path is cross-compiled and passes `go vet` but **has not been run on Linux yet**. Run `go test -race ./...` on Linux before going live.
 
 ---
 

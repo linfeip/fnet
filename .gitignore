@@ -1,20 +1,3 @@
-# OS files
-.DS_Store
-
-# IDE
-.idea/
-.vscode/
-
-# Binaries & object files
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-*.test
-*.out
-
-# Benchmark binaries & logs
-report/
-*.log
-*.local.md
+# Autobahn TestSuite (see websocket/autobahn)
+/websocket/autobahn/reports/
+/websocket/autobahn/autobahn_server

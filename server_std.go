@@ -1,0 +1,220 @@
+//go:build !linux && !darwin
+
+package fnet
+
+import (
+	"errors"
+	"log/slog"
+	"net"
+	"os"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/linfeip/fnet/internal/units"
+)
+
+// Server is a simple implementation on top of the standard library net package (for platforms such as Windows):
+// one goroutine per connection, callbacks run serially in that goroutine, and Conn.Write is a blocking write.
+type Server struct {
+	handler Handler
+	ln      net.Listener
+
+	mu     sync.Mutex
+	conns  map[*stdConn]struct{}
+	closed bool
+	wg     sync.WaitGroup
+}
+
+// NewServer creates a listener on addr; connections start being handled once Serve is called. opts is ignored on this
+// platform.
+func NewServer(addr string, handler Handler, _ Options) (*Server, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{handler: handler, ln: ln, conns: make(map[*stdConn]struct{})}, nil
+}
+
+// Addr returns the address actually being listened on.
+func (s *Server) Addr() net.Addr { return s.ln.Addr() }
+
+// Serve accepts in a loop and starts one goroutine per connection, blocking until Close is called (it then returns
+// ErrServerClosed).
+func (s *Server) Serve() error {
+	var tempDelay time.Duration // backoff delay after accept hits a temporary error
+	for {
+		nc, err := s.ln.Accept()
+		if err != nil {
+			s.mu.Lock()
+			closed := s.closed
+			s.mu.Unlock()
+			if closed {
+				return ErrServerClosed
+			}
+			// Same as net/http: a temporary error (such as running out of file descriptors) is logged and retried after
+			// a backoff that starts at 5ms and doubles each time up to 1s; it must not stop the server.
+			if t, ok := err.(interface{ Temporary() bool }); ok && t.Temporary() {
+				tempDelay = min(max(tempDelay*2, 5*time.Millisecond), time.Second)
+				slog.Error("fnet: accept error", "err", err, "retryIn", tempDelay)
+				time.Sleep(tempDelay)
+				continue
+			}
+			return err
+		}
+		tempDelay = 0
+		c := &stdConn{netConnection: nc}
+		c.readResumed.L = &c.mu
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			nc.Close()
+			return ErrServerClosed
+		}
+		s.conns[c] = struct{}{}
+		s.wg.Add(1)
+		s.mu.Unlock()
+		go s.serveConn(c)
+	}
+}
+
+// Close stops the server and closes all connections; by the time it returns every callback has finished.
+// It must therefore not be called from a callback: it waits for the callbacks of all connections to finish, including the
+// one calling it, which would deadlock; call it from a new goroutine when needed.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	s.ln.Close()
+	for c := range s.conns {
+		c.closeWith(closedByServer)
+	}
+	s.mu.Unlock()
+	s.wg.Wait()
+	return nil
+}
+
+func (s *Server) serveConn(c *stdConn) {
+	defer s.wg.Done()
+	s.handler.OnOpen(c)
+	buf := make([]byte, 4*units.KB)
+	var in []byte
+	var err error
+	for err == nil {
+		c.waitResumed()
+		var n int
+		n, err = c.netConnection.Read(buf)
+		if n == 0 {
+			continue
+		}
+		data := buf[:n]
+		if len(in) > 0 {
+			in = append(in, data...)
+			data = in
+		}
+		consumed := min(max(s.handler.OnData(c, data), 0), len(data))
+		in = append(in[:0], data[consumed:]...)
+	}
+	c.netConnection.Close()
+	s.mu.Lock()
+	delete(s.conns, c)
+	s.mu.Unlock()
+	switch c.closedBy.Load() {
+	case closedByUser:
+		err = nil
+	case closedByServer:
+		err = ErrServerClosed
+	default:
+		if errors.Is(err, os.ErrDeadlineExceeded) { // the SetDeadline deadline expired
+			err = os.ErrDeadlineExceeded
+		}
+	}
+	s.handler.OnClose(c, err)
+}
+
+const (
+	closedByUser int32 = iota + 1
+	closedByServer
+)
+
+type stdConn struct {
+	netConnection net.Conn
+	ctx           any
+	closedBy      atomic.Int32 // who initiated the close, which decides the err reported to OnClose
+
+	mu          sync.Mutex
+	readPaused  bool
+	readResumed sync.Cond // broadcast when reading resumes or the connection closes, with L being &mu
+}
+
+func (c *stdConn) LocalAddr() net.Addr  { return c.netConnection.LocalAddr() }
+func (c *stdConn) RemoteAddr() net.Addr { return c.netConnection.RemoteAddr() }
+func (c *stdConn) Context() any         { return c.ctx }
+func (c *stdConn) SetContext(ctx any)   { c.ctx = ctx }
+
+func (c *stdConn) Write(b []byte) (int, error) {
+	n, err := c.netConnection.Write(b)
+	if err != nil && c.closedBy.Load() != 0 {
+		err = net.ErrClosed
+	}
+	return n, err
+}
+
+// Writev sends through net.Buffers, which also writes everything out at once with writev (WSASend on Windows) when the
+// underlying connection supports it.
+func (c *stdConn) Writev(bs [][]byte) (int, error) {
+	// net.Buffers.WriteTo modifies the elements of the slice, so copy it to avoid changing the caller's bs.
+	buffers := net.Buffers(slices.Clone(bs))
+	n, err := buffers.WriteTo(c.netConnection)
+	if err != nil && c.closedBy.Load() != 0 {
+		err = net.ErrClosed
+	}
+	return int(n), err
+}
+
+// Close closes the connection. Write is synchronous on this platform, so by the time Close is called all data already
+// written has been handed to the kernel.
+func (c *stdConn) Close() error {
+	c.closeWith(closedByUser)
+	return nil
+}
+
+// SetDeadline is implemented with a read timeout: once it expires the blocked Read returns a timeout error and the read
+// loop then closes the connection.
+func (c *stdConn) SetDeadline(t time.Time) { c.netConnection.SetReadDeadline(t) }
+
+// PauseRead makes the read loop wait before its next Read, until reading resumes or the connection closes.
+func (c *stdConn) PauseRead() {
+	c.mu.Lock()
+	c.readPaused = true
+	c.mu.Unlock()
+}
+
+func (c *stdConn) ResumeRead() {
+	c.mu.Lock()
+	c.readPaused = false
+	c.readResumed.Broadcast()
+	c.mu.Unlock()
+}
+
+// waitResumed blocks while reading is paused, until reading resumes or the connection closes.
+func (c *stdConn) waitResumed() {
+	c.mu.Lock()
+	for c.readPaused && c.closedBy.Load() == 0 {
+		c.readResumed.Wait()
+	}
+	c.mu.Unlock()
+}
+
+func (c *stdConn) closeWith(by int32) {
+	if c.closedBy.CompareAndSwap(0, by) {
+		c.netConnection.Close()
+		c.mu.Lock() // broadcast while holding the lock, so it cannot interleave with the check in waitResumed and lose the wakeup
+		c.readResumed.Broadcast()
+		c.mu.Unlock()
+	}
+}

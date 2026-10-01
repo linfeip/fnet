@@ -1,20 +1,146 @@
-// Package fnet is a networking framework on native event loops (epoll, kqueue,
-// or the Windows emulation). Idle connections are parked on a poller and hold
-// no goroutine.
+// Package fnet is an event-driven TCP network library based on the Reactor model.
 //
-// Server serves a message protocol over TCP: a Split function frames each
-// connection's byte stream on the event loop, and OnOpen, OnMessage and
-// OnClose run on the worker pool, one call at a time per connection, in
-// order. Package fhttp serves HTTP/1.x and HTTPS behind the standard
-// http.Handler API, package websocket serves WebSocket on the same
-// connections, and package pool runs their business code.
+// On Linux (epoll) / macOS (kqueue) it uses a main/sub-reactor structure:
+//   - main reactor: one goroutine watches the listener and distributes newly accepted connections to the
+//     sub-reactors in round-robin order;
+//   - sub-reactor (event loop): each one takes a goroutine and a Poller, waits only for the events of the
+//     connections it owns (edge-triggered), and hands a connection that has events to the executor
+//     (see Options.Executor);
+//   - connection task: an executor goroutine reads the data, invokes the Handler callbacks, keeps draining
+//     the send buffer and closes the connection; a connection has at most one task at a time, and the data
+//     read borrows a buffer from a pool that is returned as soon as the callback returns;
+//   - a connection does not occupy a goroutine of its own and an idle connection holds no read or write
+//     buffer, so a small number of goroutines can carry a million connections.
 //
-// Layout: internal/netpoll is the platform layer and internal/reactor owns the
-// event loops and connections; everything above them is a protocol.
+// Other platforms (such as Windows) implement the same API on top of the standard library net: one goroutine
+// per connection.
 package fnet
 
-import "github.com/linfeip/fnet/internal/reactor"
+import (
+	"errors"
+	"net"
+	"runtime"
+	"time"
 
-// ErrWriteBufferFull is returned by a connection write when its outbound queue
-// is full because the peer is not reading (see Server.MaxOutboundBytes).
-var ErrWriteBufferFull = reactor.ErrWriteBufferFull
+	"github.com/linfeip/fnet/internal/units"
+	"github.com/linfeip/fnet/taskpool"
+)
+
+var (
+	// ErrServerClosed is returned by Serve after Server.Close, and is also the OnClose reason when the
+	// server is shut down.
+	ErrServerClosed = errors.New("fnet: server closed")
+	// ErrHandlerPanic is the OnClose reason when a callback panics: the connection is closed and the panic
+	// keeps propagating upwards, to be recovered by the executor. Linux/macOS only.
+	ErrHandlerPanic = errors.New("fnet: handler panic")
+)
+
+// Handler is the connection event callback interface.
+//
+// The callbacks of a single connection always run serially: OnOpen first, OnClose last and only once. On
+// Linux/macOS the callbacks run in a goroutine of the executor (see Options.Executor), the connection is not
+// read again before the callback returns, and the callbacks of other connections share the executor's
+// goroutines as well, so a callback must return quickly and must never block; time-consuming logic should be
+// handed to other goroutines, which may safely call Conn.Write and Conn.Close concurrently.
+type Handler interface {
+	// OnOpen is called after a new connection has been established.
+	OnOpen(c Conn)
+	// OnData is called after data has been received. data is all of the connection's currently unconsumed
+	// inbound data and is only valid within this callback (on Linux/macOS it may be a read buffer borrowed by
+	// the engine that is reused once the callback returns, and it may be modified in place);
+	// return the number of bytes consumed this time, the unconsumed part is kept by the engine and passed to
+	// the callback again joined with the data that arrives later.
+	OnData(c Conn, data []byte) (consumed int)
+	// OnClose is called after the connection has been closed; err is the close reason: nil for an explicit
+	// Close, io.EOF when the peer closed.
+	//
+	// Half-close is not supported: after EOF is read (the peer closed its write direction) the engine first
+	// sends out the data in the send buffer and then closes the connection, and writes after that return
+	// net.ErrClosed. A reply written synchronously in OnData is unaffected, but a reply written by another
+	// goroutine only after the EOF is discarded.
+	OnClose(c Conn, err error)
+}
+
+// Conn represents a TCP connection. Except for SetContext, all methods may be called concurrently from any
+// goroutine.
+type Conn interface {
+	// LocalAddr returns the local address. On Linux/macOS the local address has to be queried from the kernel
+	// and is not kept resident per connection, so it returns nil once the connection has been closed
+	// (including inside OnClose); RemoteAddr is unaffected.
+	LocalAddr() net.Addr
+	// RemoteAddr returns the peer address.
+	RemoteAddr() net.Addr
+	// Context returns the user data bound to the connection.
+	Context() any
+	// SetContext binds user data; it should be called in OnOpen.
+	SetContext(ctx any)
+	// Write sends data. On Linux/macOS it never blocks: the data is written directly to the socket as far as
+	// possible, and the part that does not fit is copied into the connection's send buffer, from where the
+	// connection's task keeps sending once the socket becomes writable.
+	// The caller may reuse b once it returns; it returns net.ErrClosed when the connection is already closed.
+	Write(b []byte) (n int, err error)
+	// Writev sends the several segments in bs in order, with the same semantics as Write, and no other write
+	// is interleaved between the segments. The data is handed to the kernel in a single writev, which saves
+	// the caller the copy of joining the segments into one block. bs is not modified.
+	Writev(bs [][]byte) (n int, err error)
+	// Close closes the connection. Data in the send buffer that has not been sent yet is sent out in full
+	// before closing, even if an EOF from the peer is read in the meantime; on an error or an expired deadline
+	// it closes immediately. Writes after the call return net.ErrClosed.
+	Close() error
+	// PauseRead pauses reading (read backpressure): no more data is read from the socket and OnData is no
+	// longer called, until ResumeRead.
+	// The unread data stays in the kernel receive buffer, and once that buffer is full TCP flow control makes
+	// the peer stop sending.
+	// When called in OnData it takes effect once this callback returns; when called from another goroutine, a
+	// read that has already started still results in one more OnData callback.
+	// Writes are unaffected while paused; since nothing is read, a close by the peer is usually only noticed
+	// after reading is resumed. Deadlines apply as usual
+	// (other platforms do not check deadlines while paused, they only take effect after reading is resumed).
+	// Repeated calls have no additional effect, and a call after the connection is closed has no effect.
+	PauseRead()
+	// ResumeRead resumes reading. Data that was handed to OnData before the pause but left unconsumed is only
+	// passed to the callback again, joined with new data, once new data arrives.
+	ResumeRead()
+	// SetDeadline sets the connection's close deadline: when it expires the connection is closed immediately
+	// (without waiting for the send buffer to drain) and the err of OnClose is os.ErrDeadlineExceeded;
+	// the zero value cancels the deadline. Receiving data does not extend it automatically; whether to extend
+	// it is up to the caller.
+	// On Linux/macOS the deadline is checked once per second, so the actual close time may be up to about one
+	// second later than t.
+	SetDeadline(t time.Time)
+}
+
+// Options holds the engine parameters; the zero value is the default configuration.
+type Options struct {
+	// NumLoops is the number of sub-reactors (event loops); runtime.NumCPU() when <=0. Linux/macOS only.
+	NumLoops int
+	// ReadBufferSize is the buffer size of a single read; 16KB when <=0. A connection's task borrows from the
+	// buffer pool only while reading and returns the buffer once the callback returns, so idle connections
+	// hold none, and the number of buffers held at the same time never exceeds the number of tasks currently
+	// in a callback. Linux/macOS only.
+	ReadBufferSize int
+	// Executor runs a connection's tasks (reading, invoking the Handler callbacks, draining the send buffer,
+	// closing): it is called once when a connection has events, a connection has at most one task at a time,
+	// and it is called again when more events arrive while one is being processed.
+	// Executor may be called from any goroutine (the event loop, the executor's own goroutines, the
+	// application goroutines calling Write and Close) and must not block; the task must run asynchronously
+	// (it must not run directly on the caller's stack) and must not be dropped.
+	// When a callback panics the connection is closed with ErrHandlerPanic and the task panics, so Executor
+	// must recover, otherwise the process exits.
+	// When nil it is the Submit of taskpool.DefaultTaskPool (lock-free submission, worker reuse, recovers and
+	// logs the panic). Linux/macOS only.
+	Executor func(task func())
+}
+
+func (o Options) withDefaults() Options {
+	if o.NumLoops <= 0 {
+		o.NumLoops = runtime.NumCPU()
+	}
+	if o.ReadBufferSize <= 0 {
+		o.ReadBufferSize = 16 * units.KB
+	}
+	if o.Executor == nil {
+		o.Executor = taskpool.DefaultTaskPool.Submit
+	}
+	return o
+}
