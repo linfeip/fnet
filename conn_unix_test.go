@@ -9,24 +9,27 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestKeepAlive verifies TCP keepalive is enabled on the connections the server accepts.
-func TestKeepAlive(t *testing.T) {
+// TestSocketOptions verifies TCP_NODELAY and TCP keepalive are set on the connections the server accepts by the time
+// OnOpen runs, before anything can be written to them.
+func TestSocketOptions(t *testing.T) {
 	type result struct {
-		keepAlive, interval int
-		err                 error
+		noDelay, keepAlive, interval int
+		err                          error
 	}
 	got := make(chan result, 1)
 	srv := startServer(t, &funcHandler{open: func(c Conn) {
 		fd := c.(*conn).fd
 		var r result
-		if r.keepAlive, r.err = unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_KEEPALIVE); r.err == nil {
-			r.interval, r.err = unix.GetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPINTVL)
+		if r.noDelay, r.err = unix.GetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY); r.err == nil {
+			if r.keepAlive, r.err = unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_KEEPALIVE); r.err == nil {
+				r.interval, r.err = unix.GetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPINTVL)
+			}
 		}
 		got <- r
 	}})
 	dial(t, srv)
-	if r := <-got; r.err != nil || r.keepAlive == 0 || r.interval != 15 {
-		t.Fatalf("SO_KEEPALIVE=%d TCP_KEEPINTVL=%d err=%v", r.keepAlive, r.interval, r.err)
+	if r := <-got; r.err != nil || r.noDelay == 0 || r.keepAlive == 0 || r.interval != 15 {
+		t.Fatalf("TCP_NODELAY=%d SO_KEEPALIVE=%d TCP_KEEPINTVL=%d err=%v", r.noDelay, r.keepAlive, r.interval, r.err)
 	}
 }
 

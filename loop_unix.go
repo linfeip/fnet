@@ -4,6 +4,7 @@ package fnet
 
 import (
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -28,8 +29,9 @@ type loop struct {
 	tasks []func()
 	dead  bool // the Poller is closed, no more tasks are accepted
 
-	spare    []func() // used alternately with tasks to reduce allocations, accessed only by the event loop
-	stopping bool     // accessed only by the event loop
+	spare     []func() // used alternately with tasks to reduce allocations, accessed only by the event loop
+	stopping  bool     // accessed only by the event loop
+	submitted bool     // the current round of events submitted a task (see run), accessed only by the event loop
 }
 
 func newLoop(s *Server) (*loop, error) {
@@ -61,7 +63,13 @@ func (l *loop) trigger(task func()) {
 
 // run runs the event loop until it receives the stop task or the Poller fails; before exiting it requests the
 // close of all connections, which is then carried out by each connection's task.
+//
+// After a round of events that submitted tasks the loop yields its P. The executor wakes workers for those tasks, and
+// the runtime queues each woken goroutine on the P of the goroutine that woke it, which is this one; a loop that keeps
+// finding events never parks, so they would wait for another P to steal them while Ps may sit idle. Yielding runs them
+// right away. A lone loop does not yield: every connection's events would then wait behind the workers it woke.
 func (l *loop) run() error {
+	yield := len(l.srv.loops) > 1
 	var err error
 	for !l.stopping {
 		var woken bool
@@ -70,6 +78,12 @@ func (l *loop) run() error {
 		}
 		if woken {
 			l.runTasks()
+		}
+		if l.submitted {
+			l.submitted = false
+			if yield {
+				runtime.Gosched()
+			}
 		}
 	}
 	l.forEachConn(func(c *conn) { c.requestClose(ErrServerClosed) })
@@ -99,8 +113,8 @@ func (l *loop) runTasks() {
 	l.spare = tasks[:0]
 }
 
-// register takes over a new connection distributed by the main reactor; OnOpen is invoked by the connection's
-// first task.
+// register takes over a new connection distributed by the main reactor; its socket options are set and OnOpen is
+// invoked by the connection's first task.
 func (l *loop) register(c *conn) {
 	if err := l.poller.AddEdge(c.fd); err != nil {
 		unix.Close(c.fd)
@@ -122,8 +136,8 @@ func (l *loop) register(c *conn) {
 // reused by now, by a connection of this loop (which then only gets a spurious event, and reading it finds nothing) or
 // of another one (which must not be notified through this loop).
 func (l *loop) handleEvent(fd int, ev poll.Event) {
-	if c := connsByFd.lookup(fd); c != nil && c.loop == l {
-		c.notify(uint32(ev))
+	if c := connsByFd.lookup(fd); c != nil && c.loop == l && c.notify(uint32(ev)) {
+		l.submitted = true
 	}
 }
 

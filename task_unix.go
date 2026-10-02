@@ -29,11 +29,13 @@ const (
 // that bit was clear there is no task queued or running, so this call submits one; otherwise a task already exists
 // and it will notice the new events at the end of its round and run another one (see run).
 // A connection therefore has at most one task at a time, with reading, callbacks, flushing and closing all done
-// serially inside it, and no events are lost.
-func (c *conn) notify(ev uint32) {
+// serially inside it, and no events are lost. It reports whether this call submitted the task.
+func (c *conn) notify(ev uint32) bool {
 	if c.state.Or(ev|scheduledBit)&scheduledBit == 0 {
 		c.loop.srv.opts.Executor(c.run)
+		return true
 	}
+	return false
 }
 
 // run is the connection's task: it takes the pending events and processes one round. When more events arrive while
@@ -60,15 +62,22 @@ func (c *conn) run() {
 	}
 }
 
-// handle processes one round of events: the OnOpen callback, flushing the send buffer, reading, and finally a check for
-// whether the connection has to be closed. A close request (including one made from a callback in this round) is
-// handled in the next round: data the peer has already sent but that has not been read yet is read away first, so that
-// the socket holds no unread data at close time, which would make the peer receive an RST instead of a FIN.
+// handle processes one round of events: setting up a new connection (its socket options, then the OnOpen callback),
+// flushing the send buffer, reading, and finally a check for whether the connection has to be closed. A close request
+// (including one made from a callback in this round) is handled in the next round: data the peer has already sent but
+// that has not been read yet is read away first, so that the socket holds no unread data at close time, which would make
+// the peer receive an RST instead of a FIN.
 func (c *conn) handle(ev uint32) {
 	if c.closed { // events left over after the connection was closed
 		return
 	}
 	if ev&evOpen != 0 {
+		// The socket options are set here rather than by the acceptor: that is one goroutine serving every listener,
+		// and setting them there would put five setsockopt calls per connection on its serial path, capping the rate
+		// at which connections are accepted. Nothing is written to the socket before OnOpen, so they are in place
+		// before the first byte goes out.
+		unix.SetsockoptInt(c.fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+		setKeepAlive(c.fd)
 		c.loop.srv.handler.OnOpen(c)
 	}
 	if ev&evWrite != 0 {

@@ -251,8 +251,6 @@ func (s *Server) accept(listenerFd int, _ poll.Event) {
 				return
 			}
 		}
-		unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-		setKeepAlive(fd)
 		l := s.loops[s.next]
 		s.next = (s.next + 1) % len(s.loops)
 		c := &conn{fd: fd, loop: l, remote: sockaddrToAddrPort(sa)}

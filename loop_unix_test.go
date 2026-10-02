@@ -59,14 +59,24 @@ func TestHandleEventOwnLoopOnly(t *testing.T) {
 	}
 
 	before := tasks.Load()
-	other.handleEvent(c.fd, poll.EventRead)
+	onLoop(other, func() { other.handleEvent(c.fd, poll.EventRead) })
 	if got := tasks.Load(); got != before {
 		t.Fatalf("另一个 loop 的事件通知了连接：Executor 多被调用了 %d 次", got-before)
 	}
-	own.handleEvent(c.fd, poll.EventRead)
+	onLoop(own, func() { own.handleEvent(c.fd, poll.EventRead) })
 	if got := tasks.Load(); got != before+1 {
 		t.Fatalf("所属 loop 的事件没有通知连接：Executor 被调用了 %d 次, 期望 1 次", got-before)
 	}
+}
+
+// onLoop runs fn on the event loop, which owns the loop's state (such as what handleEvent records), and waits for it.
+func onLoop(l *loop, fn func()) {
+	done := make(chan struct{})
+	l.trigger(func() {
+		fn()
+		close(done)
+	})
+	<-done
 }
 
 // loopFds returns the fds of the connections the loop still holds; it runs on the event loop, which owns the list.
