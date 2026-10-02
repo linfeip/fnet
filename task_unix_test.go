@@ -65,33 +65,39 @@ func TestHandlerPanic(t *testing.T) {
 	}
 }
 
-// TestExecutorNotCalledUnderLoopLock checks that the event loop does not hold connsMu when it calls the
-// user-supplied Executor to request a connection close (deadline expired, server closed): once the Executor
-// blocks, the event loop and the connection task waiting for that lock (see loop.remove) would wait on each
-// other.
-func TestExecutorNotCalledUnderLoopLock(t *testing.T) {
+// TestExecutorNotCalledUnderConnLock checks that the event loop does not hold the connection's mu when it calls the
+// user-supplied Executor to request a connection close (deadline expired): the task the Executor starts takes that
+// lock right away (see closeIfRequested), so once the Executor blocks until that task has made progress, the two would
+// wait on each other.
+func TestExecutorNotCalledUnderConnLock(t *testing.T) {
 	var held, armed atomic.Bool
-	var srv *Server
+	var target atomic.Pointer[conn]
 	opened := make(chan Conn, 1)
-	srv = startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c }}, Options{NumLoops: 1, Executor: func(task func()) {
-		if armed.Load() {
-			if l := srv.loops[0]; !l.connsMu.TryLock() {
+	srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c }}, Options{NumLoops: 1, Executor: func(task func()) {
+		if c := target.Load(); c != nil && armed.Load() {
+			if !c.mu.TryLock() {
 				held.Store(true)
 			} else {
-				l.connsMu.Unlock()
+				c.mu.Unlock()
 			}
 		}
 		go task()
 	}})
 	dial(t, srv)
 	sc := <-opened
-	time.Sleep(100 * time.Millisecond) // let the connection settle: after this only the call below uses connsMu
+	time.Sleep(100 * time.Millisecond) // let the connection settle: after this only the call below calls the Executor
 	sc.SetDeadline(time.Now().Add(-time.Second))
+	target.Store(sc.(*conn))
 	armed.Store(true)
-	srv.loops[0].checkDeadlines()
+	l, checked := srv.loops[0], make(chan struct{})
+	l.trigger(func() { // the connection list belongs to the event loop
+		l.checkDeadlines()
+		close(checked)
+	})
+	<-checked
 	armed.Store(false)
 	if held.Load() {
-		t.Fatal("请求关闭到期的连接时，Executor 是在持有 connsMu 的情况下被调用的")
+		t.Fatal("请求关闭到期的连接时，Executor 是在持有连接的 mu 的情况下被调用的")
 	}
 }
 

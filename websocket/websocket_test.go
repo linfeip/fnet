@@ -887,6 +887,22 @@ func TestCorkPerOnData(t *testing.T) {
 	}
 }
 
+// TestCorkEveryOnData checks that every OnData that receives several frames corks anew: the corking state of one
+// OnData must not leak into the next, or the replies of the later batches would go out one write each.
+func TestCorkEveryOnData(t *testing.T) {
+	c, rc := newCorkConn()
+	want := slices.Concat(frame(ws.OpText, []byte("a")), frame(ws.OpText, []byte("b")), frame(ws.OpText, []byte("c")))
+	for round := range 3 {
+		c.OnData(clientFrames(ws.OpText, []byte("a"), []byte("b"), []byte("c")))
+		if len(rc.events) != round+1 || !bytes.Equal(rc.events[round].data, want) {
+			t.Fatalf("第 %d 批: 写出 %+v, 期望每批合并为 1 次", round, rc.events)
+		}
+		if c.corking || c.corkBuffer != nil {
+			t.Fatal("处理完后仍在攒写")
+		}
+	}
+}
+
 // TestCorkClose covers closing in the middle of handling: the already corked replies are written out first,
 // then the close frame, and only then is the underlying connection closed; later writes return net.ErrClosed.
 func TestCorkClose(t *testing.T) {

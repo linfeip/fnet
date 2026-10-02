@@ -55,6 +55,7 @@ type Conn struct {
 	messageOpCode   ws.OpCode       // the type of the message field; 0 (ws.OpContinuation) means there is no unfinished message
 	receiving       bool            // the current deadline belongs to a message (or frame) that has not been received in full
 	messageFinished bool            // a data message was received in full during this OnData
+	corking         bool            // this OnData has taken the cork buffer and has not written it out yet, see cork
 
 	writeMu     sync.Mutex             // guarantees that no frame is sent after the close frame
 	closeErr    error                  // the reason for closing; determined when closing is set and never changed afterwards
@@ -156,10 +157,15 @@ func (c *Conn) writeCorked(op ws.OpCode, payload []byte) error {
 	return err
 }
 
-// cork starts corking and does nothing when corking is already in progress: frames written afterwards (including
-// those written by other goroutines) go into the cork buffer first and are written out all at once by uncork.
-// The cork buffer is borrowed large enough in one go, according to the expected size bytes.
+// cork starts corking: frames written afterwards (including those written by other goroutines) go into the cork
+// buffer first and are written out all at once by uncork. The cork buffer is borrowed large enough in one go,
+// according to the expected size bytes.
+// cork and uncork are called only by the connection's task and record their state in the task-only field corking, so
+// the other frames of the same OnData do not take writeMu to cork again, and an OnData that never corked does not take
+// it to uncork. closeWith, which may run on any goroutine, writes the cork buffer out through uncorkLocked and leaves
+// corking alone.
 func (c *Conn) cork(size int) {
+	c.corking = true
 	c.writeMu.Lock()
 	if c.corkBuffer == nil {
 		b := bytepool.Get(min(size, maxCorkBytes))
@@ -170,6 +176,7 @@ func (c *Conn) cork(size int) {
 
 // uncork writes out the corked frames and ends corking.
 func (c *Conn) uncork() {
+	c.corking = false
 	c.writeMu.Lock()
 	c.uncorkLocked()
 	c.writeMu.Unlock()
@@ -277,7 +284,9 @@ func (c *Conn) OnData(data []byte) int {
 		}
 		consumed += n
 	}
-	c.uncork()
+	if c.corking {
+		c.uncork()
+	}
 	done = true
 	if c.closing.Load() { // already closing (close frame received, protocol error or local Close): discard all later data
 		return len(data)
@@ -341,7 +350,7 @@ func (c *Conn) readFrame(data []byte) int {
 	end := start + int(h.Length)
 	payload := data[start:end]
 	ws.Cipher(payload, h.Mask, 0) // unmask in place: this data is consumed right now
-	if end < len(data) {
+	if end < len(data) && !c.corking {
 		c.cork(len(data) - start) // more data follows: cork frames from callbacks; OnData writes them all at once when done
 	}
 

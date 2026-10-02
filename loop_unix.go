@@ -3,9 +3,7 @@
 package fnet
 
 import (
-	"maps"
 	"os"
-	"slices"
 	"sync"
 	"time"
 
@@ -21,8 +19,10 @@ type loop struct {
 	poller  *poll.Poller
 	onEvent func(fd int, ev poll.Event)
 
-	connsMu sync.Mutex    // guards conns: the event loop looks up by fd, a connection is removed when its own task closes it
-	conns   map[int]*conn // fd -> connection
+	// The connections registered with this loop, accessed only by the event loop. Looking a ready fd up goes through
+	// connsByFd instead, so a connection's task can take itself out when it closes without any lock; the entries it
+	// leaves behind here are dropped the next time the list is walked (see forEachConn).
+	conns []*conn
 
 	mu    sync.Mutex // guards tasks and dead
 	tasks []func()
@@ -40,7 +40,6 @@ func newLoop(s *Server) (*loop, error) {
 	l := &loop{
 		srv:    s,
 		poller: p,
-		conns:  make(map[int]*conn),
 	}
 	l.onEvent = l.handleEvent // bind in advance to avoid allocating a closure on every Wait round
 	return l, nil
@@ -73,15 +72,7 @@ func (l *loop) run() error {
 			l.runTasks()
 		}
 	}
-	// Only copy the connection list while holding the lock: requestClose calls the user-supplied Executor,
-	// which must not run while connsMu is held, otherwise once the Executor blocks, the event loop and the
-	// connection tasks waiting for this lock (see remove) would wait for each other.
-	l.connsMu.Lock()
-	conns := slices.Collect(maps.Values(l.conns))
-	l.connsMu.Unlock()
-	for _, c := range conns {
-		c.requestClose(ErrServerClosed)
-	}
+	l.forEachConn(func(c *conn) { c.requestClose(ErrServerClosed) })
 	return err
 }
 
@@ -115,45 +106,50 @@ func (l *loop) register(c *conn) {
 		unix.Close(c.fd)
 		return
 	}
-	l.connsMu.Lock()
-	l.conns[c.fd] = c
-	l.connsMu.Unlock()
+	if !connsByFd.store(c) { // an fd beyond the table's range; closing it also drops its epoll registration
+		unix.Close(c.fd)
+		return
+	}
+	l.conns = append(l.conns, c)
 	l.srv.openConnsWg.Add(1) // decremented again in close after the OnClose callback has finished
 	c.notify(evOpen)
 }
 
-// remove takes the connection out of the event loop; it is called before the connection closes its fd, because
-// a closed fd may immediately be reused by a new connection.
-func (l *loop) remove(c *conn) {
-	l.connsMu.Lock()
-	delete(l.conns, c.fd)
-	l.connsMu.Unlock()
-}
-
 // handleEvent notifies the task of the connection that owns fd to handle the events; for how events are turned
 // into state bits see evRead and evWrite.
+//
+// An event left over for a connection that has already closed in its task finds no connection. The fd may even have been
+// reused by now, by a connection of this loop (which then only gets a spurious event, and reading it finds nothing) or
+// of another one (which must not be notified through this loop).
 func (l *loop) handleEvent(fd int, ev poll.Event) {
-	l.connsMu.Lock()
-	c := l.conns[fd]
-	l.connsMu.Unlock()
-	if c != nil { // a leftover event for a connection already closed in its task has no matching connection
+	if c := connsByFd.lookup(fd); c != nil && c.loop == l {
 		c.notify(uint32(ev))
 	}
 }
 
-// checkDeadlines requests the close of connections whose deadline has passed; the Server submits it once every
-// deadlineCheckInterval.
-func (l *loop) checkDeadlines() {
-	now := time.Now().UnixNano()
-	var expired []*conn
-	l.connsMu.Lock()
+// forEachConn calls fn for every connection still registered with the loop. The ones that have taken themselves out of
+// connsByFd (see conn.close) are dropped from the list on the way, which is how the list catches up with them; it must
+// only be called by the event loop.
+// fn may call the user-supplied Executor (through requestClose); no lock is held while it runs.
+func (l *loop) forEachConn(fn func(c *conn)) {
+	live := l.conns[:0]
 	for _, c := range l.conns {
-		if d := c.deadline.Load(); d != 0 && d <= now {
-			expired = append(expired, c)
+		if connsByFd.lookup(c.fd) == c {
+			live = append(live, c)
+			fn(c)
 		}
 	}
-	l.connsMu.Unlock()
-	for _, c := range expired { // request the close outside the lock, for the same reason as in run
-		c.requestClose(os.ErrDeadlineExceeded)
-	}
+	clear(l.conns[len(live):]) // let the connections that were dropped be collected
+	l.conns = live
+}
+
+// checkDeadlines requests the close of connections whose deadline has passed; the Server submits it once every
+// deadlineCheckInterval, to be run by the event loop.
+func (l *loop) checkDeadlines() {
+	now := time.Now().UnixNano()
+	l.forEachConn(func(c *conn) {
+		if d := c.deadline.Load(); d != 0 && d <= now {
+			c.requestClose(os.ErrDeadlineExceeded)
+		}
+	})
 }

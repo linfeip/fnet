@@ -220,7 +220,7 @@ func (c *conn) close(err error) {
 		return
 	}
 	defer c.loop.srv.openConnsWg.Done()
-	c.loop.remove(c)
+	connsByFd.remove(c) // before the fd is closed: a closed fd may immediately be reused by a new connection
 	c.discardInbound()
 	c.mu.Lock()
 	c.closed = true
