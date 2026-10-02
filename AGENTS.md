@@ -1,6 +1,6 @@
 # AGENTS.md
 
-这是一个GOLANG的网络库项目, 实现高性能的事件驱动网络库, Linux下使用epoll, macOS下使用kqueue, Windows下直接使用标准库简单实现
+这是一个GOLANG的网络库项目, 实现高性能的事件驱动网络库, 主要生产环境为Linux, Linux下使用epoll, macOS下使用kqueue, Windows下直接使用标准库简单实现
 
 ## 项目场景与性能目标
 

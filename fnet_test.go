@@ -405,6 +405,19 @@ func TestServerClose(t *testing.T) {
 	}
 }
 
+// TestDefaultNumLoopsFollowsGOMAXPROCS verifies the default number of event loops is bounded by the Ps the
+// process may actually use: GOMAXPROCS can be lower than runtime.NumCPU() (taskset, a container CPU quota, an
+// explicit setting), and loops beyond the Ps only compete with the tasks for them.
+func TestDefaultNumLoopsFollowsGOMAXPROCS(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(3))
+	if got := (Options{}).withDefaults().NumLoops; got != 3 {
+		t.Fatalf("默认 NumLoops = %d, 期望 GOMAXPROCS(0) = 3", got)
+	}
+	if got := (Options{NumLoops: 5}).withDefaults().NumLoops; got != 5 {
+		t.Fatalf("显式 NumLoops 被覆盖: %d", got)
+	}
+}
+
 // TestDeadline verifies a connection whose deadline expires is closed with os.ErrDeadlineExceeded, while
 // a connection whose deadline was cleared is unaffected.
 func TestDeadline(t *testing.T) {

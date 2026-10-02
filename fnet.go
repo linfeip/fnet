@@ -112,7 +112,7 @@ type Conn interface {
 
 // Options holds the engine parameters; the zero value is the default configuration.
 type Options struct {
-	// NumLoops is the number of sub-reactors (event loops); runtime.NumCPU() when <=0. Linux/macOS only.
+	// NumLoops is the number of sub-reactors (event loops); runtime.GOMAXPROCS(0) when <=0. Linux/macOS only.
 	NumLoops int
 	// ReadBufferSize is the buffer size of a single read; 16KB when <=0. A connection's task borrows from the
 	// buffer pool only while reading and returns the buffer once the callback returns, so idle connections
@@ -134,7 +134,7 @@ type Options struct {
 
 func (o Options) withDefaults() Options {
 	if o.NumLoops <= 0 {
-		o.NumLoops = runtime.NumCPU()
+		o.NumLoops = runtime.GOMAXPROCS(0)
 	}
 	if o.ReadBufferSize <= 0 {
 		o.ReadBufferSize = 16 * units.KB

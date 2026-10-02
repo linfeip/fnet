@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -214,6 +216,159 @@ func TestAppendFrameHeader(t *testing.T) {
 		if got := appendFrameHeader(nil, ws.OpText, n); !bytes.Equal(got, want.Bytes()) {
 			t.Errorf("长度 %d: got %x, want %x", n, got, want.Bytes())
 		}
+	}
+}
+
+// checkParseHeader checks that parseHeader agrees with ws.ReadHeader on data: the same header and header length, the
+// same error, and "incomplete" exactly when ws.ReadHeader hits the end of data.
+func checkParseHeader(t *testing.T, data []byte) {
+	t.Helper()
+	var r bytes.Reader
+	r.Reset(data)
+	want, wantErr := ws.ReadHeader(&r)
+	got, n, err := parseHeader(data)
+	if wantErr == io.EOF || wantErr == io.ErrUnexpectedEOF {
+		if n != 0 || err != nil {
+			t.Fatalf("%x: 头部不完整, got n=%d err=%v, want n=0 err=nil", data, n, err)
+		}
+		return
+	}
+	if err != wantErr {
+		t.Fatalf("%x: err = %v, want %v", data, err, wantErr)
+	}
+	if err != nil {
+		return // the header is undefined on error
+	}
+	if wantN := len(data) - r.Len(); got != want || n != wantN {
+		t.Fatalf("%x: got %+v n=%d, want %+v n=%d", data, got, n, want, wantN)
+	}
+}
+
+// TestParseHeader checks parseHeader against ws.ReadHeader on every combination of the header fields (every
+// length encoding, FIN, RSV, opcode and mask), on every truncation of the encoded header, and with payload bytes
+// following the header, which must not be consumed.
+func TestParseHeader(t *testing.T) {
+	lengths := []int64{0, 1, 125, 126, 127, 65535, 65536, 1 << 31, 1 << 40, math.MaxInt64}
+	for _, length := range lengths {
+		for _, masked := range []bool{false, true} {
+			for _, fin := range []bool{false, true} {
+				for op := range ws.OpCode(16) {
+					for rsv := range byte(8) {
+						h := ws.Header{Fin: fin, Rsv: rsv, OpCode: op, Masked: masked, Length: length}
+						if masked {
+							h.Mask = [4]byte{0x12, 0x34, 0x56, 0x78}
+						}
+						var buf bytes.Buffer
+						ws.WriteHeader(&buf, h)
+						encoded := append(buf.Bytes(), "payload"...)
+						for n := range len(encoded) + 1 {
+							checkParseHeader(t, encoded[:n])
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestParseHeaderMSB checks that a 64-bit length with its most significant bit set is rejected, and only once the
+// whole header has arrived, as ws.ReadHeader does.
+func TestParseHeaderMSB(t *testing.T) {
+	data := []byte{0x82, 0xff, 0x80, 0, 0, 0, 0, 0, 0, 1, 1, 2, 3, 4}
+	for n := range len(data) + 1 {
+		checkParseHeader(t, data[:n])
+	}
+	if _, _, err := parseHeader(data); err != ws.ErrHeaderLengthMSB {
+		t.Fatalf("err = %v, want %v", err, ws.ErrHeaderLengthMSB)
+	}
+	if _, n, err := parseHeader(data[:len(data)-1]); n != 0 || err != nil {
+		t.Fatalf("头部不完整时 n=%d err=%v, want n=0 err=nil", n, err)
+	}
+}
+
+// TestParseHeaderRandom checks parseHeader against ws.ReadHeader on random bytes, which also covers the headers a
+// well-behaved peer never sends (non-shortest length encodings, for example). The length code is picked among the
+// three length encodings, since a uniformly random byte would almost never pick the 16 and 64-bit ones.
+func TestParseHeaderRandom(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 200000 {
+		data := make([]byte, rng.IntN(17))
+		for i := range data {
+			data[i] = byte(rng.Uint32())
+		}
+		if len(data) >= 2 {
+			code := [3]byte{byte(rng.IntN(126)), 126, 127}[rng.IntN(3)]
+			data[1] = data[1]&0x80 | code
+		}
+		checkParseHeader(t, data)
+	}
+}
+
+// stubConnection is an fnet.Conn that discards what is written to it, so that the frame processing of a Conn can
+// be driven (and measured) without a socket; only the methods used on the OnData path are implemented.
+type stubConnection struct{ fnet.Conn }
+
+func (stubConnection) Write(b []byte) (int, error) { return len(b), nil }
+
+func (stubConnection) Writev(bs [][]byte) (n int, err error) {
+	for _, b := range bs {
+		n += len(b)
+	}
+	return n, nil
+}
+
+func (stubConnection) SetDeadline(time.Time) {}
+
+// echoHandler echoes every message.
+type echoHandler struct{}
+
+func (echoHandler) OnOpen(*Conn)                                 {}
+func (echoHandler) OnMessage(c *Conn, op ws.OpCode, data []byte) { c.WriteMessage(op, data) }
+func (echoHandler) OnClose(*Conn, error)                         {}
+
+// maskedFrames returns count masked binary frames of payload bytes each, back to back, as one client write.
+func maskedFrames(count, payload int) []byte {
+	var buf bytes.Buffer
+	body := make([]byte, payload)
+	for range count {
+		ws.WriteFrame(&buf, ws.MaskFrame(ws.NewFrame(ws.OpBinary, true, body)))
+	}
+	return buf.Bytes()
+}
+
+// BenchmarkOnData measures the receive path of one connection for a client write of frames pipelined messages of
+// 1KB each (frames=1 is the plain echo, frames=10 is the pipelined case): header parsing, unmasking, the echo
+// into the cork buffer and the single write that goes out afterwards.
+func BenchmarkOnData(b *testing.B) {
+	for _, frames := range []int{1, 10} {
+		b.Run(fmt.Sprintf("frames=%d", frames), func(b *testing.B) {
+			batch := maskedFrames(frames, units.KB)
+			c := &Conn{connection: stubConnection{}, handler: echoHandler{}, maxMessageSize: units.MB}
+			data := make([]byte, len(batch))
+			b.SetBytes(int64(frames * units.KB))
+			b.ReportAllocs()
+			for range b.N {
+				copy(data, batch) // OnData unmasks in place
+				if n := c.OnData(data); n != len(data) {
+					b.Fatalf("OnData 消费了 %d 字节, want %d", n, len(data))
+				}
+			}
+		})
+	}
+}
+
+// TestOnDataAllocs checks that processing a frame allocates nothing: the receive path runs once per message, and
+// a per-frame allocation (ws.ReadHeader allocated a scratch buffer for every frame) is the biggest source of
+// garbage under pipelined load.
+func TestOnDataAllocs(t *testing.T) {
+	batch := maskedFrames(1, units.KB)
+	c := &Conn{connection: stubConnection{}, handler: echoHandler{}, maxMessageSize: units.MB}
+	data := make([]byte, len(batch))
+	if allocs := testing.AllocsPerRun(1000, func() {
+		copy(data, batch)
+		c.OnData(data)
+	}); allocs != 0 {
+		t.Fatalf("处理一个帧分配了 %v 次, want 0", allocs)
 	}
 }
 

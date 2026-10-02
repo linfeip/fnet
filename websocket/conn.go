@@ -1,10 +1,8 @@
 package websocket
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -53,7 +51,6 @@ type Conn struct {
 
 	// The following fields are accessed only in fnet's callbacks (OnData, OnClose): callbacks of one connection run
 	// serially
-	reader          bytes.Reader    // used by ws.ReadHeader to parse frame headers
 	message         bytepool.Buffer // the fragmented message being reassembled (already unmasked)
 	messageOpCode   ws.OpCode       // the type of the message field; 0 (ws.OpContinuation) means there is no unfinished message
 	receiving       bool            // the current deadline belongs to a message (or frame) that has not been received in full
@@ -206,6 +203,51 @@ func appendFrameHeader(b []byte, op ws.OpCode, length int) []byte {
 	}
 }
 
+// parseHeader parses the frame header at the start of data and returns it together with its length in bytes; the
+// length is 0 when data does not hold the whole header yet. It is ws.ReadHeader on a byte slice: that one reads
+// through an io.Reader and allocates a scratch buffer for every frame, which, run once per received frame, was the
+// biggest source of garbage under pipelined load.
+// Like ws.ReadHeader it checks nothing but the encoding: a 64-bit length with its most significant bit set is
+// rejected, and only once the whole header is there. The rest of the validation is ws.CheckHeader's.
+func parseHeader(data []byte) (h ws.Header, n int, err error) {
+	if len(data) < 2 {
+		return h, 0, nil
+	}
+	h.Fin = data[0]&0x80 != 0
+	h.Rsv = (data[0] & 0x70) >> 4
+	h.OpCode = ws.OpCode(data[0] & 0x0f)
+	h.Masked = data[1]&0x80 != 0
+	size := 2 // header length: the two fixed bytes, the extended length and the mask
+	length := data[1] & 0x7f
+	switch length {
+	case 126:
+		size += 2
+	case 127:
+		size += 8
+	}
+	if h.Masked {
+		size += 4
+	}
+	if len(data) < size {
+		return h, 0, nil
+	}
+	switch length {
+	case 126:
+		h.Length = int64(binary.BigEndian.Uint16(data[2:]))
+	case 127:
+		if data[2]&0x80 != 0 {
+			return h, 0, ws.ErrHeaderLengthMSB
+		}
+		h.Length = int64(binary.BigEndian.Uint64(data[2:]))
+	default:
+		h.Length = int64(length)
+	}
+	if h.Masked {
+		copy(h.Mask[:], data[size-4:size])
+	}
+	return h, size, nil
+}
+
 // OnData implements fhttp.Protocol: it processes inbound data frame by frame and returns the number of consumed
 // bytes. An unfragmented message goes straight to the OnMessage callback, with the payload being a slice of data,
 // neither queued nor copied. When data still holds further frames, the frames written while processing them are
@@ -272,9 +314,8 @@ func deadlineAfter(timeout time.Duration) time.Time {
 // readFrame processes the one frame at the start of data and returns the frame's length; it returns 0 when the frame
 // is incomplete, leaving the data in the engine to be processed once it has all arrived.
 func (c *Conn) readFrame(data []byte) int {
-	c.reader.Reset(data)
-	h, err := ws.ReadHeader(&c.reader)
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
+	h, start, err := parseHeader(data)
+	if err == nil && start == 0 { // the header is incomplete
 		return 0
 	}
 	state := ws.StateServerSide
@@ -294,7 +335,6 @@ func (c *Conn) readFrame(data []byte) int {
 		c.closeWith(ws.StatusMessageTooBig, errMessageTooBig)
 		return 0
 	}
-	start := len(data) - c.reader.Len()
 	if int64(len(data)-start) < h.Length {
 		return 0
 	}
