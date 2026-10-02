@@ -114,4 +114,4 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## 5. Git 提交与推送
 
-- 不要执行 `git commit`、`git push` 等提交或推送操作；完成代码修改和验证后，将改动留在工作区，由开发者自行审阅并提交。
+- 默认不要自动执行 `git commit`、`git push` 等提交或推送操作；只有在用户主动且明确要求提交代码时，才可以执行对应操作。

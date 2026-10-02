@@ -18,40 +18,90 @@ import (
 // Server is a simple implementation on top of the standard library net package (for platforms such as Windows):
 // one goroutine per connection, callbacks run serially in that goroutine, and Conn.Write is a blocking write.
 type Server struct {
-	handler Handler
-	ln      net.Listener
+	handler   Handler
+	listeners []net.Listener
 
 	mu     sync.Mutex
 	conns  map[*stdConn]struct{}
 	closed bool
-	wg     sync.WaitGroup
+	err    error          // the fatal accept error that made the server exit
+	wg     sync.WaitGroup // connection goroutines
 }
 
-// NewServer creates a listener on addr; connections start being handled once Serve is called. opts is ignored on this
-// platform.
-func NewServer(addr string, handler Handler, _ Options) (*Server, error) {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, err
+// NewServer creates a listener on addr; connections start being handled once Serve is called. To listen on several
+// addresses with the one server, see NewServerAddrs. opts is ignored on this platform.
+func NewServer(addr string, handler Handler, opts Options) (*Server, error) {
+	return NewServerAddrs([]string{addr}, handler, opts)
+}
+
+// NewServerAddrs creates a listener on each of addrs; connections start being handled once Serve is called. At least
+// one address is required, and the listeners share a fate: a fatal accept error on any one of them shuts the whole
+// server down. opts is ignored on this platform.
+func NewServerAddrs(addrs []string, handler Handler, _ Options) (*Server, error) {
+	if len(addrs) == 0 {
+		return nil, errors.New("fnet: NewServerAddrs needs at least one address")
 	}
-	return &Server{handler: handler, ln: ln, conns: make(map[*stdConn]struct{})}, nil
+	s := &Server{handler: handler, conns: make(map[*stdConn]struct{})}
+	for _, addr := range addrs {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			for _, open := range s.listeners {
+				open.Close()
+			}
+			return nil, err
+		}
+		s.listeners = append(s.listeners, ln)
+	}
+	return s, nil
 }
 
-// Addr returns the address actually being listened on.
-func (s *Server) Addr() net.Addr { return s.ln.Addr() }
+// Addr returns the first address actually being listened on; see Addrs for all of them.
+func (s *Server) Addr() net.Addr { return s.listeners[0].Addr() }
 
-// Serve accepts in a loop and starts one goroutine per connection, blocking until Close is called (it then returns
-// ErrServerClosed).
+// Addrs returns all the addresses actually being listened on, in the order they were given to NewServerAddrs.
+func (s *Server) Addrs() []net.Addr {
+	addrs := make([]net.Addr, 0, len(s.listeners))
+	for _, ln := range s.listeners {
+		addrs = append(addrs, ln.Addr())
+	}
+	return addrs
+}
+
+// Serve accepts on every listener and starts one goroutine per connection, blocking until Close is called (it then
+// returns ErrServerClosed).
 func (s *Server) Serve() error {
+	var accepting sync.WaitGroup
+	for _, ln := range s.listeners {
+		accepting.Add(1)
+		go func() {
+			defer accepting.Done()
+			if err := s.accept(ln); err != nil {
+				s.shutdown(err) // stop the other listeners and all connections too
+			}
+		}()
+	}
+	accepting.Wait()
+	s.wg.Wait() // the connection goroutines the accept loops started
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	return ErrServerClosed
+}
+
+// accept accepts on one listener until the server is closed (returning nil) or a fatal error occurs.
+func (s *Server) accept(ln net.Listener) error {
 	var tempDelay time.Duration // backoff delay after accept hits a temporary error
 	for {
-		nc, err := s.ln.Accept()
+		nc, err := ln.Accept()
 		if err != nil {
 			s.mu.Lock()
 			closed := s.closed
 			s.mu.Unlock()
 			if closed {
-				return ErrServerClosed
+				return nil
 			}
 			// Same as net/http: a temporary error (such as running out of file descriptors) is logged and retried after
 			// a backoff that starts at 5ms and doubles each time up to 1s; it must not stop the server.
@@ -70,7 +120,7 @@ func (s *Server) Serve() error {
 		if s.closed {
 			s.mu.Unlock()
 			nc.Close()
-			return ErrServerClosed
+			return nil
 		}
 		s.conns[c] = struct{}{}
 		s.wg.Add(1)
@@ -83,19 +133,25 @@ func (s *Server) Serve() error {
 // It must therefore not be called from a callback: it waits for the callbacks of all connections to finish, including the
 // one calling it, which would deadlock; call it from a new goroutine when needed.
 func (s *Server) Close() error {
+	s.shutdown(nil)
+	s.wg.Wait()
+	return nil
+}
+
+// shutdown closes the listeners and all connections; err is the fatal error that caused the shutdown.
+func (s *Server) shutdown(err error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
-		s.mu.Unlock()
-		return nil
+		return
 	}
-	s.closed = true
-	s.ln.Close()
+	s.closed, s.err = true, err
+	for _, ln := range s.listeners {
+		ln.Close()
+	}
 	for c := range s.conns {
 		c.closeWith(closedByServer)
 	}
-	s.mu.Unlock()
-	s.wg.Wait()
-	return nil
 }
 
 func (s *Server) serveConn(c *stdConn) {

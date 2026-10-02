@@ -80,13 +80,20 @@ type Server struct {
 	engine  *fnet.Server
 }
 
-// NewServer creates an HTTP server on addr; when handler is nil, http.DefaultServeMux is used.
+// NewServer creates an HTTP server on addr; when handler is nil, http.DefaultServeMux is used. To listen on
+// several addresses with the one server, see NewServerAddrs.
 func NewServer(addr string, handler http.Handler, opts Options) (*Server, error) {
+	return NewServerAddrs([]string{addr}, handler, opts)
+}
+
+// NewServerAddrs creates an HTTP server on each of addrs; when handler is nil, http.DefaultServeMux is used. At
+// least one address is required, and all of them share the one underlying fnet engine (see fnet.NewServerAddrs).
+func NewServerAddrs(addrs []string, handler http.Handler, opts Options) (*Server, error) {
 	if handler == nil {
 		handler = http.DefaultServeMux
 	}
 	s := &Server{handler: handler, opts: opts.withDefaults()}
-	engine, err := fnet.NewServer(addr, engineHandler{s}, s.opts.Engine)
+	engine, err := fnet.NewServerAddrs(addrs, engineHandler{s}, s.opts.Engine)
 	if err != nil {
 		return nil, err
 	}
@@ -103,8 +110,11 @@ func ListenAndServe(addr string, handler http.Handler) error {
 	return s.Serve()
 }
 
-// Addr returns the actual listening address.
+// Addr returns the first address actually being listened on; see Addrs for all of them.
 func (s *Server) Addr() net.Addr { return s.engine.Addr() }
+
+// Addrs returns all the addresses actually being listened on, in the order they were given to NewServerAddrs.
+func (s *Server) Addrs() []net.Addr { return s.engine.Addrs() }
 
 // Serve runs the server and blocks until Close is called (returning http.ErrServerClosed) or a fatal error occurs.
 func (s *Server) Serve() error {

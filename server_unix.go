@@ -14,16 +14,21 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// listener is one listening socket: the fd the main reactor accepts on, and the address it is bound to.
+type listener struct {
+	fd   int
+	addr net.Addr
+}
+
 // Server is a TCP server based on the main/sub-reactor model.
 type Server struct {
-	handler    Handler
-	opts       Options
-	listenerFd int
-	addr       net.Addr
-	acceptor   *poll.Poller // the main reactor's Poller, watches only the listener
-	loops      []*loop      // sub-reactors
-	next       int          // round-robin index, accessed only by the main reactor
-	onAccept   func(fd int, ev poll.Event)
+	handler   Handler
+	opts      Options
+	listeners []listener   // the listening sockets, all watched by the one acceptor
+	acceptor  *poll.Poller // the main reactor's Poller, watches only the listeners
+	loops     []*loop      // sub-reactors
+	next      int          // round-robin index, accessed only by the main reactor
+	onAccept  func(fd int, ev poll.Event)
 
 	openConnsWg sync.WaitGroup // connections not yet closed: closed means OnClose returned; Serve waits for them before exiting
 
@@ -35,42 +40,69 @@ type Server struct {
 }
 
 // NewServer creates a listener on addr and a Poller for each sub-reactor. It starts handling connections
-// after Serve is called.
+// after Serve is called. To listen on several addresses with the one server, see NewServerAddrs.
 func NewServer(addr string, handler Handler, opts Options) (*Server, error) {
-	fd, laddr, err := listen(addr)
-	if err != nil {
-		return nil, err
+	return NewServerAddrs([]string{addr}, handler, opts)
+}
+
+// NewServerAddrs creates a listener on each of addrs and a Poller for each sub-reactor. It starts handling
+// connections after Serve is called. At least one address is required; all the listeners share the one main
+// reactor and the one set of sub-reactors, so the number of Pollers and goroutines is independent of how many
+// addresses are listened on.
+//
+// The listeners share a fate: a fatal accept error on any one of them shuts the whole server down, closing the
+// other listeners and all connections.
+func NewServerAddrs(addrs []string, handler Handler, opts Options) (*Server, error) {
+	if len(addrs) == 0 {
+		return nil, errors.New("fnet: NewServerAddrs needs at least one address")
 	}
 	s := &Server{
-		handler:    handler,
-		opts:       opts.withDefaults(),
-		listenerFd: fd,
-		addr:       laddr,
-		done:       make(chan struct{}),
+		handler: handler,
+		opts:    opts.withDefaults(),
+		done:    make(chan struct{}),
 	}
-	if s.acceptor, err = poll.New(); err != nil {
-		unix.Close(fd)
-		return nil, err
-	}
-	if err = s.acceptor.AddRead(fd); err == nil {
-		for range s.opts.NumLoops {
-			var l *loop
-			if l, err = newLoop(s); err != nil {
-				break
-			}
-			s.loops = append(s.loops, l)
-		}
-	}
+	// The acceptor comes first so that release can clean up after any failure below.
+	acceptor, err := poll.New()
 	if err != nil {
-		s.release()
 		return nil, err
+	}
+	s.acceptor = acceptor
+	for _, addr := range addrs {
+		fd, laddr, err := listen(addr)
+		if err != nil {
+			s.release()
+			return nil, err
+		}
+		if err := s.acceptor.AddRead(fd); err != nil {
+			unix.Close(fd) // not in s.listeners yet, so release does not cover it
+			s.release()
+			return nil, err
+		}
+		s.listeners = append(s.listeners, listener{fd: fd, addr: laddr})
+	}
+	for range s.opts.NumLoops {
+		l, err := newLoop(s)
+		if err != nil {
+			s.release()
+			return nil, err
+		}
+		s.loops = append(s.loops, l)
 	}
 	s.onAccept = s.accept
 	return s, nil
 }
 
-// Addr returns the actual listening address.
-func (s *Server) Addr() net.Addr { return s.addr }
+// Addr returns the first address actually being listened on; see Addrs for all of them.
+func (s *Server) Addr() net.Addr { return s.listeners[0].addr }
+
+// Addrs returns all the addresses actually being listened on, in the order they were given to NewServerAddrs.
+func (s *Server) Addrs() []net.Addr {
+	addrs := make([]net.Addr, 0, len(s.listeners))
+	for _, ln := range s.listeners {
+		addrs = append(addrs, ln.addr)
+	}
+	return addrs
+}
 
 // Serve starts all sub-reactors and runs the main reactor in the current goroutine, blocking until Close is
 // called (returning ErrServerClosed) or a fatal error occurs.
@@ -183,18 +215,22 @@ func (s *Server) isClosed() bool {
 }
 
 func (s *Server) release() {
-	unix.Close(s.listenerFd)
+	for _, ln := range s.listeners {
+		unix.Close(ln.fd)
+	}
 	s.acceptor.Close()
 	for _, l := range s.loops {
 		l.close()
 	}
 }
 
-// accept is the main reactor's readable callback: it accepts in batches until EAGAIN and distributes the
-// connections to the sub-reactors in round-robin order.
-func (s *Server) accept(int, poll.Event) {
+// accept is the main reactor's readable callback: it accepts in batches on the ready listener until EAGAIN and
+// distributes the connections to the sub-reactors in round-robin order. The connections of all the listeners
+// go through the one round-robin, so they spread evenly over the sub-reactors no matter which address they
+// arrived on.
+func (s *Server) accept(listenerFd int, _ poll.Event) {
 	for {
-		fd, sa, err := accept(s.listenerFd)
+		fd, sa, err := accept(listenerFd)
 		if err != nil {
 			switch err {
 			case unix.EAGAIN:

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -403,6 +404,118 @@ func TestServerClose(t *testing.T) {
 	if err := s2.Serve(); !errors.Is(err, ErrServerClosed) {
 		t.Fatalf("Close 之后 Serve 返回 %v, 期望 ErrServerClosed", err)
 	}
+}
+
+// TestNewServerSingleAddr verifies NewServer is the one-address spelling of NewServerAddrs: the server listens
+// on exactly the address given, and Addr and Addrs agree about it.
+func TestNewServerSingleAddr(t *testing.T) {
+	srv := startServer(t, &funcHandler{data: echo})
+	addrs := srv.Addrs()
+	if len(addrs) != 1 {
+		t.Fatalf("Addrs() 返回 %d 个地址, 期望 1", len(addrs))
+	}
+	if srv.Addr().String() != addrs[0].String() {
+		t.Fatalf("Addr() = %v, 期望等于 Addrs()[0] = %v", srv.Addr(), addrs[0])
+	}
+}
+
+// TestServerMultipleAddrs verifies one server listening on several addresses serves all of them through the one
+// main reactor and the one set of sub-reactors, and reports them through Addr and Addrs.
+func TestServerMultipleAddrs(t *testing.T) {
+	const numAddrs = 3
+	closed := make(chan error, numAddrs)
+	srv, err := NewServerAddrs(slices.Repeat([]string{"127.0.0.1:0"}, numAddrs), &funcHandler{
+		data:  echo,
+		close: func(c Conn, err error) { closed <- err },
+	}, Options{NumLoops: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve() }()
+
+	addrs := srv.Addrs()
+	if len(addrs) != numAddrs {
+		t.Fatalf("Addrs() 返回 %d 个地址, 期望 %d", len(addrs), numAddrs)
+	}
+	if srv.Addr().String() != addrs[0].String() {
+		t.Fatalf("Addr() = %v, 期望等于 Addrs()[0] = %v", srv.Addr(), addrs[0])
+	}
+	// Every address gets its own listener, so they are all different and all echo.
+	ports := make(map[string]struct{}, numAddrs)
+	for _, addr := range addrs {
+		ports[addr.String()] = struct{}{}
+		c, err := net.Dial("tcp", addr.String())
+		if err != nil {
+			t.Fatalf("连接 %v 失败: %v", addr, err)
+		}
+		defer c.Close()
+		c.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := c.Write([]byte("hello")); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, 5)
+		if _, err := io.ReadFull(c, got); err != nil {
+			t.Fatalf("%v 没有回显: %v", addr, err)
+		}
+		if string(got) != "hello" {
+			t.Fatalf("%v 回显 %q", addr, got)
+		}
+	}
+	if len(ports) != numAddrs {
+		t.Fatalf("Addrs() 里有重复地址: %v", addrs)
+	}
+
+	srv.Close() // closing the one server closes the connections of all the addresses
+	for range numAddrs {
+		if err := <-closed; !errors.Is(err, ErrServerClosed) {
+			t.Fatalf("OnClose 的 err = %v, 期望 ErrServerClosed", err)
+		}
+	}
+	if err := <-served; !errors.Is(err, ErrServerClosed) {
+		t.Fatalf("Serve 返回 %v, 期望 ErrServerClosed", err)
+	}
+}
+
+// TestNewServerAddrsNoAddrs verifies a server without an address to listen on is rejected rather than started
+// as a server that can never be reached.
+func TestNewServerAddrsNoAddrs(t *testing.T) {
+	for name, addrs := range map[string][]string{"nil": nil, "空切片": {}} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewServerAddrs(addrs, &funcHandler{}, Options{}); err == nil {
+				t.Fatal("NewServerAddrs 没有地址时应返回错误")
+			}
+		})
+	}
+}
+
+// TestNewServerAddrsPartialBindFailure verifies a server that fails to bind one of its addresses releases the
+// listeners it had already opened, rather than leaking their fds and leaving the ports occupied.
+func TestNewServerAddrsPartialBindFailure(t *testing.T) {
+	// A port that is known to be free: take it, note it, give it back.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	probe.Close()
+
+	// The second address keeps the listener open, so binding it a second time fails.
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	if _, err := NewServerAddrs([]string{addr, taken.Addr().String()}, &funcHandler{}, Options{}); err == nil {
+		t.Fatal("NewServerAddrs 绑定一个已占用的地址时应返回错误")
+	}
+
+	// The first listener was released, so the port is free again.
+	again, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("第一个 listener 没有被释放, %v 仍被占用: %v", addr, err)
+	}
+	again.Close()
 }
 
 // TestDefaultNumLoopsFollowsGOMAXPROCS verifies the default number of event loops is bounded by the Ps the

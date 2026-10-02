@@ -75,7 +75,7 @@ func TestServeRetriesTemporaryAcceptError(t *testing.T) {
 	}
 	flaky := &flakyListener{Listener: ln}
 	flaky.failures.Store(3)
-	srv := &Server{handler: &funcHandler{data: echo}, ln: flaky, conns: make(map[*stdConn]struct{})}
+	srv := &Server{handler: &funcHandler{data: echo}, listeners: []net.Listener{flaky}, conns: make(map[*stdConn]struct{})}
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve() }()
 

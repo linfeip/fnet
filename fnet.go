@@ -1,8 +1,8 @@
 // Package fnet is an event-driven TCP network library based on the Reactor model.
 //
 // On Linux (epoll) / macOS (kqueue) it uses a main/sub-reactor structure:
-//   - main reactor: one goroutine watches the listener and distributes newly accepted connections to the
-//     sub-reactors in round-robin order;
+//   - main reactor: one goroutine watches all the listeners (a server may listen on several addresses) and
+//     distributes newly accepted connections to the sub-reactors in round-robin order;
 //   - sub-reactor (event loop): each one takes a goroutine and a Poller, waits only for the events of the
 //     connections it owns (edge-triggered), and hands a connection that has events to the executor
 //     (see Options.Executor);
