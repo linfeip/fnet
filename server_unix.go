@@ -254,6 +254,7 @@ func (s *Server) accept(listenerFd int, _ poll.Event) {
 		l := s.loops[s.next]
 		s.next = (s.next + 1) % len(s.loops)
 		c := &conn{fd: fd, loop: l, remote: sockaddrToAddrPort(sa)}
+		c.task = c.run
 		l.trigger(func() { l.register(c) })
 	}
 }

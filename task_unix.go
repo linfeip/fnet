@@ -32,7 +32,7 @@ const (
 // serially inside it, and no events are lost. It reports whether this call submitted the task.
 func (c *conn) notify(ev uint32) bool {
 	if c.state.Or(ev|scheduledBit)&scheduledBit == 0 {
-		c.loop.srv.opts.Executor(c.run)
+		c.loop.srv.opts.Executor(c.task)
 		return true
 	}
 	return false
@@ -58,7 +58,7 @@ func (c *conn) run() {
 		return
 	}
 	if !c.state.CompareAndSwap(scheduledBit, 0) {
-		c.loop.srv.opts.Executor(c.run)
+		c.loop.srv.opts.Executor(c.task)
 	}
 }
 
@@ -80,8 +80,11 @@ func (c *conn) handle(ev uint32) {
 		setKeepAlive(c.fd)
 		c.loop.srv.handler.OnOpen(c)
 	}
-	if ev&evWrite != 0 {
-		c.flush()
+	// The poller reports a writable socket along with every event, so evWrite is nearly always set: only a backlog
+	// needs the lock and a write.
+	drained := false
+	if ev&evWrite != 0 && c.backlogged.Load() {
+		drained = c.flush()
 	}
 	if ev&evHup != 0 {
 		c.peerClosed = true
@@ -89,7 +92,7 @@ func (c *conn) handle(ev uint32) {
 	if ev&evRead != 0 && !c.readPaused.Load() {
 		c.read()
 	}
-	if ev&(evWrite|evClose) != 0 { // the send buffer drained, or a close has been requested
+	if drained || ev&evClose != 0 { // the send buffer drained, or a close has been requested
 		c.closeIfRequested()
 	}
 }
@@ -154,12 +157,12 @@ func (c *conn) read() {
 }
 
 // flush sends the backed-up data on a writable event, writing only once per event: when it cannot write everything the
-// kernel send buffer is full, and another writable event will come.
-func (c *conn) flush() {
+// kernel send buffer is full, and another writable event will come. It reports whether the send buffer drained.
+func (c *conn) flush() bool {
 	c.mu.Lock()
 	if c.out.Len() == 0 {
 		c.mu.Unlock()
-		return
+		return false
 	}
 	n, err := sysWrite(c.fd, c.out.Bytes()[c.outPos:])
 	switch err {
@@ -167,20 +170,23 @@ func (c *conn) flush() {
 	case unix.EINTR: // interrupted by a signal: this edge-triggered event was used up without writing data, write again
 		c.mu.Unlock()
 		c.notify(evWrite)
-		return
+		return false
 	default:
 		c.mu.Unlock()
 		c.requestClose(err)
-		return
+		return false
 	}
 	if n > 0 {
 		c.outPos += n
 	}
-	if c.outPos == c.out.Len() { // the send buffer has drained: return the buffer to the pool
+	drained := c.outPos == c.out.Len()
+	if drained { // the send buffer has drained: return the buffer to the pool
 		c.out.Release()
 		c.outPos = 0
+		c.backlogged.Store(false)
 	}
 	c.mu.Unlock()
+	return drained
 }
 
 // requestClose requests that the connection be closed; it may be called from any goroutine, and the close itself is
@@ -235,6 +241,7 @@ func (c *conn) close(err error) {
 	c.closed = true
 	unix.Close(c.fd)
 	c.out.Release()
+	c.backlogged.Store(false)
 	c.mu.Unlock()
 	c.in.Release()
 	c.loop.srv.handler.OnClose(c, err)

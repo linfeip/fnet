@@ -141,12 +141,24 @@ func (h engineHandler) OnOpen(c fnet.Conn) {
 	hc.setDeadline() // a new connection counts as idle; there is no concurrent access yet, so mu need not be held
 }
 
+// OnData and OnClose find the connection's state in its context: the HTTP conn, or, once a protocol has taken the
+// connection over, that protocol itself (see conn.onData), which leaves the HTTP state out of the path of every
+// message the protocol receives.
 func (h engineHandler) OnData(c fnet.Conn, data []byte) int {
-	return c.Context().(*conn).onData(data)
+	ctx := c.Context()
+	if hc, ok := ctx.(*conn); ok {
+		return hc.onData(data)
+	}
+	return ctx.(Protocol).OnData(data)
 }
 
 func (h engineHandler) OnClose(c fnet.Conn, err error) {
-	c.Context().(*conn).onClose(err)
+	ctx := c.Context()
+	if hc, ok := ctx.(*conn); ok {
+		hc.onClose(err)
+		return
+	}
+	ctx.(Protocol).OnClose(err)
 }
 
 // request is one item in the request queue: either a complete request message, or an error status code to reply
@@ -217,6 +229,9 @@ func (c *conn) setPartial(partial bool) {
 // onData splits out complete request headers and enqueues them, returning the number of consumed bytes.
 func (c *conn) onData(data []byte) int {
 	if p := c.protocol.Load(); p != nil {
+		// The protocol takes over the context from here on, which a callback may set. Nothing of the HTTP state is
+		// needed any more: Upgrade released the queue, and closed only stops an upgrade that has already happened.
+		c.connection.SetContext(*p)
 		return (*p).OnData(data)
 	}
 	if c.broken {

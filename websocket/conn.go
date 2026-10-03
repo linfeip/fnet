@@ -20,6 +20,12 @@ import (
 // maxCorkBytes is the upper bound of the cork buffer (see Conn.cork).
 const maxCorkBytes = 64 * units.KB
 
+// maxFrameHeaderSize is the longest header of a frame the server sends: 2 bytes and a 64-bit length, never a mask.
+const maxFrameHeaderSize = 2 + 8
+
+// maxCopiedPayload is the largest payload writeFrame copies next to its header to write the frame in one piece.
+const maxCopiedPayload = 4 * units.KB
+
 // The values of Conn.phase: OnOpen runs on the goroutine of the upgrade request, while OnData and OnClose are
 // invoked from fnet's tasks; they must not be invoked before OnOpen returns, and they must not block a goroutine of
 // the executor. The zero value means already opened.
@@ -39,31 +45,31 @@ var (
 // The field order also accounts for alignment: small fields fill the gaps left by fields such as sync.Mutex (4-byte
 // alignment), so that Conn stays in the smallest possible size class (see TestConnSize).
 type Conn struct {
-	connection     fnet.Conn
-	handler        Handler
-	maxMessageSize int
-	messageTimeout time.Duration
-	idleTimeout    time.Duration
-	ctx            any
-
 	phase   atomic.Int32 // the progress of OnOpen (phaseOpening and so on), see Upgrade
 	closing atomic.Bool  // close frame sent or connection closed: set under writeMu, read lock-free by OnData; later data is all dropped
 
 	// The following fields are accessed only in fnet's callbacks (OnData, OnClose): callbacks of one connection run
 	// serially
-	message         bytepool.Buffer // the fragmented message being reassembled (already unmasked)
-	messageOpCode   ws.OpCode       // the type of the message field; 0 (ws.OpContinuation) means there is no unfinished message
-	receiving       bool            // the current deadline belongs to a message (or frame) that has not been received in full
-	messageFinished bool            // a data message was received in full during this OnData
-	corking         bool            // this OnData has taken the cork buffer and has not written it out yet, see cork
+	messageOpCode   ws.OpCode // the type of the message field; 0 (ws.OpContinuation) means there is no unfinished message
+	receiving       bool      // the current deadline belongs to a message (or frame) that has not been received in full
+	messageFinished bool      // a data message was received in full during this OnData
+	corking         bool      // this OnData has taken the cork buffer and has not written it out yet, see cork
 
-	writeMu     sync.Mutex             // guarantees that no frame is sent after the close frame
-	closeErr    error                  // the reason for closing; determined when closing is set and never changed afterwards
-	frameHeader [ws.MaxHeaderSize]byte // the frame-header encoding buffer, used while holding writeMu
-	segments    [2][]byte              // frame header and payload, Writev's argument (no per-frame allocation), used while holding writeMu
+	frameHeader [maxFrameHeaderSize]byte // the frame-header encoding buffer, used while holding writeMu
+	writeMu     sync.Mutex               // guarantees that no frame is sent after the close frame
+	connection  fnet.Conn
+	handler     Handler
 	// The cork buffer; nil means no corking is in progress. Used while holding writeMu. A pointer rather than a
 	// slice is stored so that Conn stays in a smaller size class.
-	corkBuffer *bytepool.Buffer
+	corkBuffer     *bytepool.Buffer
+	message        bytepool.Buffer // the fragmented message being reassembled (already unmasked); callbacks only
+	maxMessageSize int
+	idleTimeout    time.Duration
+	messageTimeout time.Duration
+
+	segments [2][]byte // frame header and payload, Writev's argument (no per-frame allocation), used while holding writeMu
+	ctx      any
+	closeErr error // the reason for closing; determined when closing is set and never changed afterwards
 }
 
 // LocalAddr returns the local address; after the connection is closed (including inside OnClose) it returns nil,
@@ -126,10 +132,22 @@ func (c *Conn) closeWith(code ws.StatusCode, err error) {
 	c.connection.Close()
 }
 
-// writeFrame sends one unfragmented, unmasked frame and requires the caller to hold writeMu. The frame header and
-// the payload are written with a single writev, so the payload needs no copy.
+// writeFrame sends one unfragmented, unmasked frame and requires the caller to hold writeMu.
+//
+// A small frame is copied together with its header into one buffer and written with a single write: for a few KB the
+// copy costs less than the kernel taking in the iovec array of a writev. A larger frame is written with a single
+// writev of the header and the payload, so the payload is not copied.
 func (c *Conn) writeFrame(op ws.OpCode, payload []byte) error {
-	c.segments = [2][]byte{appendFrameHeader(c.frameHeader[:0], op, len(payload)), payload}
+	header := appendFrameHeader(c.frameHeader[:0], op, len(payload))
+	if len(payload) <= maxCopiedPayload {
+		frame := bytepool.Get(len(header) + len(payload))
+		frame.Append(header)
+		frame.Append(payload)
+		_, err := c.connection.Write(frame.Bytes())
+		frame.Release()
+		return err
+	}
+	c.segments = [2][]byte{header, payload}
 	_, err := c.connection.Writev(c.segments[:])
 	c.segments[1] = nil // stop referencing the caller's payload
 	return err

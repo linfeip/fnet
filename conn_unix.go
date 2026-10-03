@@ -22,27 +22,27 @@ import (
 // well, which guarantees that whenever closed=false is seen while holding the lock the fd is valid, so no
 // write goes to the wrong object after the fd has been reused by a new connection.
 type conn struct {
-	fd     int
-	loop   *loop
-	remote netip.AddrPort // kept by value, net.Addr is built on RemoteAddr: two fewer small objects resident per connection
-	ctx    any
-
-	in       bytepool.Buffer // unconsumed inbound data, accessed only by the task
-	deadline atomic.Int64    // close deadline (UnixNano), 0 means no deadline; written by any goroutine, checked by the event loop
-
-	// Small fields are packed together to fill the gap before sync.Mutex (4-byte aligned), so that conn can stay
-	// in the 176B size class (see TestConnSize).
+	// Small fields are packed together, so that conn can stay in the 176B size class (see TestConnSize).
 	state      atomic.Uint32 // pending events and scheduledBit, see notify
 	readPaused atomic.Bool   // reading has been paused
+	backlogged atomic.Bool   // out holds data; written while holding mu, read lock-free by the task (see handle)
 	closing    bool          // a close has been requested, see requestClose; accessed while holding mu
 	closeNow   bool          // close immediately, without draining the send buffer (error or deadline); accessed while holding mu
 	closed     bool          // written only by the task while holding the lock, so the task itself can read it lock-free
 	peerClosed bool          // the peer closed or an error occurred (see evHup), accessed only by the task
+	loop       *loop
+	fd         int
+	task       func() // run bound once, so that handing the task to the Executor does not allocate a method value each time
+	ctx        any
+	in         bytepool.Buffer // unconsumed inbound data, accessed only by the task
 
 	mu       sync.Mutex
 	out      bytepool.Buffer // send buffer, the data to send is out.Bytes()[outPos:]; empty when nothing is backed up
+	deadline atomic.Int64    // close deadline (UnixNano), 0 means no deadline; written by any goroutine, checked by the event loop
+
 	outPos   int
-	closeErr error // close reason: nil means an explicit close, io.EOF means the peer closed its write direction; both drain the send buffer before closing
+	closeErr error          // close reason: nil means an explicit close, io.EOF means the peer closed its write direction; both drain the send buffer before closing
+	remote   netip.AddrPort // kept by value, net.Addr is built on RemoteAddr: two fewer small objects resident per connection
 }
 
 func (c *conn) RemoteAddr() net.Addr { return addrPortToTCPAddr(c.remote) }
@@ -88,6 +88,7 @@ func (c *conn) Write(b []byte) (int, error) {
 	}
 	c.compactOut(len(b) - n)
 	c.out.Append(b[n:])
+	c.backlogged.Store(true)
 	buffered = true
 	return len(b), nil
 }
@@ -126,6 +127,7 @@ func (c *conn) Writev(bs [][]byte) (int, error) {
 		c.out.Append(b[skip:])
 		n -= skip
 	}
+	c.backlogged.Store(true)
 	buffered = true
 	return size, nil
 }

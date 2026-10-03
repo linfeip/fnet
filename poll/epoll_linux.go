@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync/atomic"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -148,7 +149,17 @@ func (p *Poller) Wait(fn func(fd int, ev Event)) (woken bool, err error) {
 // pollEvents retrieves one round of ready events without blocking. When it returns false (no events), the runtime parks
 // the goroutine running Wait and calls it again once the epoll fd becomes readable; on an error (including EINTR) it
 // returns true and Wait handles it.
+//
+// A zero timeout never blocks, so the call is a raw one, without handing the P to the scheduler around it: under load
+// the loop polls hundreds of times a second, and a P left in a syscall can be handed to another thread, with the loop
+// then waiting for a P to come back from it. It is epoll_pwait with no signal mask, which is epoll_wait and the one of
+// the two every architecture has.
 func (p *Poller) pollEvents(uintptr) bool {
-	p.readyCount, p.pollErr = unix.EpollWait(p.epollFd, p.events, 0)
+	r, _, errno := syscall.RawSyscall6(unix.SYS_EPOLL_PWAIT, uintptr(p.epollFd),
+		uintptr(unsafe.Pointer(unsafe.SliceData(p.events))), uintptr(len(p.events)), 0, 0, 0)
+	p.readyCount, p.pollErr = int(r), nil
+	if errno != 0 {
+		p.readyCount, p.pollErr = -1, errno
+	}
 	return p.readyCount > 0 || p.pollErr != nil
 }

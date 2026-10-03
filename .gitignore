@@ -1,3 +1,4 @@
 # Autobahn TestSuite (see websocket/autobahn)
 /websocket/autobahn/reports/
 /websocket/autobahn/autobahn_server
+*.local.md

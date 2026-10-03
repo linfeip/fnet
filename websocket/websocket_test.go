@@ -813,8 +813,7 @@ func clientFrames(op ws.OpCode, payloads ...[]byte) []byte {
 }
 
 // TestCorkWrites covers receiving several frames in one OnData: the replies written while handling them are
-// merged into a single write. With only one frame the reply is written out directly with writev as usual,
-// without copying the payload.
+// merged into a single write. With only one frame the reply is written out directly as usual (see TestWriteFrame).
 func TestCorkWrites(t *testing.T) {
 	c, rc := newCorkConn()
 	var payloads [][]byte
@@ -833,11 +832,33 @@ func TestCorkWrites(t *testing.T) {
 	}
 
 	c.OnData(clientFrames(ws.OpText, []byte("one")))
-	if len(rc.events) != 2 || !rc.events[1].vectored || !bytes.Equal(rc.events[1].data, frame(ws.OpText, []byte("one"))) {
+	if len(rc.events) != 2 || rc.events[1].vectored || !bytes.Equal(rc.events[1].data, frame(ws.OpText, []byte("one"))) {
 		t.Fatalf("单个帧: %+v", rc.events[1:])
 	}
 	if c.corkBuffer != nil {
 		t.Fatal("处理完后仍在攒写")
+	}
+}
+
+// TestWriteFrame checks how a single frame goes out: a small one is copied next to its header and written in one
+// piece, a larger one is written with writev without copying the payload; the bytes are the same either way.
+func TestWriteFrame(t *testing.T) {
+	for _, tc := range []struct {
+		size     int
+		vectored bool
+	}{{0, false}, {125, false}, {maxCopiedPayload, false}, {maxCopiedPayload + 1, true}, {units.MB, true}} {
+		rc := &recordConn{}
+		c := &Conn{connection: rc}
+		payload := bytes.Repeat([]byte("x"), tc.size)
+		if err := c.WriteMessage(ws.OpBinary, payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(rc.events) != 1 || !bytes.Equal(rc.events[0].data, frame(ws.OpBinary, payload)) {
+			t.Fatalf("%dB: 写出 %d 次, 数据不符", tc.size, len(rc.events))
+		}
+		if rc.events[0].vectored != tc.vectored {
+			t.Fatalf("%dB: vectored=%v, 期望 %v", tc.size, rc.events[0].vectored, tc.vectored)
+		}
 	}
 }
 
@@ -882,7 +903,7 @@ func TestCorkPerOnData(t *testing.T) {
 	c.OnData(clientFrames(ws.OpText, []byte("c")))
 	want := slices.Concat(frame(ws.OpText, []byte("a")), frame(ws.OpText, []byte("b")))
 	if len(rc.events) != 2 || !bytes.Equal(rc.events[0].data, want) ||
-		!rc.events[1].vectored || !bytes.Equal(rc.events[1].data, frame(ws.OpText, []byte("c"))) {
+		rc.events[1].vectored || !bytes.Equal(rc.events[1].data, frame(ws.OpText, []byte("c"))) {
 		t.Fatalf("写出: %+v", rc.events)
 	}
 }
