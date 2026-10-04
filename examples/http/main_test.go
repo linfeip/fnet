@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/linfeip/fnet/fhttp"
@@ -16,12 +19,17 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// BenchmarkGET compares fhttp, net/http and fasthttp serving the same GET /hello over loopback keep-alive connections,
-// one connection per parallel client goroutine:
+// conns is the number of client connections, each with one request in flight at a time. Far more connections than
+// cores keep every server busy, as real traffic does; with about one per core the benchmark mostly measures how fast
+// the Go scheduler wakes goroutines up.
+var conns = flag.Int("conns", 1000, "BenchmarkGET 的客户端连接数")
+
+// BenchmarkGET compares fhttp, net/http and fasthttp serving the same GET /hello over -conns loopback keep-alive
+// connections:
 //
 //	cd examples
 //	go test ./http -run XXX -bench GET -benchtime 3s
-//	go test ./http -run XXX -bench GET -cpu 4,8 -count 5   # vary the number of connections, repeat
+//	go test ./http -run XXX -bench GET -conns 100 -cpu 4,8 -count 5   # other connection and core counts, repeated
 //
 // The servers and the client share the process and its CPUs, so the numbers compare the servers with each other rather
 // than measure any of them alone. The client allocates nothing, so allocs/op is the server's.
@@ -37,22 +45,33 @@ func BenchmarkGET(b *testing.B) {
 		b.Run(s.name, func(b *testing.B) {
 			addr, stop := s.start(b)
 			defer stop()
-			b.ReportAllocs()
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
+			clients := make([]*client, *conns)
+			for i := range clients {
 				c, err := dialClient(addr)
 				if err != nil {
-					b.Error(err)
-					return
+					b.Fatal(err)
 				}
-				defer c.conn.Close()
-				for pb.Next() {
-					if err := c.get(); err != nil {
-						b.Error(err)
-						return
+				defer c.close()
+				clients[i] = c
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			// Every connection sends requests until b.N have been issued in total.
+			var issued atomic.Int64
+			var wg sync.WaitGroup
+			for _, c := range clients {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for issued.Add(1) <= int64(b.N) {
+						if err := c.get(); err != nil {
+							b.Error(err)
+							return
+						}
 					}
-				}
-			})
+				}()
+			}
+			wg.Wait()
 			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "req/s")
 		})
 	}
@@ -114,6 +133,13 @@ func dialClient(addr string) (*client, error) {
 		return nil, err
 	}
 	return &client{conn: conn, br: bufio.NewReader(conn)}, nil
+}
+
+// close resets the connection instead of leaving it in TIME_WAIT: every run opens -conns new ones, and repeated runs
+// would otherwise use up the ephemeral ports (about 16k on macOS).
+func (c *client) close() {
+	c.conn.(*net.TCPConn).SetLinger(0)
+	c.conn.Close()
 }
 
 // get sends one request and reads the whole response, checking the status and the body length.
