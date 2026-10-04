@@ -12,11 +12,11 @@ import (
 	"net/http"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/internal/units"
@@ -39,6 +39,9 @@ func testMux() *http.ServeMux {
 	})
 	mux.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
 		panic("boom")
+	})
+	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(w, r.Body)
 	})
 	return mux
 }
@@ -98,16 +101,23 @@ func TestClient(t *testing.T) {
 		t.Fatalf("连接未复用: %s vs %s", addr1, addr2)
 	}
 
-	// Requests with a body are not supported yet: both Content-Length and chunked (hiding the concrete type
-	// keeps the client from knowing the length) get a 413.
-	for _, r := range []io.Reader{strings.NewReader("ping"), struct{ io.Reader }{strings.NewReader("ping")}} {
-		resp, err := client.Post(base+"/hello", "text/plain", r)
+	// A small body with Content-Length is buffered and served on fnet, keeping the connection alive; a chunked one
+	// (hiding the concrete type keeps the client from knowing the length) goes to net/http, which closes it.
+	for _, tt := range []struct {
+		body  io.Reader
+		close bool
+	}{
+		{strings.NewReader("ping"), false},
+		{struct{ io.Reader }{strings.NewReader("ping")}, true},
+	} {
+		resp, err := client.Post(base+"/echo", "text/plain", tt.body)
 		if err != nil {
 			t.Fatal(err)
 		}
+		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusRequestEntityTooLarge {
-			t.Fatalf("带请求体的 POST: %d", resp.StatusCode)
+		if err != nil || resp.StatusCode != 200 || string(body) != "ping" || resp.Close != tt.close {
+			t.Fatalf("带请求体的 POST: %d %q close=%v err=%v", resp.StatusCode, body, resp.Close, err)
 		}
 	}
 
@@ -196,6 +206,21 @@ func (discardConn) Writev(bs [][]byte) (int, error) {
 func (discardConn) SetDeadline(time.Time) {}
 func (discardConn) RemoteAddr() net.Addr  { return &net.TCPAddr{} }
 
+// TestConnSize checks that conn and the request queue item stay within their size classes: every connection holds a
+// conn, and its queue keeps a backing array (see maxRetainedQueueCapacity), so a few bytes more cost every idle
+// connection a whole size class.
+func TestConnSize(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("尺寸按 64 位平台检查")
+	}
+	if size := unsafe.Sizeof(conn{}); size > 112 {
+		t.Fatalf("conn 为 %dB，超出 112B 的内存分级", size)
+	}
+	if size := unsafe.Sizeof(request{}); size > 32 {
+		t.Fatalf("request 为 %dB，超出 32B", size)
+	}
+}
+
 // TestQueueCapacity verifies that once the queue has been drained the large capacity left behind by a
 // pipelining burst is released, while the capacity for a small number of requests is retained so that
 // each request does not have to allocate again.
@@ -254,9 +279,14 @@ func TestBadRequests(t *testing.T) {
 		{"BLAH\r\n\r\n", 400},
 		{"GET / HTTP/1.1\r\n\r\n", 400}, // missing Host
 		{"GET / HTTP/1.1\r\nHost: a\r\nX: " + strings.Repeat("a", 2*units.KB) + "\r\n\r\n", 431},
-		{"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: " + strconv.Itoa(2*units.KB) + "\r\n\r\n", 413},
-		{"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n", 400},
+		// Framed by fhttp, but the standard library reads a different body out of the message: an obs-fold line
+		// continuing Content-Length, and an empty line made of a bare LF ending the headers early.
+		{"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n 0\r\n\r\nx", 400},
+		{"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 3\n\nabc\r\n\r\nxyz", 400},
+		// Not buffered by fhttp, so net/http answers them, the same as the net/http server would.
+		{"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n", 501},
 		{"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n", 400},
+		{"POST /echo HTTP/1.1\r\nHost: a\r\nExpect: foo\r\nContent-Length: 1\r\n\r\nx", 417},
 		{"GET /hello HTTP/9.9\r\nHost: a\r\n\r\n", 505},
 		{"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 505},
 		// A blank line made of a bare LF makes the standard library stop parsing early: what
@@ -277,15 +307,24 @@ func TestBadRequests(t *testing.T) {
 		expectClosed(t, br)
 	}
 
-	// The error response has to come after the response to the valid request that preceded it.
-	br := dialRaw(t, s, "GET /hello HTTP/1.1\r\nHost: a\r\n\r\nPOST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n")
-	if resp, _ := readResp(t, br); resp.StatusCode != 200 {
-		t.Fatalf("第一个响应: %d", resp.StatusCode)
+	// The error response has to come after the response to the valid request that preceded it, also when it comes
+	// from net/http.
+	for _, tt := range []struct {
+		req    string
+		status int
+	}{
+		{"GET / HTTP/1.1\r\nHost: a\r\nX: " + strings.Repeat("a", 2*units.KB) + "\r\n\r\n", 431},
+		{"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n", 501},
+	} {
+		br := dialRaw(t, s, "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"+tt.req)
+		if resp, _ := readResp(t, br); resp.StatusCode != 200 {
+			t.Fatalf("第一个响应: %d", resp.StatusCode)
+		}
+		if resp, _ := readResp(t, br); resp.StatusCode != tt.status {
+			t.Fatalf("第二个响应: got %d, want %d", resp.StatusCode, tt.status)
+		}
+		expectClosed(t, br)
 	}
-	if resp, _ := readResp(t, br); resp.StatusCode != 400 {
-		t.Fatalf("第二个响应: %d", resp.StatusCode)
-	}
-	expectClosed(t, br)
 }
 
 // TestValidHost checks that a Host may be a hostname, an IPv4 address or an IPv6 literal with a zone
@@ -369,7 +408,8 @@ func TestH1Spec(t *testing.T) {
 		{"Valid GET request", "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n", [][2]int{{200, 299}}, ""},
 		{"Valid GET request with edge cases", "GET / HTTP/1.1\r\nhoSt:\texample.com\r\nempty:\r\n\r\n", [][2]int{{200, 299}}, ""},
 		{"Invalid header characters", "GET / HTTP/1.1\r\nHost: example.com\r\nX-Invalid[]: test\r\n\r\n", [][2]int{{400, 499}}, ""},
-		{"Missing Host header", "GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\n", [][2]int{{400, 499}}, ""},
+		// fhttp handles a request once its body has arrived, so unlike h1spec the 5 bytes are sent as well.
+		{"Missing Host header", "GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", [][2]int{{400, 499}}, ""},
 		{"Multiple Host headers", "GET / HTTP/1.1\r\nHost: example.com\r\nHost: example.org\r\n\r\n", [][2]int{{400, 499}}, ""},
 		{"Overflowing negative Content-Length header", "GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: -123456789123456789123456789\r\n\r\n", [][2]int{{400, 499}}, ""},
 		{"Negative Content-Length header", "GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: -1234\r\n\r\n", [][2]int{{400, 499}}, ""},
@@ -379,10 +419,8 @@ func TestH1Spec(t *testing.T) {
 		{"Invalid HTTP version", "GET / HTTP/9.9\r\nHost: example.com\r\n\r\n", [][2]int{{400, 499}, {500, 599}}, ""},
 		{"Invalid prefix of request", "Extra lineGET / HTTP/1.1\r\nHost: example.com\r\n\r\n", [][2]int{{400, 499}, {500, 599}}, ""},
 		{"Invalid line ending", "GET / HTTP/1.1\r\nHost: example.com\r\n\rSome-Header: Test\r\n\r\n", [][2]int{{400, 499}}, ""},
-		// h1spec expects 2xx or 404: fhttp does not support request bodies yet, so it replies 413.
-		{"Valid POST request with body", "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello", [][2]int{{413, 413}}, "hello"},
-		// h1spec expects 2xx: same as above, it replies 413.
-		{"Chunked Transfer-Encoding", "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\nc\r\nHellO world1\r\n0\r\n\r\n", [][2]int{{413, 413}}, "HellO world1"},
+		{"Valid POST request with body", "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello", [][2]int{{200, 299}, {404, 404}}, "hello"},
+		{"Chunked Transfer-Encoding", "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\nc\r\nHellO world1\r\n0\r\n\r\n", [][2]int{{200, 299}}, "HellO world1"},
 		{"Conflicting Transfer-Encoding and Content-Length in varying case", "POST / HTTP/1.1\r\nHost: example.com\r\ncontent-LengtH: 5\r\nTransFer-Encoding: chunked\r\n\r\nc\r\nHellO world1\r\n0\r\n\r\n", [][2]int{{400, 499}, {200, 299}}, "HellO world1"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -472,6 +510,10 @@ func TestTimeouts(t *testing.T) {
 			}
 		}()
 		expectDropped(t, bufio.NewReader(c))
+	})
+	t.Run("慢速发送请求体", func(t *testing.T) { // a buffered body is part of the request, under ReadHeaderTimeout
+		t.Parallel()
+		expectDropped(t, dialRaw(t, s, "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel"))
 	})
 	t.Run("处理期间收到的不完整请求头", func(t *testing.T) {
 		t.Parallel()

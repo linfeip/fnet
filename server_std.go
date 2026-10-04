@@ -161,9 +161,19 @@ func (s *Server) serveConn(c *stdConn) {
 	var in []byte
 	var err error
 	for err == nil {
-		c.waitResumed()
+		if c.waitResumed() { // detached: hand the unconsumed data over and leave the connection open
+			s.mu.Lock()
+			delete(s.conns, c)
+			s.mu.Unlock()
+			c.in = in
+			close(c.detached)
+			return
+		}
 		var n int
 		n, err = c.netConnection.Read(buf)
+		if err != nil && c.isDetached() { // Detach woke the Read up
+			err = nil
+		}
 		if n == 0 {
 			continue
 		}
@@ -195,6 +205,7 @@ func (s *Server) serveConn(c *stdConn) {
 const (
 	closedByUser int32 = iota + 1
 	closedByServer
+	closedByDetach // taken out of the engine by Detach: the net.Conn now belongs to its caller and is left open
 )
 
 type stdConn struct {
@@ -204,7 +215,9 @@ type stdConn struct {
 
 	mu          sync.Mutex
 	readPaused  bool
-	readResumed sync.Cond // broadcast when reading resumes or the connection closes, with L being &mu
+	readResumed sync.Cond     // broadcast when reading resumes, the connection closes or is detached, with L being &mu
+	detached    chan struct{} // set by Detach, closed by the read loop once it has stopped for good
+	in          []byte        // the data OnData left unconsumed, handed over by the read loop when it stops
 }
 
 func (c *stdConn) LocalAddr() net.Addr  { return c.netConnection.LocalAddr() }
@@ -213,6 +226,9 @@ func (c *stdConn) Context() any         { return c.ctx }
 func (c *stdConn) SetContext(ctx any)   { c.ctx = ctx }
 
 func (c *stdConn) Write(b []byte) (int, error) {
+	if c.closedBy.Load() == closedByDetach {
+		return 0, net.ErrClosed
+	}
 	n, err := c.netConnection.Write(b)
 	if err != nil && c.closedBy.Load() != 0 {
 		err = net.ErrClosed
@@ -223,6 +239,9 @@ func (c *stdConn) Write(b []byte) (int, error) {
 // Writev sends through net.Buffers, which also writes everything out at once with writev (WSASend on Windows) when the
 // underlying connection supports it.
 func (c *stdConn) Writev(bs [][]byte) (int, error) {
+	if c.closedBy.Load() == closedByDetach {
+		return 0, net.ErrClosed
+	}
 	// net.Buffers.WriteTo modifies the elements of the slice, so copy it to avoid changing the caller's bs.
 	buffers := net.Buffers(slices.Clone(bs))
 	n, err := buffers.WriteTo(c.netConnection)
@@ -241,7 +260,11 @@ func (c *stdConn) Close() error {
 
 // SetDeadline is implemented with a read timeout: once it expires the blocked Read returns a timeout error and the read
 // loop then closes the connection.
-func (c *stdConn) SetDeadline(t time.Time) { c.netConnection.SetReadDeadline(t) }
+func (c *stdConn) SetDeadline(t time.Time) {
+	if c.closedBy.Load() != closedByDetach {
+		c.netConnection.SetReadDeadline(t)
+	}
+}
 
 // PauseRead makes the read loop wait before its next Read, until reading resumes or the connection closes.
 func (c *stdConn) PauseRead() {
@@ -257,13 +280,40 @@ func (c *stdConn) ResumeRead() {
 	c.mu.Unlock()
 }
 
-// waitResumed blocks while reading is paused, until reading resumes or the connection closes.
-func (c *stdConn) waitResumed() {
+// waitResumed blocks while reading is paused, until reading resumes, the connection closes or is detached; it reports
+// whether the connection has been detached.
+func (c *stdConn) waitResumed() bool {
 	c.mu.Lock()
-	for c.readPaused && c.closedBy.Load() == 0 {
+	defer c.mu.Unlock()
+	for c.readPaused && c.closedBy.Load() == 0 && c.detached == nil {
 		c.readResumed.Wait()
 	}
+	return c.detached != nil
+}
+
+func (c *stdConn) isDetached() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.detached != nil
+}
+
+// Detach stops the read loop, which hands over the data OnData left unconsumed. Taking closedBy keeps every later close
+// (Close, the server shutting down) away from the net.Conn. Write is synchronous on this platform, so there is no send
+// buffer to drain.
+func (c *stdConn) Detach() (net.Conn, error) {
+	c.mu.Lock()
+	if !c.closedBy.CompareAndSwap(0, closedByDetach) {
+		c.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	done := make(chan struct{})
+	c.detached = done
+	c.readResumed.Broadcast()
 	c.mu.Unlock()
+	c.netConnection.SetReadDeadline(time.Unix(1, 0)) // wakes a Read in progress, in case reading was not paused
+	<-done
+	c.netConnection.SetReadDeadline(time.Time{})
+	return &detachedConn{TCPConn: c.netConnection.(*net.TCPConn), in: c.in}, nil
 }
 
 func (c *stdConn) closeWith(by int32) {

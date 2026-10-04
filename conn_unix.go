@@ -3,8 +3,11 @@
 package fnet
 
 import (
+	"bytes"
 	"net"
 	"net/netip"
+	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -173,6 +176,55 @@ func (c *conn) PauseRead() { c.readPaused.Store(true) }
 func (c *conn) ResumeRead() {
 	c.readPaused.Store(false)
 	c.notify(evRead)
+}
+
+// Detach first takes over the connection's task: once state goes from 0 (no task queued or running) to scheduledBit,
+// notify never submits the task again, so this goroutine owns everything the task owns, the inbound buffer included.
+func (c *conn) Detach() (net.Conn, error) {
+	for !c.state.CompareAndSwap(0, scheduledBit) {
+		c.mu.Lock()
+		closed := c.closed // a closed connection keeps scheduledBit set for good (see run)
+		c.mu.Unlock()
+		if closed {
+			return nil, net.ErrClosed
+		}
+		runtime.Gosched() // a task is queued or running; callbacks return quickly
+	}
+	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		if !c.state.CompareAndSwap(scheduledBit, 0) { // give the task back to carry out the close
+			c.loop.srv.opts.Executor(c.task)
+		}
+		return nil, net.ErrClosed
+	}
+	c.closed = true // writes now fail; close does nothing, so OnClose is never called
+	out := bytes.Clone(c.out.Bytes()[c.outPos:])
+	c.out.Release()
+	c.outPos = 0
+	c.backlogged.Store(false)
+	c.mu.Unlock()
+	in := bytes.Clone(c.in.Bytes())
+	c.in.Release()
+
+	// Deregister explicitly: net.FileConn duplicates the fd, and an epoll registration lasts as long as any descriptor
+	// of the socket stays open. The table entry goes before the fd is closed, which frees the fd number for reuse.
+	c.loop.poller.Delete(c.fd)
+	connsByFd.remove(c)
+	c.loop.srv.openConnsWg.Done()
+	f := os.NewFile(uintptr(c.fd), "")
+	nc, err := net.FileConn(f)
+	f.Close()
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > 0 {
+		if _, err := nc.Write(out); err != nil {
+			nc.Close()
+			return nil, err
+		}
+	}
+	return &detachedConn{TCPConn: nc.(*net.TCPConn), in: in}, nil
 }
 
 // SetDeadline only records the deadline, which the event loop checks once per second (see

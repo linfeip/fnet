@@ -1,6 +1,6 @@
 // websocket is an example WebSocket echo server based on fnet's websocket package.
 //
-//	go run ./examples/websocket -addr :8080
+//	cd examples && go run ./websocket -addr :8080
 //	websocket ws://localhost:8080/ws
 package main
 

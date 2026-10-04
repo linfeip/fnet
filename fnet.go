@@ -18,6 +18,7 @@ package fnet
 
 import (
 	"errors"
+	"io"
 	"net"
 	"runtime"
 	"time"
@@ -108,6 +109,41 @@ type Conn interface {
 	// On Linux/macOS the deadline is checked once per second, so the actual close time may be up to about one
 	// second later than t.
 	SetDeadline(t time.Time)
+	// Detach takes the connection out of the engine and returns it as a standard library net.Conn, so that the
+	// rest of it can be served with blocking reads and writes (fhttp hands such connections to net/http). Read on
+	// the net.Conn first returns the data OnData left unconsumed, and the data still in the send buffer is
+	// written out before Detach returns. From then on the engine is done with the connection: no callback is
+	// invoked again (OnClose included), this Conn behaves as a closed one, and closing the net.Conn is up to the
+	// caller.
+	//
+	// Reading must be paused first (PauseRead from OnData), so that OnData does not consume what is meant for
+	// the net.Conn. Detach waits for a running callback of the connection to return, so it must not be called
+	// from a callback. It returns net.ErrClosed when the connection is closed or a close has been requested.
+	Detach() (net.Conn, error)
+}
+
+// detachedConn is a connection taken out of the engine by Conn.Detach. Read first returns the data OnData left
+// unconsumed; the *net.TCPConn is embedded so that the rest of its methods (CloseWrite, ReadFrom, ...) stay
+// available, which net/http uses.
+type detachedConn struct {
+	*net.TCPConn
+	in []byte
+}
+
+func (c *detachedConn) Read(b []byte) (int, error) {
+	if len(c.in) == 0 {
+		return c.TCPConn.Read(b)
+	}
+	n := copy(b, c.in)
+	if c.in = c.in[n:]; len(c.in) == 0 {
+		c.in = nil
+	}
+	return n, nil
+}
+
+// WriteTo hides (*net.TCPConn).WriteTo, which would read from the socket past the unconsumed data.
+func (c *detachedConn) WriteTo(w io.Writer) (int64, error) {
+	return io.Copy(w, struct{ io.Reader }{c})
 }
 
 // Options holds the engine parameters; the zero value is the default configuration.

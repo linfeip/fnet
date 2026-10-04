@@ -1,18 +1,23 @@
 // Package fhttp is an HTTP/1.x server built on the fnet engine.
 //
 // The division of labor:
-//   - fnet's OnData callback (on a goroutine of the executor) only looks for the request header terminator
-//     "\r\n\r\n" and copies the request line and headers into the connection's request queue, without parsing
-//     anything;
-//   - a worker goroutine takes the message out, hands it to the standard library's http.ReadRequest for parsing,
-//     then runs the http.Handler and writes the response back.
+//   - fnet's OnData callback (on a goroutine of the executor) only finds where each request message ends: the
+//     header terminator "\r\n\r\n", then the Content-Length bytes of a small body. It copies the whole message
+//     into the connection's request queue without parsing it;
+//   - a worker goroutine takes the message out, hands it to the standard library's http.ReadRequest for parsing
+//     (the request body is the standard library's own reader over the buffered bytes), then runs the http.Handler
+//     and writes the response back.
 //
 // At most one worker processes a given connection at a time, so with pipelining the responses come in the same
-// order as the requests. Request headers must be received in full within ReadHeaderTimeout, idle connections are
-// closed after IdleTimeout, and the Handler's execution time is not limited (see Options).
-// Currently only requests without a body are supported (a request with a body gets a 413 and the connection is
-// closed); the response body is buffered in full before being written out, so http.Flusher and http.Hijacker are
-// not supported. Protocol upgrades (such as WebSocket) are done through Upgrade.
+// order as the requests. A request, small body included, must be received in full within ReadHeaderTimeout, idle
+// connections are closed after IdleTimeout, and the Handler's execution time is not limited (see Options).
+// The response body is buffered in full before being written out, so http.Flusher and http.Hijacker are not
+// supported. Protocol upgrades (such as WebSocket) are done through Upgrade.
+//
+// A request whose body is not buffered (larger than MaxBufferedBodyBytes, chunked, or framed in an unusual way) is
+// served by net/http instead: the connection is detached from fnet and handed to an internal http.Server running the
+// same Handler, which streams the body (a large file upload costs constant memory with Request.MultipartReader) and
+// closes the connection after that request.
 package fhttp
 
 import (
@@ -48,9 +53,13 @@ type Options struct {
 	// MaxHeaderBytes is the maximum number of bytes of the request line and headers; when <=0 it is
 	// http.DefaultMaxHeaderBytes (1MB).
 	MaxHeaderBytes int
-	// ReadHeaderTimeout is the maximum time from the first byte of a request until the request header is received
-	// in full; data arriving in the meantime does not extend it. When 0 it is 10s, when <0 it is unlimited. On
-	// timeout the connection is closed immediately.
+	// MaxBufferedBodyBytes is the largest request body that is received in full before the Handler runs; when <=0
+	// it is 1MB. Such a request costs no more than one without a body: it stays on fnet and its body is read from
+	// memory. A request with a larger body is served by net/http (see the package documentation).
+	MaxBufferedBodyBytes int
+	// ReadHeaderTimeout is the maximum time from the first byte of a request until the request header, and a body
+	// of up to MaxBufferedBodyBytes, are received in full; data arriving in the meantime does not extend it. When 0
+	// it is 10s, when <0 it is unlimited. On timeout the connection is closed immediately.
 	ReadHeaderTimeout time.Duration
 	// IdleTimeout is the maximum time to wait for the next request while no request is being received or processed
 	// (including on a newly established connection); when 0 it is 120s, when <0 it is unlimited.
@@ -64,6 +73,9 @@ func (o Options) withDefaults() Options {
 	if o.MaxHeaderBytes <= 0 {
 		o.MaxHeaderBytes = http.DefaultMaxHeaderBytes
 	}
+	if o.MaxBufferedBodyBytes <= 0 {
+		o.MaxBufferedBodyBytes = units.MB
+	}
 	if o.ReadHeaderTimeout == 0 {
 		o.ReadHeaderTimeout = 10 * time.Second
 	}
@@ -75,9 +87,11 @@ func (o Options) withDefaults() Options {
 
 // Server is an HTTP server.
 type Server struct {
-	handler http.Handler
-	opts    Options
-	engine  *fnet.Server
+	handler  http.Handler
+	opts     Options
+	engine   *fnet.Server
+	streams  *http.Server     // serves the handed-off connections, see conn.handoff
+	handoffs *handoffListener // what streams accepts from
 }
 
 // NewServer creates an HTTP server on addr; when handler is nil, http.DefaultServeMux is used. To listen on
@@ -98,6 +112,10 @@ func NewServerAddrs(addrs []string, handler http.Handler, opts Options) (*Server
 		return nil, err
 	}
 	s.engine = engine
+	// The header of a handed-off request has already arrived, so of net/http's limits only MaxHeaderBytes matters.
+	s.streams = &http.Server{Handler: handler, MaxHeaderBytes: s.opts.MaxHeaderBytes}
+	s.streams.SetKeepAlivesEnabled(false) // one request per handed-off connection, the next one comes back to fnet
+	s.handoffs = newHandoffListener(engine.Addr())
 	return s, nil
 }
 
@@ -118,6 +136,7 @@ func (s *Server) Addrs() []net.Addr { return s.engine.Addrs() }
 
 // Serve runs the server and blocks until Close is called (returning http.ErrServerClosed) or a fatal error occurs.
 func (s *Server) Serve() error {
+	go s.streams.Serve(s.handoffs)
 	err := s.engine.Serve()
 	if errors.Is(err, fnet.ErrServerClosed) {
 		return http.ErrServerClosed
@@ -128,6 +147,8 @@ func (s *Server) Serve() error {
 // Close closes the listener and all connections. Handlers that are already running are not interrupted, but their
 // responses cannot be written out.
 func (s *Server) Close() error {
+	s.handoffs.Close()
+	s.streams.Close()
 	return s.engine.Close()
 }
 
@@ -136,7 +157,7 @@ func (s *Server) Close() error {
 type engineHandler struct{ server *Server }
 
 func (h engineHandler) OnOpen(c fnet.Conn) {
-	hc := &conn{srv: h.server, connection: c, framer: framer{maxHeaderBytes: h.server.opts.MaxHeaderBytes}}
+	hc := &conn{srv: h.server, connection: c}
 	c.SetContext(hc)
 	hc.setDeadline() // a new connection counts as idle; there is no concurrent access yet, so mu need not be held
 }
@@ -161,12 +182,15 @@ func (h engineHandler) OnClose(c fnet.Conn, err error) {
 	ctx.(Protocol).OnClose(err)
 }
 
-// request is one item in the request queue: either a complete request message, or an error status code to reply
-// with.
+// request is one item in the request queue: either a complete request message, or a status code to reply with
+// (100 Continue, or an error that closes the connection), or statusHandoff.
 type request struct {
 	msg    bytepool.Buffer
 	status int
 }
+
+// statusHandoff is the queue item that hands the connection to net/http, see conn.handoff.
+const statusHandoff = -1
 
 // conn is the state of one HTTP connection.
 type conn struct {
@@ -226,7 +250,7 @@ func (c *conn) setPartial(partial bool) {
 	c.mu.Unlock()
 }
 
-// onData splits out complete request headers and enqueues them, returning the number of consumed bytes.
+// onData splits out complete request messages and enqueues them, returning the number of consumed bytes.
 func (c *conn) onData(data []byte) int {
 	if p := c.protocol.Load(); p != nil {
 		// The protocol takes over the context from here on, which a callback may set. Nothing of the HTTP state is
@@ -239,15 +263,33 @@ func (c *conn) onData(data []byte) int {
 	}
 	consumed := 0
 	for consumed < len(data) {
-		n, err := c.framer.next(data[consumed:])
+		n, expectContinue, err := c.framer.next(data[consumed:], &c.srv.opts)
+		if err == errStreamBody {
+			// The rest of the connection goes to net/http once the earlier requests are answered. Reading stops, so
+			// the request stays unconsumed for it.
+			c.connection.PauseRead()
+			if !c.push(nil, statusHandoff) {
+				c.broken = true
+				return len(data)
+			}
+			return consumed
+		}
 		if err != nil {
-			// framer only ever returns errHeaderTooLarge. The error response also goes out through the queue, which
-			// guarantees it comes after the responses of earlier requests.
+			// framer only ever returns errHeaderTooLarge here. The error response also goes out through the queue,
+			// which guarantees it comes after the responses of earlier requests.
 			c.broken = true
 			c.push(nil, http.StatusRequestHeaderFieldsTooLarge)
 			return len(data)
 		}
 		if n == 0 {
+			// The header is complete and the client waits for 100 Continue before sending the body. It goes through
+			// the queue as well, so it is not written in the middle of earlier responses.
+			if expectContinue {
+				if !c.push(nil, http.StatusContinue) {
+					c.broken = true
+					return len(data)
+				}
+			}
 			break
 		}
 		if !c.push(data[consumed:consumed+n], 0) {
@@ -342,9 +384,20 @@ var readerPool = sync.Pool{New: func() any {
 	return rd
 }}
 
+// continueResponse is the interim response that asks the client to send the request body.
+var continueResponse = []byte("HTTP/1.1 100 Continue\r\n\r\n")
+
 // handle parses and processes one request, and reports whether to keep the connection alive.
 func (c *conn) handle(r request) bool {
-	if r.status != 0 {
+	switch r.status {
+	case 0:
+	case http.StatusContinue:
+		c.connection.Write(continueResponse)
+		return true
+	case statusHandoff:
+		c.handoff()
+		return false // closing the detached connection does nothing
+	default:
 		c.writeError(r.status)
 		return false
 	}
@@ -361,17 +414,18 @@ func (c *conn) handle(r request) bool {
 		c.writeError(http.StatusBadRequest)
 		return false
 	}
-	// The message is cut at the first "\r\n\r\n", but the standard library also accepts a bare LF as a line break:
-	// when the message contains an empty line made of "\n\n", parsing ends early. The remainder must not be
-	// silently discarded (an upstream proxy may treat it as the next request, misaligning the responses), so it is
-	// handled as a bad request.
-	if rd.bufferedReader.Buffered() > 0 || rd.bytesReader.Len() > 0 {
-		c.writeError(http.StatusBadRequest)
-		return false
-	}
 	// Same as the net/http server: only HTTP/1.x is supported, and it is rejected before Host is checked.
 	if req.ProtoMajor != 1 {
 		c.writeError(http.StatusHTTPVersionNotSupported)
+		return false
+	}
+	// The message ends where framer said, so what the standard library takes for the body must be exactly the rest
+	// of it. Otherwise the two disagree on the framing: a field framer did not recognize (see bodyLength), or an empty
+	// line made of a bare LF, which the standard library accepts as a line break, ending the headers early. The
+	// remainder must not be silently discarded or executed (an upstream proxy may frame it differently, misaligning
+	// the responses), so it is handled as a bad request.
+	if int64(rd.bufferedReader.Buffered()+rd.bytesReader.Len()) != req.ContentLength {
+		c.writeError(http.StatusBadRequest)
 		return false
 	}
 	// Same as the net/http server: an HTTP/1.1 request must carry Host (multiple Hosts are already rejected by
@@ -386,14 +440,6 @@ func (c *conn) handle(r request) bool {
 		c.writeError(http.StatusBadRequest)
 		return false
 	}
-	// framer only cuts at the header terminator, so the request body is not part of the message; requests with a
-	// body are not supported yet (ContentLength is -1 for chunked). They must be rejected and the connection closed:
-	// the body has already been split and enqueued as subsequent requests, and closing keeps them from being
-	// executed — otherwise this would be request smuggling.
-	if req.ContentLength != 0 {
-		c.writeError(http.StatusRequestEntityTooLarge)
-		return false
-	}
 	if c.remoteAddr == "" {
 		c.remoteAddr = c.connection.RemoteAddr().String()
 	}
@@ -401,7 +447,15 @@ func (c *conn) handle(r request) bool {
 
 	w := newResponse(c, req)
 	defer w.release()
-	if !c.serveHTTP(w, req) {
+	body := req.Body
+	ok := c.serveHTTP(w, req)
+	// Same as the net/http server: close the body, so a Handler that kept it cannot read the pooled reader once it
+	// serves another request, and remove the files ParseMultipartForm stored on disk.
+	body.Close()
+	if req.MultipartForm != nil {
+		req.MultipartForm.RemoveAll()
+	}
+	if !ok {
 		return false
 	}
 	if w.upgraded { // Upgrade already wrote the response: on success the connection goes to the new protocol, on failure it closes

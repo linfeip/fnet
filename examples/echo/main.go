@@ -1,6 +1,6 @@
 // echo is an example TCP echo server based on fnet.
 //
-//	go run ./examples/echo -addr :9000
+//	cd examples && go run ./echo -addr :9000
 package main
 
 import (

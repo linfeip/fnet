@@ -42,7 +42,7 @@ listener ─▶ main reactor (accept) ── round-robin ─▶ sub-reactor 0 �
 
 - **One task per connection**: reading, callbacks and closing run serially in the connection's task, so the callbacks of one connection never overlap and stay in order. There is no goroutine per connection and no inbound queue.
 - **Zero-copy reads, kernel backpressure**: data is handed to `OnData` straight from a borrowed buffer. A connection is not read again until its callback returns, so a slow handler is throttled by TCP flow control instead of piling up memory.
-- **HTTP**: the callback only looks for the end of the header (`\r\n\r\n`); parsing is left to `http.ReadRequest`, and the Handler runs on a goroutine that exists only while the connection has pending requests.
+- **HTTP**: the callback only looks for the end of each request (the header terminator `\r\n\r\n`, then a `Content-Length` body of up to `MaxBufferedBodyBytes`, 1MB by default); parsing and the body are left to `http.ReadRequest`, and the Handler runs on a goroutine that exists only while the connection has pending requests. A larger or chunked body (say a big file upload) is streamed by `net/http` instead: the connection is detached from `fnet` (`Conn.Detach`) and handed to an internal `http.Server` running the same Handler, which closes it after that request.
 - **WebSocket**: frames are split and unmasked inside the connection's task and passed to `OnMessage` without a message queue; replies written while handling a batch of frames are coalesced into one write.
 
 ---
@@ -105,10 +105,14 @@ Callbacks run on the executor (`taskpool.DefaultTaskPool` by default, replaceabl
 
 ## Examples
 
+The examples are a separate module (`examples/go.mod`, built against the fnet in this repository), so their dependencies, such as fasthttp for the HTTP benchmark, stay out of fnet's own `go.mod`.
+
 ```bash
-go run ./examples/echo        # TCP echo
-go run ./examples/http        # HTTP
-go run ./examples/websocket   # WebSocket echo
+cd examples
+go run ./echo        # TCP echo
+go run ./http        # HTTP: GET, forms, JSON, PUT/PATCH/DELETE/OPTIONS, chunked, multipart uploads
+go run ./websocket   # WebSocket echo
+go test ./http -run XXX -bench GET   # GET benchmark: fhttp vs net/http vs fasthttp
 ```
 
 ---
@@ -130,7 +134,7 @@ Throughput is on par because most CPU goes to system calls (the loopback stack);
 ## Limitations
 
 - The send buffer has no upper bound and there is no write timeout: a client that never reads makes it grow.
-- No TLS or HTTP/2. HTTP requests with a body are not supported (413) and responses are fully buffered (no `http.Flusher` / `http.Hijacker`).
+- No TLS or HTTP/2. Responses are fully buffered (no `http.Flusher` / `http.Hijacker`), except on connections handed to `net/http` for a streamed request body.
 - WebSocket: no permessage-deflate; messages are always sent as a single frame.
 - Half-close is not supported: after EOF the connection is closed once the buffered data has been sent.
 - The kqueue path is fully tested on macOS; the epoll path is cross-compiled and passes `go vet` but **has not been run on Linux yet**. Run `go test -race ./...` on Linux before going live.

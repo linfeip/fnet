@@ -853,3 +853,97 @@ func TestBackloggedLeftoverIsSmall(t *testing.T) {
 		t.Fatalf("每个积压的连接占用 %dB，期望只为残留的半个帧占用内存", perConn)
 	}
 }
+
+// TestDetach takes a connection out of the engine in the middle of its traffic: the data OnData left unconsumed comes
+// out of the net.Conn first, the backlog in the send buffer reaches the peer before what is written to the net.Conn,
+// the old Conn behaves as a closed one, OnClose is never called, and the server shuts down without waiting for the
+// detached connection.
+func TestDetach(t *testing.T) {
+	backlog := bytes.Repeat([]byte("0123456789abcdef"), units.MB) // 16MB, far beyond the kernel buffer
+	type result struct {
+		sc  Conn
+		nc  net.Conn
+		err error
+	}
+	detached := make(chan result, 1)
+	closed := make(chan error, 1)
+	srv := startServer(t, &funcHandler{
+		data: func(c Conn, b []byte) int {
+			if len(b) < len("head") {
+				return 0
+			}
+			c.Write(backlog) // most of it stays in the send buffer
+			c.PauseRead()
+			go func() {
+				nc, err := c.Detach()
+				detached <- result{c, nc, err}
+			}()
+			return len("head") // the rest is for the net.Conn
+		},
+		close: func(c Conn, err error) { closed <- err },
+	})
+	c := dial(t, srv)
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	io.WriteString(c, "headtail")
+	got := make([]byte, len(backlog))
+	if _, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, backlog) {
+		t.Fatalf("发送缓冲中的数据不一致, err=%v", err)
+	}
+	r := <-detached
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	nc := r.nc
+	defer nc.Close()
+	nc.SetDeadline(time.Now().Add(5 * time.Second))
+
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(nc, buf); err != nil || string(buf) != "tail" {
+		t.Fatalf("未消费的数据: %q %v", buf, err)
+	}
+	io.WriteString(c, "more")
+	if _, err := io.ReadFull(nc, buf); err != nil || string(buf) != "more" {
+		t.Fatalf("Detach 之后到达的数据: %q %v", buf, err)
+	}
+	io.WriteString(nc, "bye!")
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "bye!" {
+		t.Fatalf("经 net.Conn 写出的数据: %q %v", buf, err)
+	}
+
+	if _, err := r.sc.Write([]byte("x")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Detach 后经原 Conn 写入: %v", err)
+	}
+	if _, err := r.sc.Detach(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("重复 Detach: %v", err)
+	}
+	r.sc.Close() // does nothing to the detached connection
+	io.WriteString(nc, "ok")
+	if _, err := io.ReadFull(c, buf[:2]); err != nil || string(buf[:2]) != "ok" {
+		t.Fatalf("原 Conn 的 Close 影响了 net.Conn: %q %v", buf[:2], err)
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("Detach 后回调了 OnClose(%v)", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestDetachClosed checks that a connection which is closed, or whose close has been requested, cannot be detached.
+func TestDetachClosed(t *testing.T) {
+	opened := make(chan Conn, 1)
+	closed := make(chan struct{})
+	srv := startServer(t, &funcHandler{
+		open:  func(c Conn) { opened <- c },
+		close: func(c Conn, err error) { close(closed) },
+	})
+	dial(t, srv)
+	sc := <-opened
+	sc.Close()
+	if _, err := sc.Detach(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("请求关闭后 Detach: %v", err)
+	}
+	<-closed
+	if _, err := sc.Detach(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("关闭后 Detach: %v", err)
+	}
+}

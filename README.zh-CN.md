@@ -42,7 +42,7 @@ listener ─▶ 主 Reactor（accept）── 轮询 ─▶ 子 Reactor 0 … N-
 
 - **一连接一任务**：读取、回调、关闭都在连接的任务里串行完成，同一连接的回调不会重叠且保序。没有每连接一个 goroutine，也没有入站队列。
 - **零拷贝读取，内核背压**：数据直接从借用的缓冲交给 `OnData`。回调返回之前不会再读取该连接，处理慢时由 TCP 流量控制限速，而不是在内存里堆积。
-- **HTTP**：回调里只找头部结束符（`\r\n\r\n`），解析交给 `http.ReadRequest`；Handler 运行在只在连接有待处理请求时才存在的 goroutine 中。
+- **HTTP**：回调里只找每个请求的结束位置（头部结束符 `\r\n\r\n`，以及不超过 `MaxBufferedBodyBytes`（默认 1MB）的 `Content-Length` 请求体），解析和请求体交给 `http.ReadRequest`；Handler 运行在只在连接有待处理请求时才存在的 goroutine 中。更大的或 chunked 的请求体（例如大文件上传）改由 `net/http` 流式处理：连接从 `fnet` 摘下（`Conn.Detach`），交给运行同一个 Handler 的内部 `http.Server`，处理完这个请求后关闭连接。
 - **WebSocket**：帧在连接的任务里切分、解掩码，直接回调 `OnMessage`，没有消息队列；处理同一批帧期间写出的回复会合并成一次写。
 
 ---
@@ -105,10 +105,14 @@ mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 
 ## 示例
 
+示例是一个独立的 module（`examples/go.mod`，编译时使用本仓库里的 fnet），它的依赖（例如 HTTP 压测用到的 fasthttp）不会进入 fnet 自己的 `go.mod`。
+
 ```bash
-go run ./examples/echo        # TCP echo
-go run ./examples/http        # HTTP
-go run ./examples/websocket   # WebSocket echo
+cd examples
+go run ./echo        # TCP echo
+go run ./http        # HTTP：GET、表单、JSON、PUT/PATCH/DELETE/OPTIONS、chunked、multipart 上传
+go run ./websocket   # WebSocket echo
+go test ./http -run XXX -bench GET   # GET 压测：fhttp、net/http、fasthttp 对比
 ```
 
 ---
@@ -130,7 +134,7 @@ macOS、10 核，wrk 与服务端运行在同一台机器上，hello world Handl
 ## 当前限制
 
 - 发送缓冲没有上限，也没有写超时：只发请求却从不读取的客户端会让它持续增长。
-- 不支持 TLS、HTTP/2。不支持带请求体的 HTTP 请求（回复 413），响应体完整缓存在内存中（不支持 `http.Flusher` / `http.Hijacker`）。
+- 不支持 TLS、HTTP/2。响应体完整缓存在内存中（不支持 `http.Flusher` / `http.Hijacker`），为流式请求体交给 `net/http` 的连接除外。
 - WebSocket：不支持 permessage-deflate，发送的消息总是单帧。
 - 不支持半关闭：读到 EOF 后，发完已缓冲的数据就关闭连接。
 - kqueue 路径已在 macOS 上完整测试；epoll 路径已交叉编译并通过 `go vet`，但**尚未在 Linux 上实际运行**，上线前请在 Linux 上执行 `go test -race ./...`。
