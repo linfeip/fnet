@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/linfeip/fnet/poll"
+	"github.com/linfeip/fnet/taskpool"
 
 	"golang.org/x/sys/unix"
 )
@@ -22,13 +23,14 @@ type listener struct {
 
 // Server is a TCP server based on the main/sub-reactor model.
 type Server struct {
-	handler   Handler
-	opts      Options
-	listeners []listener   // the listening sockets, all watched by the one acceptor
-	acceptor  *poll.Poller // the main reactor's Poller, watches only the listeners
-	loops     []*loop      // sub-reactors
-	next      int          // round-robin index, accessed only by the main reactor
-	onAccept  func(fd int, ev poll.Event)
+	handler     Handler
+	opts        Options
+	listeners   []listener   // the listening sockets, all watched by the one acceptor
+	acceptor    *poll.Poller // the main reactor's Poller, watches only the listeners
+	loops       []*loop      // sub-reactors
+	next        int          // round-robin index, accessed only by the main reactor
+	onAccept    func(fd int, ev poll.Event)
+	submitBatch func([]func()) // 仅默认执行器使用；自定义 Executor 保持逐任务调用
 
 	openConnsWg sync.WaitGroup // connections not yet closed: closed means OnClose returned; Serve waits for them before exiting
 
@@ -60,6 +62,9 @@ func NewServerAddrs(addrs []string, handler Handler, opts Options) (*Server, err
 		handler: handler,
 		opts:    opts.withDefaults(),
 		done:    make(chan struct{}),
+	}
+	if opts.Executor == nil {
+		s.submitBatch = taskpool.DefaultTaskPool.SubmitBatch
 	}
 	// The acceptor comes first so that release can clean up after any failure below.
 	acceptor, err := poll.New()

@@ -31,11 +31,16 @@ const (
 // A connection therefore has at most one task at a time, with reading, callbacks, flushing and closing all done
 // serially inside it, and no events are lost. It reports whether this call submitted the task.
 func (c *conn) notify(ev uint32) bool {
-	if c.state.Or(ev|scheduledBit)&scheduledBit == 0 {
+	if c.markEvents(ev) {
 		c.loop.srv.opts.Executor(c.task)
 		return true
 	}
 	return false
+}
+
+// markEvents 合并事件并取得唯一任务的提交权；返回 true 的调用方必须负责提交，不能丢弃。
+func (c *conn) markEvents(ev uint32) bool {
+	return c.state.Or(ev|scheduledBit)&scheduledBit == 0
 }
 
 // run is the connection's task: it takes the pending events and processes one round. When more events arrive while

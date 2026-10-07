@@ -165,6 +165,7 @@ type Options struct {
 	// must recover, otherwise the process exits.
 	// When nil it is the Submit of taskpool.DefaultTaskPool (lock-free submission, worker reuse, recovers and
 	// logs the panic). Linux/macOS only.
+	// 默认执行器会合并同轮 readiness 的提交；自定义 Executor 仍逐连接调用，且任务仍须异步执行。
 	Executor func(task func())
 }
 

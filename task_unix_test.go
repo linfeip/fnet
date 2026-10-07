@@ -3,6 +3,7 @@
 package fnet
 
 import (
+	"bytes"
 	"io"
 	"net"
 	"os"
@@ -122,5 +123,33 @@ func TestPeerCloseThenDeadline(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("读到 EOF 之后期限到期，连接没有关闭")
+	}
+}
+
+// TestBatchResubmissionSerial 验证批量就绪与回调内重新通知不会并发执行同一连接的回调。
+func TestBatchResubmissionSerial(t *testing.T) {
+	var active atomic.Int32
+	var concurrent atomic.Bool
+	srv := startServer(t, &funcHandler{data: func(c Conn, b []byte) int {
+		if active.Add(1) != 1 {
+			concurrent.Store(true)
+		}
+		defer active.Add(-1)
+		c.PauseRead()
+		c.ResumeRead() // 在任务仍执行时产生下一回合的事件。
+		return echo(c, b)
+	}})
+	c := dial(t, srv)
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	payload := bytes.Repeat([]byte("echo"), 32*units.KB)
+	if n, err := c.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("写入 %d/%d 字节, err=%v", n, len(payload), err)
+	}
+	reply := make([]byte, len(payload))
+	if _, err := io.ReadFull(c, reply); err != nil {
+		t.Fatal(err)
+	}
+	if concurrent.Load() || !bytes.Equal(reply, payload) {
+		t.Fatal("回调并发执行或 Echo 数据不符")
 	}
 }

@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
+	"runtime/metrics"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -25,6 +27,7 @@ import (
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/internal/units"
+	"github.com/linfeip/fnet/taskpool"
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
@@ -198,6 +201,29 @@ func TestEcho(t *testing.T) {
 	c.expectMessage(t, ws.OpText, []byte("fragment"))
 }
 
+// TestEchoPipelined 验证真实 WebSocket 连接连续收发多帧批次，覆盖跨读回合的 Echo 顺序。
+func TestEchoPipelined(t *testing.T) {
+	for _, size := range []int{7, units.KB} {
+		t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
+			s := newTestServer(t, &testHandler{}, Options{})
+			c := dial(t, s)
+			payloads := make([][]byte, 16)
+			for i := range payloads {
+				payloads[i] = bytes.Repeat([]byte{byte(i)}, size)
+			}
+			batch := clientFrames(ws.OpBinary, payloads...)
+			for range 3 {
+				if n, err := c.Write(batch); err != nil || n != len(batch) {
+					t.Fatalf("写入 %d/%d 字节, err=%v", n, len(batch), err)
+				}
+				for _, payload := range payloads {
+					c.expectMessage(t, ws.OpBinary, payload)
+				}
+			}
+		})
+	}
+}
+
 // TestConnSize checks that Conn stays within the 256B size class, since connections are numerous: when
 // adding, removing or reordering fields pushes it over, the fields have to be rearranged.
 func TestConnSize(t *testing.T) {
@@ -340,7 +366,7 @@ func maskedFrames(count, payload int) []byte {
 // 1KB each (frames=1 is the plain echo, frames=10 is the pipelined case): header parsing, unmasking, the echo
 // into the cork buffer and the single write that goes out afterwards.
 func BenchmarkOnData(b *testing.B) {
-	for _, frames := range []int{1, 10} {
+	for _, frames := range []int{1, 2, 10, 16} {
 		b.Run(fmt.Sprintf("frames=%d", frames), func(b *testing.B) {
 			batch := maskedFrames(frames, units.KB)
 			c := &Conn{connection: stubConnection{}, handler: echoHandler{}, maxMessageSize: units.MB}
@@ -357,18 +383,27 @@ func BenchmarkOnData(b *testing.B) {
 	}
 }
 
-// TestOnDataAllocs checks that processing a frame allocates nothing: the receive path runs once per message, and
-// a per-frame allocation (ws.ReadHeader allocated a scratch buffer for every frame) is the biggest source of
-// garbage under pipelined load.
+// TestOnDataAllocs 验证单帧和多帧 Echo 在缓冲池预热后均不分配，覆盖 cork 包装对象的逃逸回归。
 func TestOnDataAllocs(t *testing.T) {
-	batch := maskedFrames(1, units.KB)
-	c := &Conn{connection: stubConnection{}, handler: echoHandler{}, maxMessageSize: units.MB}
-	data := make([]byte, len(batch))
-	if allocs := testing.AllocsPerRun(1000, func() {
-		copy(data, batch)
-		c.OnData(data)
-	}); allocs != 0 {
-		t.Fatalf("处理一个帧分配了 %v 次, want 0", allocs)
+	for _, frames := range []int{1, 2, 10, 16} {
+		for _, size := range []int{7, units.KB} {
+			t.Run(fmt.Sprintf("frames=%d/size=%d", frames, size), func(t *testing.T) {
+				batch := maskedFrames(frames, size)
+				c := &Conn{connection: stubConnection{}, handler: echoHandler{}, maxMessageSize: units.MB}
+				data := make([]byte, len(batch))
+				if allocs := testing.AllocsPerRun(1000, func() {
+					copy(data, batch)
+					if n := c.OnData(data); n != len(data) {
+						t.Fatalf("消费 %d 字节, 期望 %d", n, len(data))
+					}
+				}); allocs != 0 {
+					t.Fatalf("处理 %d 个帧分配了 %v 次, want 0", frames, allocs)
+				}
+				if c.corking || c.corkBuffer.Bytes() != nil {
+					t.Fatal("处理完后仍保留攒写缓冲区")
+				}
+			})
+		}
 	}
 }
 
@@ -835,8 +870,36 @@ func TestCorkWrites(t *testing.T) {
 	if len(rc.events) != 2 || rc.events[1].vectored || !bytes.Equal(rc.events[1].data, frame(ws.OpText, []byte("one"))) {
 		t.Fatalf("单个帧: %+v", rc.events[1:])
 	}
-	if c.corkBuffer != nil {
+	if c.corkBuffer.Bytes() != nil {
 		t.Fatal("处理完后仍在攒写")
+	}
+}
+
+// TestCorkConcurrentWrites 验证同一连接的并发写共享攒写缓冲区，结束后归还底层数组。
+func TestCorkConcurrentWrites(t *testing.T) {
+	c, rc := newCorkConn()
+	c.cork(512)
+	payload := []byte("concurrent")
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 16 {
+				if err := c.WriteMessage(ws.OpText, payload); err != nil {
+					t.Error(err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	c.uncork()
+	want := bytes.Repeat(frame(ws.OpText, payload), 8*16)
+	if len(rc.events) != 1 || !bytes.Equal(rc.events[0].data, want) {
+		t.Fatalf("并发攒写结果不符, 写出 %d 次", len(rc.events))
+	}
+	if c.corking || c.corkBuffer.Bytes() != nil {
+		t.Fatal("并发攒写结束后仍保留缓冲区")
 	}
 }
 
@@ -893,6 +956,9 @@ func TestCorkLimit(t *testing.T) {
 	if len(rc.events) != 3 {
 		t.Fatalf("写出 %d 次, 期望 3 次", len(rc.events))
 	}
+	if c.corking || c.corkBuffer.Bytes() != nil {
+		t.Fatal("处理大批次后仍保留攒写缓冲区")
+	}
 }
 
 // TestCorkPerOnData checks that the corked frames are written out at the end of every OnData, so a reply is
@@ -918,7 +984,7 @@ func TestCorkEveryOnData(t *testing.T) {
 		if len(rc.events) != round+1 || !bytes.Equal(rc.events[round].data, want) {
 			t.Fatalf("第 %d 批: 写出 %+v, 期望每批合并为 1 次", round, rc.events)
 		}
-		if c.corking || c.corkBuffer != nil {
+		if c.corking || c.corkBuffer.Bytes() != nil {
 			t.Fatal("处理完后仍在攒写")
 		}
 	}
@@ -938,7 +1004,7 @@ func TestCorkClose(t *testing.T) {
 	if err := c.WriteMessage(ws.OpText, []byte("after")); err != net.ErrClosed {
 		t.Fatalf("关闭后写入: %v", err)
 	}
-	if c.corkBuffer != nil {
+	if c.corkBuffer.Bytes() != nil {
 		t.Fatal("处理完后仍在攒写")
 	}
 }
@@ -978,7 +1044,7 @@ func TestCorkPanic(t *testing.T) {
 	want := slices.Concat(frame(ws.OpText, []byte("a")), frame(ws.OpText, []byte("b")))
 	closeFrame := frame(ws.OpClose, ws.NewCloseFrameBody(ws.StatusInternalServerError, ""))
 	if len(rc.events) != 3 || !bytes.Equal(rc.events[0].data, want) || !bytes.Equal(rc.events[1].data, closeFrame) ||
-		!rc.events[2].close || c.corkBuffer != nil {
+		!rc.events[2].close || c.corkBuffer.Bytes() != nil {
 		t.Fatalf("panic 之后: %+v", rc.events)
 	}
 	if c.closeErr != errHandlerPanic {
@@ -1107,4 +1173,103 @@ func TestTimeouts(t *testing.T) {
 		wsutil.WriteClientMessage(active, ws.OpText, []byte("alive"))
 		active.expectMessage(t, ws.OpText, []byte("alive"))
 	})
+}
+
+// BenchmarkEchoScheduling 对照批量路径与逐任务路径，同时单独扫描 NumLoops 和 pipeline。
+// 客户端在计时前握手，使用固定帧并校验全部 Echo；同进程结果不能替代 Linux 分机压测。
+func BenchmarkEchoScheduling(b *testing.B) {
+	for _, loops := range []int{8, 16, 32} {
+		for _, pipeline := range []int{1, 16} {
+			for _, batch := range []bool{false, true} {
+				b.Run(fmt.Sprintf("loops=%d/pipeline=%d/batch=%t", loops, pipeline, batch), func(b *testing.B) {
+					engine := fnet.Options{NumLoops: loops}
+					if !batch {
+						engine.Executor = func(task func()) { taskpool.DefaultTaskPool.Submit(task) }
+					}
+					mux := http.NewServeMux()
+					mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+						if err := Upgrade(w, r, echoHandler{}, Options{}); err != nil {
+							b.Error(err)
+						}
+					})
+					srv, err := fhttp.NewServer("127.0.0.1:0", mux, fhttp.Options{Engine: engine})
+					if err != nil {
+						b.Fatal(err)
+					}
+					served := make(chan error, 1)
+					go func() { served <- srv.Serve() }()
+					clients := make([]struct {
+						connection net.Conn
+						reader     io.Reader
+						reply      []byte
+					}, 8*runtime.GOMAXPROCS(0))
+					b.Cleanup(func() {
+						for _, client := range clients {
+							if client.connection != nil {
+								client.connection.Close()
+							}
+						}
+						srv.Close()
+						if err := <-served; !errors.Is(err, http.ErrServerClosed) {
+							b.Error(err)
+						}
+					})
+					payload := make([]byte, 7)
+					request := maskedFrames(pipeline, len(payload))
+					want := bytes.Repeat(frame(ws.OpBinary, payload), pipeline)
+					for i := range clients {
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						conn, buffered, _, err := ws.Dial(ctx, "ws://"+srv.Addr().String()+"/ws")
+						cancel()
+						if err != nil {
+							b.Fatal(err)
+						}
+						clients[i].connection = conn
+						clients[i].reader = conn
+						if buffered != nil {
+							clients[i].reader = io.MultiReader(buffered, conn)
+						}
+						clients[i].reply = make([]byte, len(want))
+						conn.SetDeadline(time.Now().Add(30 * time.Second))
+					}
+					var next atomic.Int32
+					samples := []metrics.Sample{{Name: "/sched/latencies:seconds"}}
+					metrics.Read(samples)
+					var scheduled uint64
+					for _, count := range samples[0].Value.Float64Histogram().Counts {
+						scheduled += count
+					}
+					b.SetParallelism(8)
+					b.ReportAllocs()
+					b.ResetTimer()
+					b.RunParallel(func(pb *testing.PB) {
+						client := &clients[int(next.Add(1))-1]
+						for pb.Next() {
+							if n, err := client.connection.Write(request); err != nil || n != len(request) {
+								b.Errorf("写入 %d/%d 字节, err=%v", n, len(request), err)
+								return
+							}
+							if _, err := io.ReadFull(client.reader, client.reply); err != nil {
+								b.Error(err)
+								return
+							}
+							if !bytes.Equal(client.reply, want) {
+								b.Error("Echo 数据不符")
+								return
+							}
+						}
+					})
+					b.StopTimer()
+					b.ReportMetric(float64(b.N*pipeline)/b.Elapsed().Seconds(), "msg/s")
+					metrics.Read(samples)
+					var finished uint64
+					for _, count := range samples[0].Value.Float64Histogram().Counts {
+						finished += count
+					}
+					// runtime 每八次调度采样一次；包含客户端与服务端，不等同于精确 worker 唤醒数。
+					b.ReportMetric(float64((finished-scheduled)*8)/float64(b.N*pipeline), "sched/msg")
+				})
+			}
+		}
+	}
 }

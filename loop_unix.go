@@ -13,6 +13,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const maxReadyTasks = 256
+
 // loop is a sub-reactor: one goroutine + one Poller, it waits only for the events of the connections it owns
 // and notifies the connection's task (see conn.notify) to handle them.
 type loop struct {
@@ -29,9 +31,11 @@ type loop struct {
 	tasks []func()
 	dead  bool // the Poller is closed, no more tasks are accepted
 
-	spare     []func() // used alternately with tasks to reduce allocations, accessed only by the event loop
-	stopping  bool     // accessed only by the event loop
-	submitted bool     // the current round of events submitted a task (see run), accessed only by the event loop
+	spare                 []func() // used alternately with tasks to reduce allocations, accessed only by the event loop
+	stopping              bool     // accessed only by the event loop
+	readyTasks            []func() // 默认执行器的有界提交批次，仅事件循环访问
+	readyEventsSinceYield int      // 计入已排队连接的事件，防止持续就绪时长期占住 P
+	submitted             bool     // the current round of events submitted a task (see run), accessed only by the event loop
 }
 
 func newLoop(s *Server) (*loop, error) {
@@ -42,6 +46,9 @@ func newLoop(s *Server) (*loop, error) {
 	l := &loop{
 		srv:    s,
 		poller: p,
+	}
+	if s.submitBatch != nil {
+		l.readyTasks = make([]func(), 0, maxReadyTasks)
 	}
 	l.onEvent = l.handleEvent // bind in advance to avoid allocating a closure on every Wait round
 	return l, nil
@@ -64,30 +71,40 @@ func (l *loop) trigger(task func()) {
 // run runs the event loop until it receives the stop task or the Poller fails; before exiting it requests the
 // close of all connections, which is then carried out by each connection's task.
 //
-// After a round of events that submitted tasks the loop yields its P. The executor wakes workers for those tasks, and
-// the runtime queues each woken goroutine on the P of the goroutine that woke it, which is this one; a loop that keeps
-// finding events never parks, so they would wait for another P to steal them while Ps may sit idle. Yielding runs them
-// right away. A lone loop does not yield: every connection's events would then wait behind the workers it woke.
+// 默认执行器按有界就绪事件数让出 P，避免小批次每轮都进行调度交接；即使事件都已合并进
+// 现有任务，也会达到让出阈值。自定义执行器保留逐轮让出行为，单个事件循环仍不主动让出。
 func (l *loop) run() error {
 	yield := len(l.srv.loops) > 1
 	var err error
 	for !l.stopping {
 		var woken bool
-		if woken, err = l.poller.Wait(l.onEvent); err != nil {
+		woken, err = l.poller.Wait(l.onEvent)
+		l.submitReadyTasks()
+		if err != nil {
 			break
 		}
 		if woken {
 			l.runTasks()
 		}
-		if l.submitted {
-			l.submitted = false
-			if yield {
-				runtime.Gosched()
-			}
+		if l.takeYield() && yield {
+			runtime.Gosched()
 		}
 	}
 	l.forEachConn(func(c *conn) { c.requestClose(ErrServerClosed) })
 	return err
+}
+
+// takeYield 消费本轮让出状态；单循环也清零计数，避免计数无限增长。
+func (l *loop) takeYield() bool {
+	yield := l.submitted
+	l.submitted = false
+	if l.srv.submitBatch != nil {
+		yield = l.readyEventsSinceYield >= maxReadyTasks
+		if yield {
+			l.readyEventsSinceYield = 0
+		}
+	}
+	return yield
 }
 
 func (l *loop) stop() { l.stopping = true }
@@ -136,9 +153,33 @@ func (l *loop) register(c *conn) {
 // reused by now, by a connection of this loop (which then only gets a spurious event, and reading it finds nothing) or
 // of another one (which must not be notified through this loop).
 func (l *loop) handleEvent(fd int, ev poll.Event) {
-	if c := connsByFd.lookup(fd); c != nil && c.loop == l && c.notify(uint32(ev)) {
-		l.submitted = true
+	c := connsByFd.lookup(fd)
+	if c == nil || c.loop != l {
+		return
 	}
+	if l.srv.submitBatch == nil {
+		if c.notify(uint32(ev)) {
+			l.submitted = true
+		}
+		return
+	}
+	l.readyEventsSinceYield++
+	if c.markEvents(uint32(ev)) {
+		l.readyTasks = append(l.readyTasks, c.task)
+		if len(l.readyTasks) == maxReadyTasks {
+			l.submitReadyTasks()
+		}
+	}
+}
+
+func (l *loop) submitReadyTasks() {
+	if len(l.readyTasks) == 0 {
+		return
+	}
+	l.srv.submitBatch(l.readyTasks)
+	clear(l.readyTasks)
+	l.readyTasks = l.readyTasks[:0]
+	l.submitted = true
 }
 
 // forEachConn calls fn for every connection still registered with the loop. The ones that have taken themselves out of

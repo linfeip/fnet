@@ -59,9 +59,9 @@ type Conn struct {
 	writeMu     sync.Mutex               // guarantees that no frame is sent after the close frame
 	connection  fnet.Conn
 	handler     Handler
-	// The cork buffer; nil means no corking is in progress. Used while holding writeMu. A pointer rather than a
-	// slice is stored so that Conn stays in a smaller size class.
-	corkBuffer     *bytepool.Buffer
+	// 攒写缓冲区内嵌在连接中，避免每批分配包装对象；仅在持有 writeMu 时访问。
+	// Bytes 为 nil 表示未攒写，每轮结束时归还底层数组，不在空闲连接上保留。
+	corkBuffer     bytepool.Buffer
 	message        bytepool.Buffer // the fragmented message being reassembled (already unmasked); callbacks only
 	maxMessageSize int
 	idleTimeout    time.Duration
@@ -96,7 +96,7 @@ func (c *Conn) WriteMessage(op ws.OpCode, data []byte) error {
 	if c.closing.Load() {
 		return net.ErrClosed
 	}
-	if c.corkBuffer != nil {
+	if c.corkBuffer.Bytes() != nil {
 		return c.writeCorked(op, data)
 	}
 	return c.writeFrame(op, data)
@@ -163,7 +163,7 @@ func (c *Conn) writeFrame(op ws.OpCode, payload []byte) error {
 //
 //go:noinline
 func (c *Conn) writeCorked(op ws.OpCode, payload []byte) error {
-	b := c.corkBuffer
+	b := &c.corkBuffer
 	header := appendFrameHeader(c.frameHeader[:0], op, len(payload))
 	if b.Len()+len(header)+len(payload) <= maxCorkBytes {
 		b.Append(header)
@@ -185,9 +185,8 @@ func (c *Conn) writeCorked(op ws.OpCode, payload []byte) error {
 func (c *Conn) cork(size int) {
 	c.corking = true
 	c.writeMu.Lock()
-	if c.corkBuffer == nil {
-		b := bytepool.Get(min(size, maxCorkBytes))
-		c.corkBuffer = &b
+	if c.corkBuffer.Bytes() == nil {
+		c.corkBuffer = bytepool.Get(min(size, maxCorkBytes))
 	}
 	c.writeMu.Unlock()
 }
@@ -203,15 +202,14 @@ func (c *Conn) uncork() {
 // uncorkLocked is the same as uncork but requires the caller to hold writeMu; it does nothing when no corking is in
 // progress.
 func (c *Conn) uncorkLocked() {
-	b := c.corkBuffer
-	if b == nil {
+	b := &c.corkBuffer
+	if b.Bytes() == nil {
 		return
 	}
 	if b.Len() > 0 {
 		c.connection.Write(b.Bytes())
 	}
 	b.Release()
-	c.corkBuffer = nil
 }
 
 // appendFrameHeader appends a frame header with FIN=1, RSV of 0 and no mask (RFC 6455 5.2); the payload length is

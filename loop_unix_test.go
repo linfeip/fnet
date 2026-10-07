@@ -167,3 +167,87 @@ func TestConnChurn(t *testing.T) {
 		}
 	}
 }
+
+// TestReadyTasksBatch 验证事件合并、批次上限和提交数组复用，不在 poller 回调里执行任务。
+func TestReadyTasksBatch(t *testing.T) {
+	var sizes []int
+	var submitted []func()
+	srv := &Server{
+		opts: Options{Executor: func(func()) { t.Error("不应逐个提交默认执行器任务") }},
+		submitBatch: func(tasks []func()) {
+			sizes = append(sizes, len(tasks))
+			submitted = append(submitted, tasks...)
+		},
+	}
+	l, err := newLoop(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.close()
+	var runs int
+	for i := range maxReadyTasks + 1 {
+		c := &conn{fd: 400000 + i, loop: l, task: func() { runs++ }}
+		if !connsByFd.store(c) {
+			t.Fatal("连接表存储失败")
+		}
+		t.Cleanup(func() { connsByFd.remove(c) })
+		l.handleEvent(c.fd, poll.EventRead)
+		l.handleEvent(c.fd, poll.EventWrite) // 合并到已有任务，不重复提交。
+		if c.state.Load() != scheduledBit|evRead|evWrite {
+			t.Fatal("事件合并不符")
+		}
+	}
+	if !slices.Equal(sizes, []int{maxReadyTasks}) || runs != 0 {
+		t.Fatalf("批次 %v，任务提前执行 %d 次", sizes, runs)
+	}
+	l.submitReadyTasks()
+	if !slices.Equal(sizes, []int{maxReadyTasks, 1}) || len(l.readyTasks) != 0 {
+		t.Fatalf("批次 %v，剩余任务 %d", sizes, len(l.readyTasks))
+	}
+	for _, task := range l.readyTasks[:cap(l.readyTasks)] {
+		if task != nil {
+			t.Fatal("提交数组仍引用连接任务")
+		}
+	}
+	for _, task := range submitted {
+		task()
+	}
+	if runs != maxReadyTasks+1 {
+		t.Fatalf("执行 %d 次，期望 %d", runs, maxReadyTasks+1)
+	}
+}
+
+func TestDefaultExecutorBatchOnly(t *testing.T) {
+	for _, custom := range []bool{false, true} {
+		opts := Options{}
+		if custom {
+			opts.Executor = func(task func()) { go task() }
+		}
+		srv, err := NewServer("127.0.0.1:0", &funcHandler{}, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (srv.submitBatch != nil) == custom {
+			t.Error("批量路径改变了自定义 Executor 语义")
+		}
+		srv.Close()
+	}
+}
+
+func TestYieldReadinessBudget(t *testing.T) {
+	l := &loop{srv: &Server{submitBatch: func([]func()) {}}}
+	l.submitted = true
+	l.readyEventsSinceYield = maxReadyTasks - 1
+	if l.takeYield() || l.submitted {
+		t.Fatal("小批次过早让出或状态未清除")
+	}
+	l.readyEventsSinceYield++ // 没有新提交也必须让出，避免已排队任务饥饿。
+	if !l.takeYield() || l.readyEventsSinceYield != 0 {
+		t.Fatal("持续就绪未按预算让出")
+	}
+	l.srv.submitBatch = nil
+	l.submitted = true
+	if !l.takeYield() || l.takeYield() {
+		t.Fatal("自定义 Executor 的逐轮让出语义改变")
+	}
+}
