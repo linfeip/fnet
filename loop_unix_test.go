@@ -5,6 +5,7 @@ package fnet
 import (
 	"io"
 	"net"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -14,36 +15,9 @@ import (
 	"github.com/linfeip/fnet/poll"
 )
 
-// BenchmarkHandleEvent measures what the event loop does for every ready fd: finding the connection and marking the
-// event pending. The Executor drops the task, so after the first event a connection already counts as scheduled and
-// the rest cost only the lookup and the atomic update.
-// The fds are 50 apart, the way the connections of one server are spread over the process's fds when 50 servers
-// accept at the same time.
-func BenchmarkHandleEvent(b *testing.B) {
-	srv := &Server{opts: Options{Executor: func(func()) {}}.withDefaults()}
-	l, err := newLoop(srv)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer l.close()
-	const numConns = 2000
-	fds := make([]int, numConns)
-	for i := range fds {
-		c := &conn{fd: 100 + i*50, loop: l}
-		connsByFd.store(c)
-		b.Cleanup(func() { connsByFd.remove(c) })
-		fds[i] = c.fd
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := range b.N {
-		l.handleEvent(fds[i%numConns], poll.EventRead)
-	}
-}
-
-// TestHandleEventOwnLoopOnly checks that an event is delivered through the loop that owns the connection: a leftover
+// TestRunEventOwnLoopOnly checks that an event is delivered through the loop that owns the connection: a leftover
 // event of another loop's poller for an fd that has since been reused by this connection must not notify it.
-func TestHandleEventOwnLoopOnly(t *testing.T) {
+func TestRunEventOwnLoopOnly(t *testing.T) {
 	var tasks atomic.Int32
 	opened := make(chan Conn, 1)
 	srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c }}, Options{NumLoops: 2, Executor: func(task func()) {
@@ -59,41 +33,29 @@ func TestHandleEventOwnLoopOnly(t *testing.T) {
 	}
 
 	before := tasks.Load()
-	onLoop(other, func() { other.handleEvent(c.fd, poll.EventRead) })
+	(&worker{home: other}).runEvent(other, c.fd, poll.EventRead)
 	if got := tasks.Load(); got != before {
 		t.Fatalf("另一个 loop 的事件通知了连接：Executor 多被调用了 %d 次", got-before)
 	}
-	onLoop(own, func() { own.handleEvent(c.fd, poll.EventRead) })
+	(&worker{home: own}).runEvent(own, c.fd, poll.EventRead)
 	if got := tasks.Load(); got != before+1 {
 		t.Fatalf("所属 loop 的事件没有通知连接：Executor 被调用了 %d 次, 期望 1 次", got-before)
 	}
 }
 
-// onLoop runs fn on the event loop, which owns the loop's state (such as what handleEvent records), and waits for it.
-func onLoop(l *loop, fn func()) {
-	done := make(chan struct{})
-	l.trigger(func() {
-		fn()
-		close(done)
-	})
-	<-done
-}
-
-// loopFds returns the fds of the connections the loop still holds; it runs on the event loop, which owns the list.
+// loopFds returns the fds of the connections the loop still holds.
 func loopFds(l *loop) []int {
-	result := make(chan []int, 1)
-	l.trigger(func() {
-		var fds []int
-		l.forEachConn(func(c *conn) { fds = append(fds, c.fd) })
-		slices.Sort(fds)
-		result <- fds
-	})
-	return <-result
+	var fds []int
+	for _, c := range l.collectConns(func(*conn) bool { return true }) {
+		fds = append(fds, c.fd)
+	}
+	slices.Sort(fds)
+	return fds
 }
 
-// TestForEachConnDropsClosed checks that the loop's connection list catches up with connections that have closed: they
-// are not visited and are dropped from the list, while the ones still open are visited.
-func TestForEachConnDropsClosed(t *testing.T) {
+// TestCollectConnsDropsClosed checks that the loop's connection list catches up with connections that have closed:
+// they are not returned and are dropped from the list, while the ones still open are returned.
+func TestCollectConnsDropsClosed(t *testing.T) {
 	opened := make(chan Conn, 3)
 	closed := make(chan struct{}, 3)
 	srv := startServerWith(t, &funcHandler{
@@ -101,9 +63,14 @@ func TestForEachConnDropsClosed(t *testing.T) {
 		close: func(Conn, error) { closed <- struct{}{} },
 	}, Options{NumLoops: 1})
 	clients := []net.Conn{dial(t, srv), dial(t, srv), dial(t, srv)}
-	var fds []int
+	fdsByAddr := map[string]int{} // the workers open the connections in no particular order
 	for range clients {
-		fds = append(fds, (<-opened).(*conn).fd)
+		c := <-opened
+		fdsByAddr[c.RemoteAddr().String()] = c.(*conn).fd
+	}
+	var fds []int
+	for _, client := range clients {
+		fds = append(fds, fdsByAddr[client.LocalAddr().String()])
 	}
 	clients[1].Close()
 	select {
@@ -115,11 +82,12 @@ func TestForEachConnDropsClosed(t *testing.T) {
 	l := srv.loops[0]
 	want := slices.Sorted(slices.Values([]int{fds[0], fds[2]}))
 	if got := loopFds(l); !slices.Equal(got, want) {
-		t.Fatalf("访问了 %v, 期望 %v", got, want)
+		t.Fatalf("返回了 %v, 期望 %v", got, want)
 	}
-	listed := make(chan int, 1)
-	l.trigger(func() { listed <- len(l.conns) })
-	if n := <-listed; n != 2 {
+	l.mu.Lock()
+	n := len(l.conns)
+	l.mu.Unlock()
+	if n != 2 {
 		t.Fatalf("列表里有 %d 个连接, 期望已关闭的被丢掉、剩 2 个", n)
 	}
 }
@@ -168,86 +136,128 @@ func TestConnChurn(t *testing.T) {
 	}
 }
 
-// TestReadyTasksBatch 验证事件合并、批次上限和提交数组复用，不在 poller 回调里执行任务。
-func TestReadyTasksBatch(t *testing.T) {
-	var sizes []int
-	var submitted []func()
-	srv := &Server{
-		opts: Options{Executor: func(func()) { t.Error("不应逐个提交默认执行器任务") }},
-		submitBatch: func(tasks []func()) {
-			sizes = append(sizes, len(tasks))
-			submitted = append(submitted, tasks...)
-		},
+// TestConnQueue checks the queue is FIFO, reports whether connections are left behind the one taken, and reuses its
+// array once drained.
+func TestConnQueue(t *testing.T) {
+	var q connQueue
+	conns := []*conn{{fd: 1}, {fd: 2}, {fd: 3}}
+	for _, c := range conns {
+		q.push(c)
 	}
-	l, err := newLoop(srv)
+	for i, want := range conns {
+		c, more := q.pop()
+		if c != want || more != (i < len(conns)-1) {
+			t.Fatalf("第 %d 次取出 %p more=%v, 期望 fd=%d", i, c, more, want.fd)
+		}
+	}
+	if c, more := q.pop(); c != nil || more || q.length.Load() != 0 {
+		t.Fatal("空队列应返回 nil")
+	}
+	if len(q.conns) != 0 || q.head != 0 {
+		t.Fatal("队列取空后没有从头复用数组")
+	}
+}
+
+// TestStuckWorkersRelieved blocks every worker of the only loop in a callback: the monitor must start an extra worker,
+// which serves another connection.
+func TestStuckWorkersRelieved(t *testing.T) {
+	release := make(chan struct{})
+	var stuck sync.WaitGroup
+	srv := startServerWith(t, &funcHandler{data: func(c Conn, b []byte) int {
+		if string(b) == "block" {
+			stuck.Done()
+			<-release
+			return len(b)
+		}
+		return echo(c, b)
+	}}, Options{NumLoops: 1})
+	t.Cleanup(func() { close(release) }) // runs before the server's Close, which waits for the callbacks
+	l := srv.loops[0]
+	l.workersMu.Lock()
+	base := l.baseWorkers
+	l.workersMu.Unlock()
+	stuck.Add(base)
+	for range base {
+		dial(t, srv).Write([]byte("block"))
+	}
+	stuck.Wait()
+
+	c := dial(t, srv)
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	c.Write([]byte("ping"))
+	if _, err := io.ReadFull(c, make([]byte, 4)); err != nil {
+		t.Fatalf("所有 worker 卡在回调里时其他连接得不到服务: %v", err)
+	}
+}
+
+// TestGoexitReplacesWorker has callbacks call runtime.Goexit more times than the loop has workers: every worker that
+// exits that way is replaced, so the connections that come after are still served.
+func TestGoexitReplacesWorker(t *testing.T) {
+	srv := startServerWith(t, &funcHandler{data: func(c Conn, b []byte) int {
+		if string(b) == "exit" {
+			runtime.Goexit()
+		}
+		return echo(c, b)
+	}}, Options{NumLoops: 1})
+	l := srv.loops[0]
+	l.workersMu.Lock()
+	base := l.baseWorkers
+	l.workersMu.Unlock()
+	for range 2 * base {
+		c := dial(t, srv)
+		c.SetDeadline(time.Now().Add(5 * time.Second))
+		c.Write([]byte("exit"))
+		if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+			t.Fatalf("Goexit 的连接应被关闭, got %v", err)
+		}
+	}
+	c := dial(t, srv)
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	c.Write([]byte("ping"))
+	if _, err := io.ReadFull(c, make([]byte, 4)); err != nil {
+		t.Fatalf("worker 因 Goexit 退出后没有被替换: %v", err)
+	}
+}
+
+// TestCloseWhileOpening closes the server while the open task of a connection it has accepted is still pending, so the
+// connection is not on any list when Serve reads them: once opened it must close itself, or Close never returns.
+func TestCloseWhileOpening(t *testing.T) {
+	held := make(chan func(), 1)
+	var holding atomic.Bool
+	holding.Store(true)
+	closed := make(chan error, 1)
+	srv, err := NewServer("127.0.0.1:0", &funcHandler{close: func(_ Conn, err error) { closed <- err }}, Options{
+		NumLoops: 1,
+		Executor: func(task func()) {
+			if holding.CompareAndSwap(true, false) { // the first task is the open task of the first connection
+				held <- task
+				return
+			}
+			go task()
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.close()
-	var runs int
-	for i := range maxReadyTasks + 1 {
-		c := &conn{fd: 400000 + i, loop: l, task: func() { runs++ }}
-		if !connsByFd.store(c) {
-			t.Fatal("连接表存储失败")
-		}
-		t.Cleanup(func() { connsByFd.remove(c) })
-		l.handleEvent(c.fd, poll.EventRead)
-		l.handleEvent(c.fd, poll.EventWrite) // 合并到已有任务，不重复提交。
-		if c.state.Load() != scheduledBit|evRead|evWrite {
-			t.Fatal("事件合并不符")
-		}
-	}
-	if !slices.Equal(sizes, []int{maxReadyTasks}) || runs != 0 {
-		t.Fatalf("批次 %v，任务提前执行 %d 次", sizes, runs)
-	}
-	l.submitReadyTasks()
-	if !slices.Equal(sizes, []int{maxReadyTasks, 1}) || len(l.readyTasks) != 0 {
-		t.Fatalf("批次 %v，剩余任务 %d", sizes, len(l.readyTasks))
-	}
-	for _, task := range l.readyTasks[:cap(l.readyTasks)] {
-		if task != nil {
-			t.Fatal("提交数组仍引用连接任务")
-		}
-	}
-	for _, task := range submitted {
-		task()
-	}
-	if runs != maxReadyTasks+1 {
-		t.Fatalf("执行 %d 次，期望 %d", runs, maxReadyTasks+1)
-	}
-}
-
-func TestDefaultExecutorBatchOnly(t *testing.T) {
-	for _, custom := range []bool{false, true} {
-		opts := Options{}
-		if custom {
-			opts.Executor = func(task func()) { go task() }
-		}
-		srv, err := NewServer("127.0.0.1:0", &funcHandler{}, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if (srv.submitBatch != nil) == custom {
-			t.Error("批量路径改变了自定义 Executor 语义")
-		}
+	go srv.Serve()
+	dial(t, srv)
+	open := <-held
+	done := make(chan struct{})
+	go func() {
 		srv.Close()
+		close(done)
+	}()
+	for !srv.draining.Load() {
+		time.Sleep(time.Millisecond)
 	}
-}
-
-func TestYieldReadinessBudget(t *testing.T) {
-	l := &loop{srv: &Server{submitBatch: func([]func()) {}}}
-	l.submitted = true
-	l.readyEventsSinceYield = maxReadyTasks - 1
-	if l.takeYield() || l.submitted {
-		t.Fatal("小批次过早让出或状态未清除")
+	time.Sleep(20 * time.Millisecond) // let Serve read the lists first
+	go open()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("打开中的连接没有关闭, Close 没有返回")
 	}
-	l.readyEventsSinceYield++ // 没有新提交也必须让出，避免已排队任务饥饿。
-	if !l.takeYield() || l.readyEventsSinceYield != 0 {
-		t.Fatal("持续就绪未按预算让出")
-	}
-	l.srv.submitBatch = nil
-	l.submitted = true
-	if !l.takeYield() || l.takeYield() {
-		t.Fatal("自定义 Executor 的逐轮让出语义改变")
+	if err := <-closed; err != ErrServerClosed {
+		t.Fatalf("OnClose(%v), 期望 ErrServerClosed", err)
 	}
 }

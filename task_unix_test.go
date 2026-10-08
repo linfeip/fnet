@@ -90,12 +90,7 @@ func TestExecutorNotCalledUnderConnLock(t *testing.T) {
 	sc.SetDeadline(time.Now().Add(-time.Second))
 	target.Store(sc.(*conn))
 	armed.Store(true)
-	l, checked := srv.loops[0], make(chan struct{})
-	l.trigger(func() { // the connection list belongs to the event loop
-		l.checkDeadlines()
-		close(checked)
-	})
-	<-checked
+	srv.loops[0].checkDeadlines()
 	armed.Store(false)
 	if held.Load() {
 		t.Fatal("请求关闭到期的连接时，Executor 是在持有连接的 mu 的情况下被调用的")

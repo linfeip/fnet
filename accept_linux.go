@@ -2,11 +2,43 @@
 
 package fnet
 
-import "golang.org/x/sys/unix"
+import (
+	"net/netip"
+	"syscall"
+	"unsafe"
 
-// accept accepts a new connection; the returned fd is already set to non-blocking and close-on-exec.
-func accept(fd int) (int, unix.Sockaddr, error) {
-	return unix.Accept4(fd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+	"golang.org/x/sys/unix"
+)
+
+// accept accepts a new connection and returns its peer address; the returned fd is already set to non-blocking and
+// close-on-exec.
+//
+// It calls accept4 itself rather than through unix.Accept4, which decodes an IP peer address only after asking for
+// the socket's protocol with a getsockopt: one more syscall per connection on the accept path. The
+// listener is non-blocking, so the call never blocks and is a raw one, like the connection reads and writes (see rawIO).
+func accept(fd int) (int, netip.AddrPort, error) {
+	var rsa unix.RawSockaddrAny
+	size := uint32(unix.SizeofSockaddrAny)
+	nfd, _, errno := syscall.RawSyscall6(unix.SYS_ACCEPT4, uintptr(fd), uintptr(unsafe.Pointer(&rsa)),
+		uintptr(unsafe.Pointer(&size)), unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0, 0)
+	if errno != 0 {
+		return -1, netip.AddrPort{}, errno
+	}
+	switch rsa.Addr.Family {
+	case unix.AF_INET:
+		sa := (*unix.RawSockaddrInet4)(unsafe.Pointer(&rsa))
+		return int(nfd), netip.AddrPortFrom(netip.AddrFrom4(sa.Addr), networkPort(sa.Port)), nil
+	case unix.AF_INET6:
+		sa := (*unix.RawSockaddrInet6)(unsafe.Pointer(&rsa))
+		return int(nfd), inet6AddrPort(sa.Addr, networkPort(sa.Port), sa.Scope_id), nil
+	}
+	return int(nfd), netip.AddrPort{}, nil
+}
+
+// networkPort reads a port kept in network byte order.
+func networkPort(port uint16) uint16 {
+	b := (*[2]byte)(unsafe.Pointer(&port))
+	return uint16(b[0])<<8 | uint16(b[1])
 }
 
 // setKeepAlive enables TCP keepalive with the same parameters as the standard library net defaults: probing starts

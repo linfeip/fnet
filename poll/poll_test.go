@@ -107,6 +107,84 @@ func TestEdgeTriggered(t *testing.T) {
 	}
 }
 
+func newBlockingPoller(t *testing.T) *Poller {
+	t.Helper()
+	p, err := NewBlocking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { p.Close() })
+	return p
+}
+
+// batchEvents returns the events of b by fd.
+func batchEvents(b *Batch) map[int]Event {
+	got := map[int]Event{}
+	for i := range b.Len() {
+		fd, ev := b.Event(i)
+		got[fd] |= ev
+	}
+	return got
+}
+
+// TestPoll runs Poll from another goroutine: it takes the ready edge-triggered event and the wake signal without
+// blocking, and neither is reported again.
+func TestPoll(t *testing.T) {
+	p := newBlockingPoller(t)
+	a, b := socketPair(t)
+	if err := p.AddEdge(a); err != nil {
+		t.Fatal(err)
+	}
+	var batch Batch
+	p.Poll(&batch) // the writability reported at registration time
+
+	unix.Write(b, []byte("x"))
+	p.Wake()
+	var got map[int]Event
+	var woken bool
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		woken = p.Poll(&batch)
+		got = batchEvents(&batch)
+	}()
+	<-done
+	if !woken || len(got) != 1 || got[a]&EventRead == 0 {
+		t.Fatalf("期望取到可读事件和唤醒信号, got %v woken=%v", got, woken)
+	}
+	if woken := p.Poll(&batch); woken || batch.Len() != 0 {
+		t.Fatalf("已取走的事件和唤醒信号不应重复报告, got %v woken=%v", batchEvents(&batch), woken)
+	}
+}
+
+// TestBlock verifies that Block, waiting in another goroutine, returns for a Wake and for an event arriving while it
+// waits.
+func TestBlock(t *testing.T) {
+	p := newBlockingPoller(t)
+	a, b := socketPair(t)
+	if err := p.AddEdge(a); err != nil {
+		t.Fatal(err)
+	}
+	var batch Batch
+	p.Poll(&batch) // the writability reported at registration time
+	for _, notify := range []func(){func() { p.Wake() }, func() { unix.Write(b, []byte("x")) }} {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			var batch Batch
+			for !p.Block(&batch) && batch.Len() == 0 { // an interrupting signal returns an empty batch
+			}
+		}()
+		time.Sleep(20 * time.Millisecond) // let Block enter the wait first
+		notify()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Block 未返回")
+		}
+	}
+}
+
 // TestEdgeHup has the peer close before the data is taken away: the data and the FIN are merged into one
 // notification carrying EventHup, and once the data is read there are no further notifications.
 func TestEdgeHup(t *testing.T) {

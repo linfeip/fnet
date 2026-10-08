@@ -7,15 +7,13 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/linfeip/fnet/poll"
-	"github.com/linfeip/fnet/taskpool"
 
 	"golang.org/x/sys/unix"
 )
 
-// listener is one listening socket: the fd the main reactor accepts on, and the address it is bound to.
+// listener is one listening socket: the fd connections are accepted on, and the address it is bound to.
 type listener struct {
 	fd   int
 	addr net.Addr
@@ -23,21 +21,26 @@ type listener struct {
 
 // Server is a TCP server based on the main/sub-reactor model.
 type Server struct {
-	handler     Handler
-	opts        Options
-	listeners   []listener   // the listening sockets, all watched by the one acceptor
-	acceptor    *poll.Poller // the main reactor's Poller, watches only the listeners
-	loops       []*loop      // sub-reactors
-	next        int          // round-robin index, accessed only by the main reactor
-	onAccept    func(fd int, ev poll.Event)
-	submitBatch func([]func()) // 仅默认执行器使用；自定义 Executor 保持逐任务调用
+	handler   Handler
+	opts      Options
+	listeners []listener    // the listening sockets, watched by the first loop's Poller (see loop.accept)
+	loops     []*loop       // sub-reactors
+	nextLoop  atomic.Uint32 // round-robin over the loops for the accepted connections
+	// acceptMu is held for reading while a connection is accepted and counted in openConnsWg, and taken once for
+	// writing by Serve after setting draining, so that no connection is counted once it waits for them.
+	acceptMu sync.RWMutex
 
 	openConnsWg sync.WaitGroup // connections not yet closed: closed means OnClose returned; Serve waits for them before exiting
+	workersWg   sync.WaitGroup // the loops' workers; Serve stops them once every connection has closed
+	draining    atomic.Bool    // Serve is closing every connection: one being opened closes itself (see loop.watch)
+	stopping    atomic.Bool    // the workers are to exit
+	monitorStop chan struct{}  // closed to stop the monitor
 
 	mu      sync.Mutex
 	serving bool
 	closed  bool
 	err     error         // the fatal error that made the server exit
+	closing chan struct{} // closed when the server is closed, after which Serve closes the connections and returns
 	done    chan struct{} // closed after Serve has fully exited
 }
 
@@ -61,30 +64,10 @@ func NewServerAddrs(addrs []string, handler Handler, opts Options) (*Server, err
 	s := &Server{
 		handler: handler,
 		opts:    opts.withDefaults(),
+		closing: make(chan struct{}),
 		done:    make(chan struct{}),
 	}
-	if opts.Executor == nil {
-		s.submitBatch = taskpool.DefaultTaskPool.SubmitBatch
-	}
-	// The acceptor comes first so that release can clean up after any failure below.
-	acceptor, err := poll.New()
-	if err != nil {
-		return nil, err
-	}
-	s.acceptor = acceptor
-	for _, addr := range addrs {
-		fd, laddr, err := listen(addr)
-		if err != nil {
-			s.release()
-			return nil, err
-		}
-		if err := s.acceptor.AddRead(fd); err != nil {
-			unix.Close(fd) // not in s.listeners yet, so release does not cover it
-			s.release()
-			return nil, err
-		}
-		s.listeners = append(s.listeners, listener{fd: fd, addr: laddr})
-	}
+	// The loops come first: the first one watches the listeners.
 	for range s.opts.NumLoops {
 		l, err := newLoop(s)
 		if err != nil {
@@ -93,7 +76,19 @@ func NewServerAddrs(addrs []string, handler Handler, opts Options) (*Server, err
 		}
 		s.loops = append(s.loops, l)
 	}
-	s.onAccept = s.accept
+	for _, addr := range addrs {
+		fd, laddr, err := listen(addr)
+		if err != nil {
+			s.release()
+			return nil, err
+		}
+		if err := s.loops[0].watchListener(fd); err != nil {
+			unix.Close(fd) // not in s.listeners yet, so release does not cover it
+			s.release()
+			return nil, err
+		}
+		s.listeners = append(s.listeners, listener{fd: fd, addr: laddr})
+	}
 	return s, nil
 }
 
@@ -109,8 +104,8 @@ func (s *Server) Addrs() []net.Addr {
 	return addrs
 }
 
-// Serve starts all sub-reactors and runs the main reactor in the current goroutine, blocking until Close is
-// called (returning ErrServerClosed) or a fatal error occurs.
+// Serve starts the sub-reactors' workers, which accept and serve the connections, and blocks until Close is called
+// (returning ErrServerClosed) or a fatal error occurs.
 func (s *Server) Serve() error {
 	s.mu.Lock()
 	if s.closed {
@@ -124,32 +119,36 @@ func (s *Server) Serve() error {
 	s.serving = true
 	s.mu.Unlock()
 
-	var wg sync.WaitGroup
 	for _, l := range s.loops {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := l.run(); err != nil {
-				s.shutdown(err)
-			}
-		}()
+		l.startWorkers()
+	}
+	var monitorDone chan struct{}
+	if s.opts.Executor == nil { // an Executor's workers run no callbacks, so they never get stuck in one
+		s.monitorStop, monitorDone = make(chan struct{}), make(chan struct{})
+		go s.monitor(monitorDone)
 	}
 	go s.tick()
-	for {
-		woken, err := s.acceptor.Wait(s.onAccept)
-		if err != nil {
-			s.shutdown(err)
-			break
-		}
-		if woken && s.isClosed() {
-			break
-		}
-	}
+	<-s.closing
+	// No connection is accepted from here on, and one accepted before is either in a loop's list already or closes
+	// itself (see loop.watch).
+	s.draining.Store(true)
+	s.acceptMu.Lock()
+	s.acceptMu.Unlock() //nolint:staticcheck // an empty critical section: it waits for the accepts under way
 	for _, l := range s.loops {
-		l.trigger(l.stop)
+		for _, c := range l.collectConns(func(*conn) bool { return true }) {
+			c.requestClose(ErrServerClosed)
+		}
 	}
-	wg.Wait()
-	s.openConnsWg.Wait() // event loops requested closing all connections before exiting, wait for their tasks to finish closing
+	s.openConnsWg.Wait() // the closes are carried out by the connections' tasks, which the workers run
+	if monitorDone != nil {
+		close(s.monitorStop)
+		<-monitorDone // the monitor starts workers, so it stops first
+	}
+	s.stopping.Store(true)
+	for _, l := range s.loops {
+		l.poller.Wake() // a worker that wakes up passes it on, see worker.run
+	}
+	s.workersWg.Wait()
 	s.release()
 	close(s.done)
 
@@ -177,7 +176,7 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// shutdown marks the server as closed and wakes the main reactor; err is the fatal error that caused the
+// shutdown marks the server as closed and makes Serve close the connections; err is the fatal error that caused the
 // shutdown.
 func (s *Server) shutdown(err error) (first, serving bool) {
 	s.mu.Lock()
@@ -186,10 +185,7 @@ func (s *Server) shutdown(err error) (first, serving bool) {
 		return false, s.serving
 	}
 	s.closed, s.err = true, err
-	if s.serving {
-		// Wake up while holding the lock: Serve only releases the acceptor after closed=true.
-		s.acceptor.Wake()
-	}
+	close(s.closing)
 	return true, s.serving
 }
 
@@ -197,7 +193,7 @@ func (s *Server) shutdown(err error) (first, serving bool) {
 // precision of Conn.SetDeadline.
 const deadlineCheckInterval = time.Second
 
-// tick periodically makes every sub-reactor check connection deadlines; it stops after Serve exits.
+// tick periodically checks the connection deadlines of every sub-reactor; it stops after Serve exits.
 func (s *Server) tick() {
 	ticker := time.NewTicker(deadlineCheckInterval)
 	defer ticker.Stop()
@@ -205,7 +201,7 @@ func (s *Server) tick() {
 		select {
 		case <-ticker.C:
 			for _, l := range s.loops {
-				l.trigger(l.checkDeadlines)
+				l.checkDeadlines()
 			}
 		case <-s.done:
 			return
@@ -213,60 +209,73 @@ func (s *Server) tick() {
 	}
 }
 
-func (s *Server) isClosed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.closed
+// monitor looks for loops whose workers are all stuck in callbacks, once every monitorTick (see loop.relieve), until
+// monitorStop is closed.
+func (s *Server) monitor(done chan struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(monitorTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			for _, l := range s.loops {
+				l.relieve()
+			}
+		case <-s.monitorStop:
+			return
+		}
+	}
 }
 
 func (s *Server) release() {
 	for _, ln := range s.listeners {
 		unix.Close(ln.fd)
 	}
-	s.acceptor.Close()
 	for _, l := range s.loops {
 		l.close()
 	}
 }
 
-// accept is the main reactor's readable callback: it accepts in batches on the ready listener until EAGAIN and
-// distributes the connections to the sub-reactors in round-robin order. The connections of all the listeners
-// go through the one round-robin, so they spread evenly over the sub-reactors no matter which address they
-// arrived on.
-func (s *Server) accept(listenerFd int, _ poll.Event) {
-	for {
-		fd, sa, err := accept(listenerFd)
-		if err != nil {
-			switch err {
-			case unix.EAGAIN:
-				return
-			case unix.EINTR, unix.ECONNABORTED:
-				continue
-			case unix.EPROTO, unix.ENETDOWN, unix.ENOPROTOOPT, unix.EHOSTDOWN, unix.EHOSTUNREACH, unix.EOPNOTSUPP, unix.ENETUNREACH:
-				// Linux's accept returns a network error that already happened on the new connection as its
-				// error code; it affects only that one connection, and accept(2) requires retrying as with
-				// EAGAIN, so the server must not stop because of it.
-				continue
-			case unix.EMFILE, unix.ENFILE, unix.ENOBUFS, unix.ENOMEM:
-				// Resource exhaustion: back off briefly to avoid spinning under level-triggered mode.
-				time.Sleep(10 * time.Millisecond)
-				return
-			default:
-				s.shutdown(os.NewSyscallError("accept", err))
-				return
-			}
+// acceptConn accepts a connection on listenerFd for a loop chosen in round-robin order, with its open task pending
+// (see loop.watch), and counts it in openConnsWg; it returns nil when there is none left to accept or the server is
+// draining.
+func (s *Server) acceptConn(listenerFd int) *conn {
+	s.acceptMu.RLock()
+	defer s.acceptMu.RUnlock()
+	for !s.draining.Load() {
+		fd, remote, err := accept(listenerFd)
+		if err == nil {
+			l := s.loops[s.nextLoop.Add(1)%uint32(len(s.loops))]
+			c := &conn{fd: fd, loop: l, remote: remote}
+			c.task = c.run
+			c.state.Store(scheduledBit | evOpen)
+			s.openConnsWg.Add(1) // decremented again in close after the OnClose callback has finished
+			return c
 		}
-		l := s.loops[s.next]
-		s.next = (s.next + 1) % len(s.loops)
-		c := &conn{fd: fd, loop: l, remote: sockaddrToAddrPort(sa)}
-		c.task = c.run
-		l.trigger(func() { l.register(c) })
+		switch err {
+		case unix.EAGAIN:
+			return nil
+		case unix.EINTR, unix.ECONNABORTED:
+		case unix.EPROTO, unix.ENETDOWN, unix.ENOPROTOOPT, unix.EHOSTDOWN, unix.EHOSTUNREACH, unix.EOPNOTSUPP, unix.ENETUNREACH:
+			// Linux's accept returns a network error that already happened on the new connection as its error code; it
+			// affects only that one connection, and accept(2) requires retrying as with EAGAIN, so the server must not
+			// stop because of it.
+		case unix.EMFILE, unix.ENFILE, unix.ENOBUFS, unix.ENOMEM:
+			// Resource exhaustion: back off briefly. The listener is edge-triggered, so the connections left waiting are
+			// accepted when the next one arrives.
+			time.Sleep(10 * time.Millisecond)
+			return nil
+		default:
+			s.shutdown(os.NewSyscallError("accept", err))
+			return nil
+		}
 	}
+	return nil
 }
 
 // listen creates the listening socket with the help of the standard library (address resolution, dual stack,
-// SO_REUSEADDR and backlog are all handled by the standard library), then duplicates a separate fd and hands
-// it to the main reactor to manage, after which the standard library's listener is closed right away.
+// SO_REUSEADDR and backlog are all handled by the standard library), then duplicates a separate fd for the
+// server to manage, after which the standard library's listener is closed right away.
 func listen(addr string) (int, net.Addr, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

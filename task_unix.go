@@ -27,15 +27,25 @@ const (
 //
 // state records both the pending events and the status of the task: setting an event also sets scheduledBit, and if
 // that bit was clear there is no task queued or running, so this call submits one; otherwise a task already exists
-// and it will notice the new events at the end of its round and run another one (see run).
+// and it will notice the new events at the end of its round and run another one (see runRound).
 // A connection therefore has at most one task at a time, with reading, callbacks, flushing and closing all done
 // serially inside it, and no events are lost. It reports whether this call submitted the task.
 func (c *conn) notify(ev uint32) bool {
 	if c.markEvents(ev) {
-		c.loop.srv.opts.Executor(c.task)
+		c.schedule()
 		return true
 	}
 	return false
+}
+
+// schedule submits the connection's task: to the Executor, or by default to the workers of the connection's loop. The
+// caller must hold the task, see markEvents.
+func (c *conn) schedule() {
+	if executor := c.loop.srv.opts.Executor; executor != nil {
+		executor(c.task)
+	} else {
+		c.loop.submit(c)
+	}
 }
 
 // markEvents 合并事件并取得唯一任务的提交权；返回 true 的调用方必须负责提交，不能丢弃。
@@ -43,12 +53,20 @@ func (c *conn) markEvents(ev uint32) bool {
 	return c.state.Or(ev|scheduledBit)&scheduledBit == 0
 }
 
-// run is the connection's task: it takes the pending events and processes one round. When more events arrive while
-// it is processing, it does not continue on the spot but submits itself again, going to the end of the executor's
-// queue so that other connections run first, keeping connections fair with each other.
+// run is the connection's task as handed to an Executor: one round, after which it submits itself again when more
+// events arrived meanwhile, going to the end of the executor's queue so that other connections run first, keeping
+// connections fair with each other.
 //
 // If a callback panics the connection is closed and the panic keeps propagating up, to be recovered by the executor.
 func (c *conn) run() {
+	if c.runRound() {
+		c.schedule()
+	}
+}
+
+// runRound takes the pending events and processes one round. It reports whether events arrived while it was
+// processing, in which case the caller still holds the task and must submit it again (see schedule).
+func (c *conn) runRound() (again bool) {
 	// clear the scheduledBit marker, clear the event markers
 	ev := c.state.Swap(scheduledBit) &^ scheduledBit
 	done := false
@@ -59,12 +77,8 @@ func (c *conn) run() {
 	}()
 	c.handle(ev)
 	done = true
-	if c.closed { // connection closed: scheduledBit stays set, so there is no further task and no further Executor call
-		return
-	}
-	if !c.state.CompareAndSwap(scheduledBit, 0) {
-		c.loop.srv.opts.Executor(c.task)
-	}
+	// A closed connection keeps scheduledBit set, so there is no further task.
+	return !c.closed && !c.state.CompareAndSwap(scheduledBit, 0)
 }
 
 // handle processes one round of events: setting up a new connection (its socket options, then the OnOpen callback),
@@ -77,10 +91,13 @@ func (c *conn) handle(ev uint32) {
 		return
 	}
 	if ev&evOpen != 0 {
-		// The socket options are set here rather than by the acceptor: that is one goroutine serving every listener,
-		// and setting them there would put five setsockopt calls per connection on its serial path, capping the rate
-		// at which connections are accepted. Nothing is written to the socket before OnOpen, so they are in place
-		// before the first byte goes out.
+		// The connection is watched and its socket options are set here rather than where it is accepted: accepts on
+		// a listener are serialized (the kernel locks it), and doing it there would put an epoll_ctl and five
+		// setsockopt calls per connection on that path, capping the rate at which connections are accepted. Nothing is written to the
+		// socket before OnOpen, so the options are in place before the first byte goes out.
+		if !c.loop.watch(c) {
+			return
+		}
 		unix.SetsockoptInt(c.fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 		setKeepAlive(c.fd)
 		c.loop.srv.handler.OnOpen(c)
@@ -250,6 +267,16 @@ func (c *conn) close(err error) {
 	c.mu.Unlock()
 	c.in.Release()
 	c.loop.srv.handler.OnClose(c, err)
+}
+
+// abandon closes a connection that could not be watched, before OnOpen; it may only be called from the connection's
+// first task.
+func (c *conn) abandon() {
+	c.mu.Lock()
+	c.closed = true
+	unix.Close(c.fd)
+	c.mu.Unlock()
+	c.loop.srv.openConnsWg.Done()
 }
 
 // discardInbound reads away data that has arrived but has not been read yet: closing while the socket holds unread data

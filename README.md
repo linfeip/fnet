@@ -26,17 +26,17 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 | `fnet` | TCP engine: main/sub-reactors, one task per connection, concurrency-safe writes (`Handler`, `Conn`, `Options`) |
 | `fhttp` | HTTP/1.x server on `fnet`: request dispatch, `http.Handler`, protocol upgrade |
 | `websocket` | WebSocket server on `fhttp`: handshake, framing, message callbacks, write coalescing |
-| `taskpool` | Per-CPU sharded lock-free goroutine pool, the default executor of connection tasks |
+| `taskpool` | Per-CPU sharded lock-free goroutine pool, usable as `fnet.Options.Executor` |
 | `poll` | epoll / kqueue wrapper |
 | `internal/bytepool` | Size-class byte buffer pool |
 
-Dependencies are one-way: `websocket → fhttp → fnet → poll`, and `fnet → taskpool`.
+Dependencies are one-way: `websocket → fhttp → fnet → poll`.
 
 ```text
-listener ─▶ main reactor (accept) ── round-robin ─▶ sub-reactor 0 … N-1   (each: 1 goroutine + 1 epoll/kqueue)
-                                                          │ a connection has events
+listener ─▶ main reactor (accept) ── round-robin ─▶ sub-reactor 0 … N-1   (each: 1 epoll/kqueue + its workers)
+                                                          │ a worker polls, finds a connection ready
                                                           ▼
-                 executor (taskpool): one task per connection at a time
+                 the worker runs the connection's task (one at a time per connection)
                  read (borrowed buffer) → OnData → flush the send buffer → close, OnClose
 ```
 
@@ -99,7 +99,7 @@ mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 })
 ```
 
-Callbacks run on the executor (`taskpool.DefaultTaskPool` by default, replaceable through `fnet.Options.Executor`), so they must return quickly. Timeouts and limits are set in `fnet.Options`, `fhttp.Options` and `websocket.Options`; see their doc comments.
+Callbacks run on the event loops' workers (or on `fnet.Options.Executor` when set), so they must return quickly. Timeouts and limits are set in `fnet.Options`, `fhttp.Options` and `websocket.Options`; see their doc comments.
 
 ---
 

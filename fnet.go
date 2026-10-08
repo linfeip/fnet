@@ -1,14 +1,15 @@
 // Package fnet is an event-driven TCP network library based on the Reactor model.
 //
 // On Linux (epoll) / macOS (kqueue) it uses a main/sub-reactor structure:
-//   - main reactor: one goroutine watches all the listeners (a server may listen on several addresses) and
-//     distributes newly accepted connections to the sub-reactors in round-robin order;
-//   - sub-reactor (event loop): each one takes a goroutine and a Poller, waits only for the events of the
-//     connections it owns (edge-triggered), and hands a connection that has events to the executor
-//     (see Options.Executor);
-//   - connection task: an executor goroutine reads the data, invokes the Handler callbacks, keeps draining
-//     the send buffer and closes the connection; a connection has at most one task at a time, and the data
-//     read borrows a buffer from a pool that is returned as soon as the callback returns;
+//   - listeners (a server may listen on several addresses): watched by the first sub-reactor's Poller; the
+//     worker that finds one ready accepts, distributing the connections to the sub-reactors in round-robin order;
+//   - sub-reactor (event loop): a Poller for the events of the connections it owns (edge-triggered), polled by
+//     the loop's workers, about one per P over all the loops; a worker runs the tasks of the connections it finds
+//     ready itself, helps the other loops when its own has nothing to do, and only then waits in the kernel
+//     (an Executor, see Options.Executor, runs the tasks instead);
+//   - connection task: reads the data, invokes the Handler callbacks, keeps draining the send buffer and
+//     closes the connection; a connection has at most one task at a time, and the data read borrows a buffer
+//     from a pool that is returned as soon as the callback returns;
 //   - a connection does not occupy a goroutine of its own and an idle connection holds no read or write
 //     buffer, so a small number of goroutines can carry a million connections.
 //
@@ -24,7 +25,6 @@ import (
 	"time"
 
 	"github.com/linfeip/fnet/internal/units"
-	"github.com/linfeip/fnet/taskpool"
 )
 
 var (
@@ -39,9 +39,10 @@ var (
 // Handler is the connection event callback interface.
 //
 // The callbacks of a single connection always run serially: OnOpen first, OnClose last and only once. On
-// Linux/macOS the callbacks run in a goroutine of the executor (see Options.Executor), the connection is not
-// read again before the callback returns, and the callbacks of other connections share the executor's
-// goroutines as well, so a callback must return quickly and must never block; time-consuming logic should be
+// Linux/macOS the callbacks run on a worker of the connection's event loop (or of the Executor, see
+// Options.Executor), the connection is not read again before the callback returns, and the callbacks of other
+// connections share those goroutines as well, so a callback must return quickly and must never block; a loop
+// whose workers are all stuck in callbacks gets extra workers only after a while. Time-consuming logic should be
 // handed to other goroutines, which may safely call Conn.Write and Conn.Close concurrently.
 type Handler interface {
 	// OnOpen is called after a new connection has been established.
@@ -148,7 +149,7 @@ func (c *detachedConn) WriteTo(w io.Writer) (int64, error) {
 
 // Options holds the engine parameters; the zero value is the default configuration.
 type Options struct {
-	// NumLoops is the number of sub-reactors (event loops); max(2, runtime.GOMAXPROCS(0)/4) when <=0. Linux/macOS only.
+	// NumLoops is the number of sub-reactors (event loops); max(2, runtime.GOMAXPROCS(0)/8) when <=0. Linux/macOS only.
 	NumLoops int
 	// ReadBufferSize is the buffer size of a single read; 16KB when <=0. A connection's task borrows from the
 	// buffer pool only while reading and returns the buffer once the callback returns, so idle connections
@@ -158,26 +159,23 @@ type Options struct {
 	// Executor runs a connection's tasks (reading, invoking the Handler callbacks, draining the send buffer,
 	// closing): it is called once when a connection has events, a connection has at most one task at a time,
 	// and it is called again when more events arrive while one is being processed.
-	// Executor may be called from any goroutine (the event loop, the executor's own goroutines, the
+	// Executor may be called from any goroutine (the event loop's worker, the executor's own goroutines, the
 	// application goroutines calling Write and Close) and must not block; the task must run asynchronously
 	// (it must not run directly on the caller's stack) and must not be dropped.
 	// When a callback panics the connection is closed with ErrHandlerPanic and the task panics, so Executor
 	// must recover, otherwise the process exits.
-	// When nil it is the Submit of taskpool.DefaultTaskPool (lock-free submission, worker reuse, recovers and
-	// logs the panic). Linux/macOS only.
-	// 默认执行器会合并同轮 readiness 的提交；自定义 Executor 仍逐连接调用，且任务仍须异步执行。
+	// When nil the event loops' workers run the tasks themselves, recovering and logging a panic: no hand-off
+	// between goroutines, and each loop then has about GOMAXPROCS/NumLoops workers instead of one.
+	// Linux/macOS only.
 	Executor func(task func())
 }
 
 func (o Options) withDefaults() Options {
 	if o.NumLoops <= 0 {
-		o.NumLoops = max(2, runtime.GOMAXPROCS(0)/4)
+		o.NumLoops = max(2, runtime.GOMAXPROCS(0)/8)
 	}
 	if o.ReadBufferSize <= 0 {
 		o.ReadBufferSize = 16 * units.KB
-	}
-	if o.Executor == nil {
-		o.Executor = taskpool.DefaultTaskPool.Submit
 	}
 	return o
 }

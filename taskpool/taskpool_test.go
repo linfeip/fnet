@@ -93,6 +93,27 @@ func TestFullQueue(t *testing.T) {
 	close(release)
 }
 
+// TestStealFromBusyShard checks that a task queued behind a shard's blocked worker is run by the worker of another
+// shard instead of waiting for the blocked one.
+func TestStealFromBusyShard(t *testing.T) {
+	p := New(2, 1, 16)
+	release, started := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	busy, other := &p.shards[0], &p.shards[1]
+	busy.push(func() { close(started); <-release })
+	busy.notify(false)
+	<-started
+	done := make(chan struct{})
+	busy.push(func() { close(done) })
+	other.push(func() {})
+	other.notify(false)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("忙分片排队的任务没有被其他分片的 worker 取走")
+	}
+}
+
 // TestOverflowTailTasks 验证临时协助退出后、resident worker 仍阻塞时，新入队的尾部任务也能执行。
 func TestOverflowTailTasks(t *testing.T) {
 	p := New(1, 1, 2)

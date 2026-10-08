@@ -37,11 +37,21 @@ func New() (*Poller, error) {
 	return p, nil
 }
 
+// NewBlocking creates a Poller for Poll and Block; with kqueue it is the same as New, whose waits already block the
+// calling thread in the kernel.
+func NewBlocking() (*Poller, error) { return New() }
+
 // Close releases the fd the Poller occupies.
 func (p *Poller) Close() error { return os.NewSyscallError("close", unix.Close(p.kqueueFd)) }
 
 // AddRead registers fd, watching for readable events.
 func (p *Poller) AddRead(fd int) error { return p.ctl(fd, unix.EVFILT_READ, unix.EV_ADD, 0) }
+
+// AddListener registers a listening socket, edge-triggered (EV_CLEAR): one notification when connections arrive,
+// after which they are accepted until EAGAIN.
+func (p *Poller) AddListener(fd int) error {
+	return p.ctl(fd, unix.EVFILT_READ, unix.EV_ADD|unix.EV_CLEAR, 0)
+}
 
 // AddEdge registers a connection fd: edge-triggered (EV_CLEAR: the event is reset once retrieved), watching readable and
 // writable at once, the same as the Go runtime's netpoller.
@@ -76,7 +86,7 @@ func (p *Poller) ctl(fd int, filter int16, flags uint16, fflags uint32) error {
 	return os.NewSyscallError("kevent", err)
 }
 
-// Wake wakes the event loop blocked in Wait; it may be called from any goroutine.
+// Wake wakes the event loop blocked in Wait, or one goroutine blocked in Block; it may be called from any goroutine.
 func (p *Poller) Wake() error {
 	if !p.waking.CompareAndSwap(false, true) {
 		return nil // there is already a wakeup signal that has not been consumed
@@ -109,19 +119,75 @@ func (p *Poller) Wait(fn func(fd int, ev Event)) (woken bool, err error) {
 	p.timeout = &zeroTimeout
 	for i := range n {
 		ev := &p.events[i]
-		switch ev.Filter {
-		case unix.EVFILT_USER:
+		if ev.Filter == unix.EVFILT_USER {
 			p.waking.Store(false) // reset first and let the caller handle the tasks after, so later Wake calls are not lost
 			woken = true
-		case unix.EVFILT_READ:
-			e := EventRead
-			if ev.Flags&unix.EV_EOF != 0 {
-				e |= EventHup
-			}
-			fn(int(ev.Ident), e)
-		case unix.EVFILT_WRITE:
-			fn(int(ev.Ident), EventWrite)
+			continue
+		}
+		if fd, e, ok := convert(ev); ok {
+			fn(fd, e)
 		}
 	}
 	return woken, nil
+}
+
+// Batch holds the events one Poll or Block call retrieved; goroutines polling at the same time each need their own.
+type Batch struct {
+	events [BatchSize]unix.Kevent_t
+	count  int
+}
+
+// Len returns the number of events in the batch.
+func (b *Batch) Len() int { return b.count }
+
+// Event returns the i-th event: the ready fd and its events.
+func (b *Batch) Event(i int) (fd int, ev Event) {
+	fd, ev, _ = convert(&b.events[i])
+	return fd, ev
+}
+
+// Poll retrieves up to BatchSize ready events into b without blocking. Any number of goroutines may call Poll and Block
+// on the same Poller at the same time, each with its own Batch. woken reports that the call consumed the Wake signal,
+// which is not counted as an event. The Poller must not be closed while Poll or Block runs.
+func (p *Poller) Poll(b *Batch) (woken bool) { return p.retrieve(b, &zeroTimeout) }
+
+// Block is Poll that blocks the calling thread in the kernel until an event is ready or Wake is called; when interrupted
+// by a signal it returns with an empty batch.
+func (p *Poller) Block(b *Batch) (woken bool) { return p.retrieve(b, nil) }
+
+// retrieve calls kevent with timeout and keeps the connection events, consuming the wake signal.
+func (p *Poller) retrieve(b *Batch, timeout *unix.Timespec) (woken bool) {
+	n, err := unix.Kevent(p.kqueueFd, nil, b.events[:], timeout)
+	if err != nil {
+		n = 0
+	}
+	count := 0
+	for i := range n {
+		if b.events[i].Filter == unix.EVFILT_USER {
+			p.waking.Store(false)
+			woken = true
+			continue
+		}
+		if _, _, ok := convert(&b.events[i]); ok {
+			b.events[count] = b.events[i]
+			count++
+		}
+	}
+	b.count = count
+	return woken
+}
+
+// convert turns a read or write filter event into the fd and its events; ok is false for any other filter.
+func convert(ev *unix.Kevent_t) (fd int, e Event, ok bool) {
+	switch ev.Filter {
+	case unix.EVFILT_READ:
+		e = EventRead
+		if ev.Flags&unix.EV_EOF != 0 {
+			e |= EventHup
+		}
+		return int(ev.Ident), e, true
+	case unix.EVFILT_WRITE:
+		return int(ev.Ident), EventWrite, true
+	}
+	return 0, 0, false
 }

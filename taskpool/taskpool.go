@@ -3,7 +3,8 @@
 // run callbacks by default.
 //
 // 每个分片使用有界无锁队列，最多保留 maxWorkers 个 worker。大批次均匀分到各分片，
-// 小批次保留随机选择并合并通知；每个分片入队后只判断一次唤醒。普通负载的运行 worker
+// 小批次保留随机选择并合并通知；每个分片入队后只判断一次唤醒。本分片队列空后 worker 先从其他分片取任务，
+// 所有队列都空才挂起。普通负载的运行 worker
 // 软预算为创建时的 GOMAXPROCS；
 // 没有 worker 的分片始终可以启动一个，避免其他分片耗尽预算后饿死它。
 // 队列积压且停止推进时，按需监测允许在分片原有硬上限内扩容，隔离阻塞回调；空队列不自旋。
@@ -39,12 +40,16 @@ var DefaultTaskPool = New(runtime.GOMAXPROCS(0), 4, 8192)
 
 // Pool is a goroutine pool.
 type Pool struct {
-	shards         []shard
-	targetWorkers  int32
+	shards        []shard
+	targetWorkers int32
+	monitorActive atomic.Bool
+	monitorOnce   sync.Once
+	monitorWake   chan struct{}
+	_             [cacheLineSize]byte
+	// runningWorkers changes on every worker wakeup and suspension, so it keeps off the cache line of the fields above,
+	// which every submission and every steal reads.
 	runningWorkers atomic.Int32 // 已预留、待唤醒或正在执行的 worker；不包含队列溢出的临时 goroutine
-	monitorActive  atomic.Bool
-	monitorOnce    sync.Once
-	monitorWake    chan struct{}
+	_              [cacheLineSize - 4]byte
 }
 
 // New creates a Pool: shards shards, at most maxWorkers workers per shard (1 to MaxWorkers), and a queue capacity of
@@ -378,7 +383,7 @@ func (s *shard) work(id int32, wakeup chan struct{}) {
 	}()
 	for {
 		s.wakingWorkers.Add(-1) // the queue has been reached
-		for task := s.pop(); task != nil; task = s.pop() {
+		for task := s.take(); task != nil; task = s.take() {
 			// While tasks are still queued, first make sure a worker comes to take them, then run this one: it may take
 			// a while, and the tasks behind it need not wait for it.
 			if s.hasTask() {
@@ -397,6 +402,26 @@ func (s *shard) work(id int32, wakeup chan struct{}) {
 		}
 		<-wakeup
 	}
+}
+
+// take pops a task from this shard's queue or, once that is empty, steals one from another shard, so a worker only
+// suspends when every queue is empty: otherwise a task waits behind its shard's busy worker while the workers of
+// other shards suspend and have to be woken again, which under load costs more than the tasks themselves. Each shard
+// still wakes its own workers for its own tasks (see notify), so stealing only adds consumers and loses no wakeup.
+func (s *shard) take() func() {
+	if task := s.pop(); task != nil {
+		return task
+	}
+	shards := s.pool.shards
+	start := int(cheaprandn(uint32(len(shards))))
+	for i := range shards {
+		if other := &shards[(start+i)%len(shards)]; other != s && other.hasTask() {
+			if task := other.pop(); task != nil {
+				return task
+			}
+		}
+	}
+	return nil
 }
 
 // help runs task when the queue is full, then helps take the remaining tasks in the queue before exiting.

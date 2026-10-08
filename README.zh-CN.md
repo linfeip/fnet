@@ -26,17 +26,17 @@
 | `fnet` | TCP 引擎：主从 Reactor、一连接一任务、并发安全的写（`Handler`、`Conn`、`Options`） |
 | `fhttp` | 基于 `fnet` 的 HTTP/1.x 服务器：请求调度、`http.Handler`、协议升级 |
 | `websocket` | 基于 `fhttp` 的 WebSocket 服务端：握手、帧处理、消息回调、合并写 |
-| `taskpool` | 按 CPU 分片的无锁 goroutine 池，连接任务的默认执行器 |
+| `taskpool` | 按 CPU 分片的无锁 goroutine 池，可用作 `fnet.Options.Executor` |
 | `poll` | epoll / kqueue 封装 |
 | `internal/bytepool` | 按大小分级的字节缓冲池 |
 
-依赖方向是单向的：`websocket → fhttp → fnet → poll`，以及 `fnet → taskpool`。
+依赖方向是单向的：`websocket → fhttp → fnet → poll`。
 
 ```text
-listener ─▶ 主 Reactor（accept）── 轮询 ─▶ 子 Reactor 0 … N-1   （每个：1 个 goroutine + 1 个 epoll/kqueue）
-                                                │ 连接有事件
+listener ─▶ 主 Reactor（accept）── 轮询 ─▶ 子 Reactor 0 … N-1   （每个：1 个 epoll/kqueue + 若干 worker）
+                                                │ worker 探测到连接就绪
                                                 ▼
-                 执行器（taskpool）：同一连接同一时刻一个任务
+                 worker 直接执行连接的任务（同一连接同一时刻一个任务）
                  读取（借用缓冲）→ OnData → 续发发送缓冲 → 关闭、OnClose
 ```
 
@@ -99,7 +99,7 @@ mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 })
 ```
 
-回调由执行器执行（默认 `taskpool.DefaultTaskPool`，可通过 `fnet.Options.Executor` 替换），因此必须快速返回。超时与各项上限在 `fnet.Options`、`fhttp.Options`、`websocket.Options` 中设置，详见其文档注释。
+回调由事件循环的 worker 执行（设置了 `fnet.Options.Executor` 时由它执行），因此必须快速返回。超时与各项上限在 `fnet.Options`、`fhttp.Options`、`websocket.Options` 中设置，详见其文档注释。
 
 ---
 

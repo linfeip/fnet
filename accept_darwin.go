@@ -3,15 +3,17 @@
 package fnet
 
 import (
+	"net/netip"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-// accept accepts a new connection; the returned fd is already set to non-blocking and close-on-exec.
+// accept accepts a new connection and returns its peer address; the returned fd is already set to non-blocking and
+// close-on-exec.
 // darwin has no accept4: as in the standard library, CLOEXEC is set under the protection of ForkLock to keep the
 // fd from leaking into a child process of a concurrent exec.
-func accept(fd int) (int, unix.Sockaddr, error) {
+func accept(fd int) (int, netip.AddrPort, error) {
 	syscall.ForkLock.RLock()
 	nfd, sa, err := unix.Accept(fd)
 	if err == nil {
@@ -19,13 +21,13 @@ func accept(fd int) (int, unix.Sockaddr, error) {
 	}
 	syscall.ForkLock.RUnlock()
 	if err != nil {
-		return -1, nil, err
+		return -1, netip.AddrPort{}, err
 	}
 	if err := unix.SetNonblock(nfd, true); err != nil {
 		unix.Close(nfd)
-		return -1, nil, err
+		return -1, netip.AddrPort{}, err
 	}
-	return nfd, sa, nil
+	return nfd, sockaddrToAddrPort(sa), nil
 }
 
 // setKeepAlive enables TCP keepalive with the same parameters as the standard library net defaults: probing starts

@@ -183,7 +183,7 @@ func (c *conn) ResumeRead() {
 func (c *conn) Detach() (net.Conn, error) {
 	for !c.state.CompareAndSwap(0, scheduledBit) {
 		c.mu.Lock()
-		closed := c.closed // a closed connection keeps scheduledBit set for good (see run)
+		closed := c.closed // a closed connection keeps scheduledBit set for good (see runRound)
 		c.mu.Unlock()
 		if closed {
 			return nil, net.ErrClosed
@@ -194,7 +194,7 @@ func (c *conn) Detach() (net.Conn, error) {
 	if c.closing {
 		c.mu.Unlock()
 		if !c.state.CompareAndSwap(scheduledBit, 0) { // give the task back to carry out the close
-			c.loop.srv.opts.Executor(c.task)
+			c.schedule()
 		}
 		return nil, net.ErrClosed
 	}
@@ -243,15 +243,20 @@ func sockaddrToAddrPort(sa unix.Sockaddr) netip.AddrPort {
 	case *unix.SockaddrInet4:
 		return netip.AddrPortFrom(netip.AddrFrom4(sa.Addr), uint16(sa.Port))
 	case *unix.SockaddrInet6:
-		ip := netip.AddrFrom16(sa.Addr)
-		if sa.ZoneId != 0 {
-			if ifi, err := net.InterfaceByIndex(int(sa.ZoneId)); err == nil {
-				ip = ip.WithZone(ifi.Name)
-			}
-		}
-		return netip.AddrPortFrom(ip, uint16(sa.Port))
+		return inet6AddrPort(sa.Addr, uint16(sa.Port), sa.ZoneId)
 	}
 	return netip.AddrPort{}
+}
+
+// inet6AddrPort builds an IPv6 address and port; a non-zero scope id becomes the zone, named after its interface.
+func inet6AddrPort(addr [16]byte, port uint16, scopeID uint32) netip.AddrPort {
+	ip := netip.AddrFrom16(addr)
+	if scopeID != 0 {
+		if ifi, err := net.InterfaceByIndex(int(scopeID)); err == nil {
+			ip = ip.WithZone(ifi.Name)
+		}
+	}
+	return netip.AddrPortFrom(ip, port)
 }
 
 // addrPortToTCPAddr converts the result of sockaddrToAddrPort into a net.Addr; the zero value returns nil.
