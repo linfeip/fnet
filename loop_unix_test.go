@@ -15,9 +15,9 @@ import (
 	"github.com/linfeip/fnet/poll"
 )
 
-// TestRunEventOwnLoopOnly checks that an event is delivered through the loop that owns the connection: a leftover
+// TestHandleEventOwnLoopOnly checks that an event is delivered through the loop that owns the connection: a leftover
 // event of another loop's poller for an fd that has since been reused by this connection must not notify it.
-func TestRunEventOwnLoopOnly(t *testing.T) {
+func TestHandleEventOwnLoopOnly(t *testing.T) {
 	var tasks atomic.Int32
 	opened := make(chan Conn, 1)
 	srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c }}, Options{NumLoops: 2, Executor: func(task func()) {
@@ -33,11 +33,11 @@ func TestRunEventOwnLoopOnly(t *testing.T) {
 	}
 
 	before := tasks.Load()
-	(&worker{home: other}).runEvent(other, c.fd, poll.EventRead)
+	other.handleEvent(c.fd, poll.EventRead)
 	if got := tasks.Load(); got != before {
 		t.Fatalf("另一个 loop 的事件通知了连接：Executor 多被调用了 %d 次", got-before)
 	}
-	(&worker{home: own}).runEvent(own, c.fd, poll.EventRead)
+	own.handleEvent(c.fd, poll.EventRead)
 	if got := tasks.Load(); got != before+1 {
 		t.Fatalf("所属 loop 的事件没有通知连接：Executor 被调用了 %d 次, 期望 1 次", got-before)
 	}
@@ -136,31 +136,9 @@ func TestConnChurn(t *testing.T) {
 	}
 }
 
-// TestConnQueue checks the queue is FIFO, reports whether connections are left behind the one taken, and reuses its
-// array once drained.
-func TestConnQueue(t *testing.T) {
-	var q connQueue
-	conns := []*conn{{fd: 1}, {fd: 2}, {fd: 3}}
-	for _, c := range conns {
-		q.push(c)
-	}
-	for i, want := range conns {
-		c, more := q.pop()
-		if c != want || more != (i < len(conns)-1) {
-			t.Fatalf("第 %d 次取出 %p more=%v, 期望 fd=%d", i, c, more, want.fd)
-		}
-	}
-	if c, more := q.pop(); c != nil || more || q.length.Load() != 0 {
-		t.Fatal("空队列应返回 nil")
-	}
-	if len(q.conns) != 0 || q.head != 0 {
-		t.Fatal("队列取空后没有从头复用数组")
-	}
-}
-
-// TestStuckWorkersRelieved blocks every worker of the only loop in a callback: the monitor must start an extra worker,
-// which serves another connection.
-func TestStuckWorkersRelieved(t *testing.T) {
+// TestBlockedCallbacksDoNotHoldUpOthers blocks more callbacks than there are Ps: the default executor must start more
+// workers, so another connection is still served.
+func TestBlockedCallbacksDoNotHoldUpOthers(t *testing.T) {
 	release := make(chan struct{})
 	var stuck sync.WaitGroup
 	srv := startServerWith(t, &funcHandler{data: func(c Conn, b []byte) int {
@@ -172,12 +150,9 @@ func TestStuckWorkersRelieved(t *testing.T) {
 		return echo(c, b)
 	}}, Options{NumLoops: 1})
 	t.Cleanup(func() { close(release) }) // runs before the server's Close, which waits for the callbacks
-	l := srv.loops[0]
-	l.workersMu.Lock()
-	base := l.baseWorkers
-	l.workersMu.Unlock()
-	stuck.Add(base)
-	for range base {
+	blocked := runtime.GOMAXPROCS(0) + 1
+	stuck.Add(blocked)
+	for range blocked {
 		dial(t, srv).Write([]byte("block"))
 	}
 	stuck.Wait()
@@ -186,24 +161,20 @@ func TestStuckWorkersRelieved(t *testing.T) {
 	c.SetDeadline(time.Now().Add(5 * time.Second))
 	c.Write([]byte("ping"))
 	if _, err := io.ReadFull(c, make([]byte, 4)); err != nil {
-		t.Fatalf("所有 worker 卡在回调里时其他连接得不到服务: %v", err)
+		t.Fatalf("多个回调阻塞时其他连接得不到服务: %v", err)
 	}
 }
 
-// TestGoexitReplacesWorker has callbacks call runtime.Goexit more times than the loop has workers: every worker that
-// exits that way is replaced, so the connections that come after are still served.
-func TestGoexitReplacesWorker(t *testing.T) {
+// TestGoexitInCallback has callbacks call runtime.Goexit more times than there are Ps: each such connection is closed,
+// the executor replaces the goroutine that exited, and the connections that come after are still served.
+func TestGoexitInCallback(t *testing.T) {
 	srv := startServerWith(t, &funcHandler{data: func(c Conn, b []byte) int {
 		if string(b) == "exit" {
 			runtime.Goexit()
 		}
 		return echo(c, b)
 	}}, Options{NumLoops: 1})
-	l := srv.loops[0]
-	l.workersMu.Lock()
-	base := l.baseWorkers
-	l.workersMu.Unlock()
-	for range 2 * base {
+	for range 2 * runtime.GOMAXPROCS(0) {
 		c := dial(t, srv)
 		c.SetDeadline(time.Now().Add(5 * time.Second))
 		c.Write([]byte("exit"))
@@ -215,7 +186,7 @@ func TestGoexitReplacesWorker(t *testing.T) {
 	c.SetDeadline(time.Now().Add(5 * time.Second))
 	c.Write([]byte("ping"))
 	if _, err := io.ReadFull(c, make([]byte, 4)); err != nil {
-		t.Fatalf("worker 因 Goexit 退出后没有被替换: %v", err)
+		t.Fatalf("执行器的 goroutine 因 Goexit 退出后没有被替换: %v", err)
 	}
 }
 

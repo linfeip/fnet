@@ -3,17 +3,15 @@
 // waiting for ready events, and waking up a waiting event loop from another goroutine.
 //
 // Conventions:
-//   - an fd registered with AddRead is level-triggered (LT); one registered with AddListener (a listening socket)
-//     or AddEdge (a connection) is edge-triggered (ET).
-//   - AddRead/AddEdge/Delete/Wake may be called concurrently from any goroutine;
-//     Wait may only be called by the single event loop goroutine of a Poller from New;
+//   - an fd registered with AddListener (a listening socket) or AddEdge (a connection) is edge-triggered (ET).
+//   - AddListener/AddEdge/Delete/Wake may be called concurrently from any goroutine;
 //     Poll and Block may be called by any number of goroutines at the same time, each with its own Batch.
 package poll
 
-// BatchSize is the number of events one Poll or Block call retrieves at most. It is kept small: the goroutine that
-// retrieves events runs them one after another, while the ones it leaves pending go to other goroutines polling at
-// the same time.
-const BatchSize = 8
+// BatchSize is the number of events one Poll or Block call retrieves at most. The goroutine that retrieves events only
+// hands their tasks over, so a large batch takes fewer system calls under load: with 8 events a call, 4096 echoing
+// connections on 24 CPUs ran about 2% slower.
+const BatchSize = 1024
 
 // Event is a ready event.
 type Event uint8

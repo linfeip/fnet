@@ -183,7 +183,7 @@ func (c *conn) ResumeRead() {
 func (c *conn) Detach() (net.Conn, error) {
 	for !c.state.CompareAndSwap(0, scheduledBit) {
 		c.mu.Lock()
-		closed := c.closed // a closed connection keeps scheduledBit set for good (see runRound)
+		closed := c.closed // a closed connection keeps scheduledBit set for good (see run)
 		c.mu.Unlock()
 		if closed {
 			return nil, net.ErrClosed

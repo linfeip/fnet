@@ -33,40 +33,28 @@ func socketPair(t *testing.T) (int, int) {
 	return fds[0], fds[1]
 }
 
-// waitOnce calls Wait in a loop until it gets an fd event or a wakeup signal.
+// waitOnce calls Block in a loop until it gets an fd event or a wakeup signal.
 func waitOnce(t *testing.T, p *Poller) (map[int]Event, bool) {
 	t.Helper()
-	got := map[int]Event{}
+	var b Batch
 	for {
-		woken, err := p.Wait(func(fd int, ev Event) { got[fd] |= ev })
-		if err != nil {
-			t.Fatal(err)
-		}
-		if woken || len(got) > 0 {
+		woken := p.Block(&b)
+		if got := batchEvents(&b); woken || len(got) > 0 {
 			return got, woken
 		}
 	}
 }
 
-// TestLevelTriggered covers AddRead's level-triggered behavior: readability keeps being reported until the
-// data is read away, and after deregistration no more events arrive.
-func TestLevelTriggered(t *testing.T) {
+// TestDelete verifies that after deregistration no more events arrive.
+func TestDelete(t *testing.T) {
 	p := newPoller(t)
 	a, b := socketPair(t)
-	if err := p.AddRead(a); err != nil {
+	if err := p.AddEdge(a); err != nil {
 		t.Fatal(err)
 	}
+	waitOnce(t, p) // the writability reported at registration time
 
-	unix.Write(b, []byte("x"))
-	if got, _ := waitOnce(t, p); got[a] != EventRead {
-		t.Fatalf("期望可读事件, got %v", got)
-	}
-	if got, _ := waitOnce(t, p); got[a] != EventRead {
-		t.Fatalf("水平触发下应再次可读, got %v", got)
-	}
-	unix.Read(a, make([]byte, 16))
-
-	// After deregistration there must be no more events even with data pending; Wake guarantees Wait returns.
+	// After deregistration there must be no more events even with data pending; Wake guarantees Block returns.
 	if err := p.Delete(a); err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +84,7 @@ func TestEdgeTriggered(t *testing.T) {
 	if got, _ := waitOnce(t, p); got[a]&EventRead == 0 {
 		t.Fatalf("期望可读事件, got %v", got)
 	}
-	p.Wake() // use Wake to guarantee Wait returns
+	p.Wake() // use Wake to guarantee Block returns
 	if got, woken := waitOnce(t, p); !woken || len(got) != 0 {
 		t.Fatalf("边沿触发下数据未读走也不应重复报告, got %v woken=%v", got, woken)
 	}
@@ -105,16 +93,6 @@ func TestEdgeTriggered(t *testing.T) {
 	if got, _ := waitOnce(t, p); got[a]&EventRead == 0 {
 		t.Fatalf("新数据到达应再次报告可读, got %v", got)
 	}
-}
-
-func newBlockingPoller(t *testing.T) *Poller {
-	t.Helper()
-	p, err := NewBlocking()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { p.Close() })
-	return p
 }
 
 // batchEvents returns the events of b by fd.
@@ -130,7 +108,7 @@ func batchEvents(b *Batch) map[int]Event {
 // TestPoll runs Poll from another goroutine: it takes the ready edge-triggered event and the wake signal without
 // blocking, and neither is reported again.
 func TestPoll(t *testing.T) {
-	p := newBlockingPoller(t)
+	p := newPoller(t)
 	a, b := socketPair(t)
 	if err := p.AddEdge(a); err != nil {
 		t.Fatal(err)
@@ -160,7 +138,7 @@ func TestPoll(t *testing.T) {
 // TestBlock verifies that Block, waiting in another goroutine, returns for a Wake and for an event arriving while it
 // waits.
 func TestBlock(t *testing.T) {
-	p := newBlockingPoller(t)
+	p := newPoller(t)
 	a, b := socketPair(t)
 	if err := p.AddEdge(a); err != nil {
 		t.Fatal(err)
@@ -233,31 +211,23 @@ func TestEdgeWritable(t *testing.T) {
 			break
 		}
 	}
-	p.Wake() // the event was already ready while the peer read the data; Wake only guarantees Wait returns
+	p.Wake() // the event was already ready while the peer read the data; Wake only guarantees Block returns
 	if got, _ := waitOnce(t, p); got[a]&EventWrite == 0 {
 		t.Fatalf("期望可写事件, got %v", got)
 	}
 }
 
-// TestPeerCloseIsReadable verifies a peer close is reported as readable (reading yields EOF), both
-// level-triggered and edge-triggered.
+// TestPeerCloseIsReadable verifies a peer close is reported as readable (reading yields EOF).
 func TestPeerCloseIsReadable(t *testing.T) {
-	for name, add := range map[string]func(*Poller, int) error{
-		"AddRead": (*Poller).AddRead,
-		"AddEdge": (*Poller).AddEdge,
-	} {
-		t.Run(name, func(t *testing.T) {
-			p := newPoller(t)
-			a, b := socketPair(t)
-			add(p, a)
-			unix.Close(b)
-			if got, _ := waitOnce(t, p); got[a]&EventRead == 0 {
-				t.Fatalf("对端关闭应报告可读, got %v", got)
-			}
-			if n, _ := unix.Read(a, make([]byte, 16)); n != 0 {
-				t.Fatalf("期望读到 EOF, n=%d", n)
-			}
-		})
+	p := newPoller(t)
+	a, b := socketPair(t)
+	p.AddEdge(a)
+	unix.Close(b)
+	if got, _ := waitOnce(t, p); got[a]&EventRead == 0 {
+		t.Fatalf("对端关闭应报告可读, got %v", got)
+	}
+	if n, _ := unix.Read(a, make([]byte, 16)); n != 0 {
+		t.Fatalf("期望读到 EOF, n=%d", n)
 	}
 }
 
@@ -281,30 +251,5 @@ func TestConcurrentWake(t *testing.T) {
 	p.Wake()
 	if _, woken := waitOnce(t, p); !woken {
 		t.Fatal("第二次 Wake 丢失")
-	}
-}
-
-// TestNotifyWhileWaiting verifies that both events and wakeups arriving only after Wait is already waiting
-// (on Linux the runtime has suspended the goroutine) must make it return.
-func TestNotifyWhileWaiting(t *testing.T) {
-	p := newPoller(t)
-	a, b := socketPair(t)
-	p.AddRead(a)
-	for _, notify := range []func(){func() { p.Wake() }, func() { unix.Write(b, []byte("x")) }} {
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			for got := false; !got; {
-				woken, err := p.Wait(func(int, Event) { got = true })
-				got = got || woken || err != nil
-			}
-		}()
-		time.Sleep(20 * time.Millisecond) // let Wait enter the wait first
-		notify()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Wait 未返回")
-		}
 	}
 }

@@ -34,7 +34,6 @@ type Server struct {
 	workersWg   sync.WaitGroup // the loops' workers; Serve stops them once every connection has closed
 	draining    atomic.Bool    // Serve is closing every connection: one being opened closes itself (see loop.watch)
 	stopping    atomic.Bool    // the workers are to exit
-	monitorStop chan struct{}  // closed to stop the monitor
 
 	mu      sync.Mutex
 	serving bool
@@ -104,8 +103,8 @@ func (s *Server) Addrs() []net.Addr {
 	return addrs
 }
 
-// Serve starts the sub-reactors' workers, which accept and serve the connections, and blocks until Close is called
-// (returning ErrServerClosed) or a fatal error occurs.
+// Serve starts the sub-reactors' workers, which accept the connections and hand their tasks to the Executor, and blocks
+// until Close is called (returning ErrServerClosed) or a fatal error occurs.
 func (s *Server) Serve() error {
 	s.mu.Lock()
 	if s.closed {
@@ -120,12 +119,7 @@ func (s *Server) Serve() error {
 	s.mu.Unlock()
 
 	for _, l := range s.loops {
-		l.startWorkers()
-	}
-	var monitorDone chan struct{}
-	if s.opts.Executor == nil { // an Executor's workers run no callbacks, so they never get stuck in one
-		s.monitorStop, monitorDone = make(chan struct{}), make(chan struct{})
-		go s.monitor(monitorDone)
+		l.startWorker()
 	}
 	go s.tick()
 	<-s.closing
@@ -139,11 +133,7 @@ func (s *Server) Serve() error {
 			c.requestClose(ErrServerClosed)
 		}
 	}
-	s.openConnsWg.Wait() // the closes are carried out by the connections' tasks, which the workers run
-	if monitorDone != nil {
-		close(s.monitorStop)
-		<-monitorDone // the monitor starts workers, so it stops first
-	}
+	s.openConnsWg.Wait() // the closes are carried out by the connections' tasks, which the Executor runs
 	s.stopping.Store(true)
 	for _, l := range s.loops {
 		l.poller.Wake() // a worker that wakes up passes it on, see worker.run
@@ -204,24 +194,6 @@ func (s *Server) tick() {
 				l.checkDeadlines()
 			}
 		case <-s.done:
-			return
-		}
-	}
-}
-
-// monitor looks for loops whose workers are all stuck in callbacks, once every monitorTick (see loop.relieve), until
-// monitorStop is closed.
-func (s *Server) monitor(done chan struct{}) {
-	defer close(done)
-	ticker := time.NewTicker(monitorTick)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			for _, l := range s.loops {
-				l.relieve()
-			}
-		case <-s.monitorStop:
 			return
 		}
 	}

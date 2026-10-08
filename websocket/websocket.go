@@ -1,8 +1,8 @@
 // Package websocket is a WebSocket (RFC 6455) server built on fhttp; the frame format and protocol validation use
 // github.com/gobwas/ws.
 //
-// A connection's data is read and processed by fnet's executor (a worker of the connection's event loop by default,
-// see fnet.Options.Executor) in the connection's task: splitting frames, unmasking, replying to ping and close frames, and
+// A connection's data is read and processed by fnet's executor (see fnet.Options.Executor, taskpool.DefaultTaskPool
+// by default) in the connection's task: splitting frames, unmasking, replying to ping and close frames, and
 // invoking the Handler in order. For an unfragmented message the payload is taken straight from the read buffer,
 // with no copy and no queueing; a fragmented message is delivered once it has been reassembled in full. An idle
 // connection occupies no goroutine.
@@ -33,9 +33,10 @@ import (
 // fnet's executor and must return quickly: when several frames arrive at once, the frames written while they are
 // being processed are merged into a single write (see Conn.WriteMessage), so one blocking callback delays replies
 // already written earlier in the same batch; the connection is not read again until the callback returns, and the
-// callback also occupies a goroutine of the executor (by default the event loops have about one worker per CPU
-// between them), slowing down the callbacks of other connections. Time-consuming logic should be
-// handed off to another goroutine.
+// callback also occupies a goroutine of the executor (the default taskpool.DefaultTaskPool starts more workers as
+// callbacks block, up to 512 × GOMAXPROCS, so blocking callbacks are absorbed up to that limit but each one holds a
+// goroutine and its stack), slowing down the callbacks of other connections once the limit is reached.
+// Time-consuming logic should be handed off to another goroutine.
 // Callbacks of one connection always run serially: OnOpen first, OnClose last and only once.
 // After a local Close, a close frame from the peer or a protocol error, OnMessage is no longer called: messages not
 // yet processed in the same batch and data arriving afterwards are all discarded.

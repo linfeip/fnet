@@ -27,7 +27,7 @@ const (
 //
 // state records both the pending events and the status of the task: setting an event also sets scheduledBit, and if
 // that bit was clear there is no task queued or running, so this call submits one; otherwise a task already exists
-// and it will notice the new events at the end of its round and run another one (see runRound).
+// and it will notice the new events at the end of its round and run another one (see run).
 // A connection therefore has at most one task at a time, with reading, callbacks, flushing and closing all done
 // serially inside it, and no events are lost. It reports whether this call submitted the task.
 func (c *conn) notify(ev uint32) bool {
@@ -38,35 +38,21 @@ func (c *conn) notify(ev uint32) bool {
 	return false
 }
 
-// schedule submits the connection's task: to the Executor, or by default to the workers of the connection's loop. The
-// caller must hold the task, see markEvents.
-func (c *conn) schedule() {
-	if executor := c.loop.srv.opts.Executor; executor != nil {
-		executor(c.task)
-	} else {
-		c.loop.submit(c)
-	}
-}
+// schedule submits the connection's task to the Executor (taskpool.DefaultTaskPool by default). The caller must hold
+// the task, see markEvents.
+func (c *conn) schedule() { c.loop.srv.opts.Executor(c.task) }
 
 // markEvents 合并事件并取得唯一任务的提交权；返回 true 的调用方必须负责提交，不能丢弃。
 func (c *conn) markEvents(ev uint32) bool {
 	return c.state.Or(ev|scheduledBit)&scheduledBit == 0
 }
 
-// run is the connection's task as handed to an Executor: one round, after which it submits itself again when more
-// events arrived meanwhile, going to the end of the executor's queue so that other connections run first, keeping
-// connections fair with each other.
+// run is the connection's task: it takes the pending events and processes one round. When more events arrive while
+// it is processing, it does not continue on the spot but submits itself again, going to the end of the executor's
+// queue so that other connections run first, keeping connections fair with each other.
 //
 // If a callback panics the connection is closed and the panic keeps propagating up, to be recovered by the executor.
 func (c *conn) run() {
-	if c.runRound() {
-		c.schedule()
-	}
-}
-
-// runRound takes the pending events and processes one round. It reports whether events arrived while it was
-// processing, in which case the caller still holds the task and must submit it again (see schedule).
-func (c *conn) runRound() (again bool) {
 	// clear the scheduledBit marker, clear the event markers
 	ev := c.state.Swap(scheduledBit) &^ scheduledBit
 	done := false
@@ -78,7 +64,9 @@ func (c *conn) runRound() (again bool) {
 	c.handle(ev)
 	done = true
 	// A closed connection keeps scheduledBit set, so there is no further task.
-	return !c.closed && !c.state.CompareAndSwap(scheduledBit, 0)
+	if !c.closed && !c.state.CompareAndSwap(scheduledBit, 0) {
+		c.schedule()
+	}
 }
 
 // handle processes one round of events: setting up a new connection (its socket options, then the OnOpen callback),

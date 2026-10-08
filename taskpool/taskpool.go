@@ -3,13 +3,15 @@
 // run callbacks by default.
 //
 // 每个分片使用有界无锁队列，最多保留 maxWorkers 个 worker。大批次均匀分到各分片，
-// 小批次保留随机选择并合并通知；每个分片入队后只判断一次唤醒。本分片队列空后 worker 先从其他分片取任务，
-// 所有队列都空才挂起。普通负载的运行 worker
-// 软预算为创建时的 GOMAXPROCS；
-// 没有 worker 的分片始终可以启动一个，避免其他分片耗尽预算后饿死它。
-// 队列积压且停止推进时，按需监测允许在分片原有硬上限内扩容，隔离阻塞回调；空队列不自旋。
+// 小批次保留随机选择并合并通知；每个分片入队后只判断一次唤醒（已有 worker 在赶来时不再唤醒）。
+// 运行中的 worker 数只受 maxWorkers 限制，不再设 GOMAXPROCS 软预算：回调阻塞时 worker 仍算“在运行”，
+// 软预算会让池无法扩到足以吸收阻塞的规模，同时让就绪任务在队列里多等，实测只拉高尾延迟，没有省下可测的调度开销。
+// 总 worker 数上限是 分片数 × maxWorkers，由所有分片共享：一个分片的 worker 全在执行任务（达到它的上限）时，
+// 它的任务由别的分片挂起的 worker 来取，或在还有余量的分片新建一个 worker 来取（见 Pool.borrow）；整个池都没有
+// 可用 worker 时任务排队，下一个挂起的 worker 会来取（见 Pool.starving）。只有分片饱和时才跨分片，正常负载下
+// worker 只取本分片的任务：常开的跨分片窃取实测拉高了尾延迟。要容纳 N 个同时阻塞的回调，总上限需要大于 N。
 // 队列满时沿用临时 goroutine 执行并协助排空的策略，提交者不阻塞。
-// worker 启动后保持驻留；监测 goroutine 每个池至多一个，只在有积压时定时检查，否则挂起。
+// worker 启动后保持驻留（不回收）。
 // When a task panics it is logged (with the stack trace), and the goroutine running it goes on with the following tasks.
 package taskpool
 
@@ -17,39 +19,44 @@ import (
 	"log/slog"
 	"math/bits"
 	"runtime"
-	"sync"
 	"sync/atomic"
-	"time"
 	_ "unsafe"
 
 	"github.com/linfeip/fnet/internal/units"
 )
 
-// MaxWorkers is the upper bound on the number of workers per shard: suspended workers are recorded in a 64-bit bitmap.
-const MaxWorkers = 64
+// MaxWorkers is the upper bound on the number of workers per shard: suspended workers are recorded in a bitmap of
+// idleWords 64-bit words.
+const MaxWorkers = 512
+
+// idleWords is the number of words in a shard's bitmap of suspended workers.
+const idleWords = MaxWorkers / 64
 
 // DefaultTaskPool is the default goroutine pool: one shard per P (based on GOMAXPROCS at package initialization), with
-// at most 4 workers and a queue capacity of 8192 per shard (about 128KB per shard). Workers start only once there are
-// tasks.
+// at most MaxWorkers workers and a queue capacity of 8192 per shard (about 128KB per shard), so at most
+// 512 × GOMAXPROCS workers, which any shard may use (see Pool.borrow). Workers start only once there are tasks, and a
+// worker started stays resident, so the number of goroutines grows with the number of callbacks that block at the same
+// time; a pool that only runs short tasks keeps a handful.
+//
+// The worker limit has to accommodate the number of callbacks that block at the same time: with the 4 workers per shard
+// it used to have, a workload where every callback blocked for 1ms or more reached only 10% to 17% of the throughput of
+// one goroutine per task, and with 64 about 100% (measured on 24 CPUs with 1024 connections).
 //
 // The capacity has to accommodate the number of connections that have a task at the same time (each fnet connection has
 // at most one task at a time): when the capacity is enough the backlog stays in the queue at 16 bytes per task; only
 // once it is full does each overflowing task get its own temporary goroutine, which is far more expensive, and with many
 // backed-up connections the goroutines and the buffers they borrow show up by the thousand.
-var DefaultTaskPool = New(runtime.GOMAXPROCS(0), 4, 8192)
+var DefaultTaskPool = New(runtime.GOMAXPROCS(0), MaxWorkers, 8192)
 
 // Pool is a goroutine pool.
 type Pool struct {
-	shards        []shard
-	targetWorkers int32
-	monitorActive atomic.Bool
-	monitorOnce   sync.Once
-	monitorWake   chan struct{}
-	_             [cacheLineSize]byte
-	// runningWorkers changes on every worker wakeup and suspension, so it keeps off the cache line of the fields above,
-	// which every submission and every steal reads.
-	runningWorkers atomic.Int32 // 已预留、待唤醒或正在执行的 worker；不包含队列溢出的临时 goroutine
-	_              [cacheLineSize - 4]byte
+	shards []shard
+	_      [cacheLineSize]byte // every Submit reads shards: keep it off the cache line of starving
+	// starving is set when a shard had tasks queued and found no suspended worker and no room for a new one anywhere in
+	// the pool; the next worker to suspend clears it and notifies every shard once (see shard.work). It is written only
+	// while the whole pool is saturated.
+	starving atomic.Bool
+	_        [cacheLineSize - 4]byte
 }
 
 // New creates a Pool: shards shards, at most maxWorkers workers per shard (1 to MaxWorkers), and a queue capacity of
@@ -57,36 +64,30 @@ type Pool struct {
 func New(shards, maxWorkers, capacity int) *Pool {
 	maxWorkers = min(max(maxWorkers, 1), MaxWorkers)
 	size := 1 << bits.Len(uint(max(capacity, 2)-1))
-	p := &Pool{
-		shards:        make([]shard, max(shards, 1)),
-		targetWorkers: int32(min(runtime.GOMAXPROCS(0), max(shards, 1)*maxWorkers)),
-		monitorWake:   make(chan struct{}, 1),
-	}
+	p := &Pool{shards: make([]shard, max(shards, 1))}
 	for i := range p.shards {
 		s := &p.shards[i]
 		s.pool = p
-		s.targetWorkers = int32(min(maxWorkers, (int(p.targetWorkers)+len(p.shards)-1)/len(p.shards)))
 		s.slots = make([]slot, size)
 		for j := range s.slots {
 			s.slots[j].seq.Store(uint64(j))
 		}
 		s.mask = uint64(size - 1)
-		s.wakeups = make([]chan struct{}, maxWorkers)
+		s.wakeups = make([]chan *shard, maxWorkers)
 		s.maxWorkers = int32(maxWorkers)
 	}
 	return p
 }
 
-// Submit 异步提交任务，不阻塞调用者；worker 和监测已预热、不触发扩容或溢出时不分配。
+// Submit 异步提交任务，不阻塞调用者；worker 已启动、不触发扩容或溢出时不分配。
 // 任务 panic 会被记录，不影响后续任务。
 func (p *Pool) Submit(task func()) {
 	s := &p.shards[cheaprandn(uint32(len(p.shards)))]
 	if !s.push(task) {
-		s.overflowed.Store(true)
 		go s.help(task)
 		return
 	}
-	s.notify(false)
+	s.notify()
 }
 
 // SubmitBatch 异步提交一个批次；返回前不保留 tasks 切片，调用方可以立即清空并复用。
@@ -114,14 +115,13 @@ func (p *Pool) SubmitBatch(tasks []func()) {
 			index := cheaprandn(uint32(count))
 			s := &p.shards[index]
 			if !s.push(task) {
-				s.overflowed.Store(true)
 				go s.help(task)
 			} else {
 				ready |= 1 << index
 			}
 		}
 		for ready != 0 {
-			p.shards[bits.TrailingZeros64(ready)].notify(false)
+			p.shards[bits.TrailingZeros64(ready)].notify()
 			ready &= ready - 1
 		}
 		return
@@ -131,82 +131,10 @@ func (p *Pool) SubmitBatch(tasks []func()) {
 		s := &p.shards[(start+i)%count]
 		for j := i; j < len(tasks); j += count {
 			if !s.push(tasks[j]) {
-				s.overflowed.Store(true)
 				go s.help(tasks[j])
 			}
 		}
-		s.notify(false)
-	}
-}
-
-// reserveWorker 预留运行名额；首个 worker 或积压监测可以越过软预算，分片硬上限仍由 notify 检查。
-func (p *Pool) reserveWorker(force bool) bool {
-	if force {
-		p.runningWorkers.Add(1)
-		return true
-	}
-	for {
-		running := p.runningWorkers.Load()
-		if running >= p.targetWorkers {
-			return false
-		}
-		if p.runningWorkers.CompareAndSwap(running, running+1) {
-			return true
-		}
-	}
-}
-
-func (p *Pool) watchBacklog() {
-	if p.monitorActive.Load() || !p.monitorActive.CompareAndSwap(false, true) {
-		return
-	}
-	p.monitorOnce.Do(func() { go p.monitor() })
-	p.monitorWake <- struct{}{}
-}
-
-// monitor 只对有待取任务的队列采样 head；连续两次没有推进才认为需要额外 worker。
-// head 是原有出队计数，无需在每个任务上新增进度原子操作或读取时间。
-func (p *Pool) monitor() {
-	heads := make([]uint64, len(p.shards))
-	for range p.monitorWake {
-		for i := range p.shards {
-			heads[i] = p.shards[i].head.Load()
-		}
-		for {
-			time.Sleep(time.Millisecond)
-			pending := false
-			for i := range p.shards {
-				s := &p.shards[i]
-				head := s.head.Load()
-				if s.hasTask() && (s.runningWorkers.Load() < s.maxWorkers || s.overflowed.Load()) {
-					pending = true
-					if head == heads[i] {
-						s.notify(true)
-						if s.overflowed.Load() && s.runningWorkers.Load() >= s.maxWorkers {
-							if task := s.pop(); task != nil {
-								go s.help(task)
-							}
-						}
-					} else if p.runningWorkers.Load() < p.targetWorkers {
-						s.notify(false)
-					}
-				}
-				heads[i] = head
-			}
-			if pending {
-				continue
-			}
-			p.monitorActive.Store(false)
-			// 与提交者配对再检查，避免它在 active 清零前看到旧值而漏掉监测。
-			for i := range p.shards {
-				s := &p.shards[i]
-				if s.hasTask() && (s.runningWorkers.Load() < s.maxWorkers || s.overflowed.Load()) {
-					p.watchBacklog()
-					break
-				}
-			}
-			break
-		}
+		s.notify()
 	}
 }
 
@@ -242,25 +170,23 @@ type slot struct {
 const cacheLineSize = 128 // 同时覆盖常见的 64B 和 128B 缓存行
 
 type shard struct {
-	slots         []slot
-	mask          uint64
-	wakeups       []chan struct{} // indexed by worker id; a suspended worker waits for a wakeup on its own channel
-	maxWorkers    int32
-	targetWorkers int32 // 本分片在正常负载下的软额度；阻塞监测可以越过
-	pool          *Pool
+	slots      []slot
+	mask       uint64
+	wakeups    []chan *shard // indexed by worker id; a suspended worker receives on its own channel the shard to serve next
+	maxWorkers int32
+	pool       *Pool
+	_          [cacheLineSize]byte
+	tail       atomic.Uint64 // the position the next task is written to
+	_          [cacheLineSize - 8]byte
+	head       atomic.Uint64 // the position the next task is taken from
+	_          [cacheLineSize - 8]byte
+	// wakingWorkers is the number of workers (of this shard, or lent by another) that have been woken or newly started
+	// for this queue but have not reached it yet: once they get there they will take the queued tasks, so there is no
+	// need to wake another worker.
+	wakingWorkers atomic.Int32
+	liveWorkers   atomic.Int32             // the number of started workers, numbered 0 through liveWorkers-1
+	idleWorkers   [idleWords]atomic.Uint64 // the suspended workers, bit i%64 of word i/64 standing for id i
 	_             [cacheLineSize]byte
-	tail          atomic.Uint64 // the position the next task is written to
-	_             [cacheLineSize - 8]byte
-	head          atomic.Uint64 // the position the next task is taken from
-	_             [cacheLineSize - 8]byte
-	// wakingWorkers is the number of workers that have been woken or newly started but have not reached the queue yet:
-	// once they get there they will take the queued tasks, so there is no need to wake another worker.
-	wakingWorkers  atomic.Int32
-	liveWorkers    atomic.Int32  // the number of started workers, numbered 0 through liveWorkers-1
-	idleWorkers    atomic.Uint64 // the suspended workers, bit i standing for id i
-	runningWorkers atomic.Int32
-	overflowed     atomic.Bool // 溢出协助持续到正常 worker 恢复；避免协助退出后尾部任务滞留
-	_              [cacheLineSize]byte
 }
 
 // push puts a task into the queue and returns false when the queue is full.
@@ -312,116 +238,136 @@ func (s *shard) hasTask() bool {
 	return s.slots[pos&s.mask].seq.Load() == pos+1
 }
 
-// notify 先取得唤醒权，再预留运行预算；成功后把这两个名额显式移交给 worker。
-// worker 到达队列释放 wakingWorkers，挂起时释放 runningWorkers；失败路径由本函数释放。
-func (s *shard) notify(force bool) {
-	if !s.hasTask() || s.wakingWorkers.Load() > 0 || !s.wakingWorkers.CompareAndSwap(0, 1) {
-		return
-	}
-	if s.liveWorkers.Load() >= s.maxWorkers && s.idleWorkers.Load() == 0 {
+// notify 确保有 worker 来取队列里的任务：已有 worker 在赶来（持有 wakingWorkers）时什么也不做；否则唤醒本分片
+// 挂起的 worker，或新建一个；本分片已达上限且全在执行任务时，从别的分片借一个（见 Pool.borrow）。找到的 worker
+// 接过本函数取得的 wakingWorkers，到达队列时释放；失败路径由本函数释放。整个池都没有可用 worker 时置 starving，
+// 由下一个挂起的 worker 来取。
+//
+// 不会丢失唤醒。分片内：提交者先写任务再看 worker，worker 先登记挂起再看队列，两边至少有一边看到另一边。
+// 跨分片：先释放 wakingWorkers 再置 starving，之后再看一遍全池有没有挂起的 worker；worker 先登记挂起再读
+// starving，所以要么它看到标志（这时 wakingWorkers 已释放，它的 notify 能取得），要么这里的第二遍看到它并重试。
+func (s *shard) notify() {
+	p := s.pool
+	for s.hasTask() && s.wakingWorkers.Load() == 0 && s.wakingWorkers.CompareAndSwap(0, 1) {
+		if s.wakeIdle(s) || s.start(s) || p.borrow(s) {
+			return
+		}
 		s.wakingWorkers.Add(-1)
-		if s.idleWorkers.Load() != 0 {
-			s.notify(force)
-		} else if s.overflowed.Load() && s.hasTask() {
-			s.pool.watchBacklog()
+		if !p.starving.Load() {
+			p.starving.Store(true)
 		}
-		return
-	}
-	if (!force && s.runningWorkers.Load() >= s.targetWorkers) ||
-		!s.pool.reserveWorker(force || s.runningWorkers.Load() == 0) {
-		s.wakingWorkers.Add(-1)
-		// 最后一个 worker 可能刚挂起；立即重试，不把普通唤醒延迟到监测 tick。
-		if s.runningWorkers.Load() == 0 {
-			s.notify(false)
-		} else if s.hasTask() {
-			s.pool.watchBacklog()
-		}
-		return
-	}
-	s.runningWorkers.Add(1)
-	for {
-		idle := s.idleWorkers.Load()
-		if idle == 0 {
-			break
-		}
-		id := bits.TrailingZeros64(idle)
-		if s.idleWorkers.CompareAndSwap(idle, idle&^(1<<id)) {
-			s.wakeups[id] <- struct{}{}
+		if !p.hasIdleWorker() {
 			return
 		}
 	}
+}
+
+// wakeIdle wakes the suspended worker of s with the lowest id (its stack and caches are the hottest) to serve target,
+// handing it the target's wakingWorkers the caller holds; it reports false when s has none suspended.
+func (s *shard) wakeIdle(target *shard) bool {
+	for w := range (s.liveWorkers.Load() + 63) / 64 {
+		word := &s.idleWorkers[w]
+		for {
+			idle := word.Load()
+			if idle == 0 {
+				break
+			}
+			bit := bits.TrailingZeros64(idle)
+			if word.CompareAndSwap(idle, idle&^(1<<bit)) {
+				s.wakeups[int(w)*64+bit] <- target // only the one that clears the bit sends: the buffer of 1 never blocks
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// start starts a new worker of s that serves target first, handing it the target's wakingWorkers the caller holds; it
+// reports false when s has maxWorkers workers already.
+func (s *shard) start(target *shard) bool {
 	for {
 		live := s.liveWorkers.Load()
 		if live >= s.maxWorkers {
-			s.runningWorkers.Add(-1)
-			s.pool.runningWorkers.Add(-1)
-			s.wakingWorkers.Add(-1)
-			// worker 可能刚公布 idle，却因本次唤醒权尚未释放而没能通知自己。
-			if s.idleWorkers.Load() != 0 {
-				s.notify(force)
-			}
-			return
+			return false
 		}
 		if s.liveWorkers.CompareAndSwap(live, live+1) {
-			wakeup := make(chan struct{}, 1)
+			wakeup := make(chan *shard, 1)
 			s.wakeups[live] = wakeup
-			go s.work(live, wakeup)
-			return
+			go s.work(live, wakeup, target)
+			return true
 		}
 	}
 }
 
-// work is the worker with id id: it takes and runs tasks until the queue is empty, then suspends waiting for a wakeup.
-func (s *shard) work(id int32, wakeup chan struct{}) {
+// borrow finds a worker for target, a shard whose workers are all running tasks with no room for another: a suspended
+// worker of another shard, or else a new worker started in another shard that has room. The worker takes over the
+// target's wakingWorkers the caller holds; borrow reports false when the whole pool has none to give.
+func (p *Pool) borrow(target *shard) bool {
+	count := len(p.shards)
+	first := int(cheaprandn(uint32(count)))
+	for i := range count {
+		if s := &p.shards[(first+i)%count]; s != target && s.wakeIdle(target) {
+			return true
+		}
+	}
+	for i := range count {
+		if s := &p.shards[(first+i)%count]; s != target && s.start(target) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasIdleWorker reports whether any shard has a suspended worker.
+func (p *Pool) hasIdleWorker() bool {
+	for i := range p.shards {
+		s := &p.shards[i]
+		for w := range (s.liveWorkers.Load() + 63) / 64 {
+			if s.idleWorkers[w].Load() != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// work is the worker with id id of shard s: it takes and runs the tasks of target (s itself, or a shard s lent it to)
+// until that queue is empty, then suspends in s waiting for a wakeup, which names the shard to serve next.
+func (s *shard) work(id int32, wakeup chan *shard, target *shard) {
 	// The loop never ends; the only way out is a task calling runtime.Goexit (which recover cannot stop). A replacement
-	// worker is then started with the same id: it is still counted in liveWorkers, and without the replacement this
-	// shard would be one worker short forever.
-	// Goexit 的替代 worker 继承当前运行名额，只重新登记唤醒，不重复预留预算。
+	// worker is then started with the same id, on its way back to the same queue: it is still counted in liveWorkers,
+	// and without the replacement this shard would be one worker short forever.
 	defer func() {
-		s.wakingWorkers.Add(1)
-		go s.work(id, wakeup)
+		target.wakingWorkers.Add(1)
+		go s.work(id, wakeup, target)
 	}()
+	p := s.pool
+	word, bit := &s.idleWorkers[id/64], uint64(1)<<(id%64)
 	for {
-		s.wakingWorkers.Add(-1) // the queue has been reached
-		for task := s.take(); task != nil; task = s.take() {
+		target.wakingWorkers.Add(-1) // the queue has been reached
+		for task := target.pop(); task != nil; task = target.pop() {
 			// While tasks are still queued, first make sure a worker comes to take them, then run this one: it may take
 			// a while, and the tasks behind it need not wait for it.
-			if s.hasTask() {
-				s.notify(false)
+			if target.hasTask() {
+				target.notify()
 			}
 			run(task)
 		}
-		s.overflowed.Store(false)
-		s.runningWorkers.Add(-1)
-		s.pool.runningWorkers.Add(-1)
-		s.idleWorkers.Or(1 << id)
+		word.Or(bit)
 		// Look at the queue once more after registering as suspended: a submitter may have enqueued only after the last
 		// pop above, at a time when this worker was not yet visible as suspended.
 		if s.hasTask() {
-			s.notify(false)
+			s.notify()
 		}
-		<-wakeup
-	}
-}
-
-// take pops a task from this shard's queue or, once that is empty, steals one from another shard, so a worker only
-// suspends when every queue is empty: otherwise a task waits behind its shard's busy worker while the workers of
-// other shards suspend and have to be woken again, which under load costs more than the tasks themselves. Each shard
-// still wakes its own workers for its own tasks (see notify), so stealing only adds consumers and loses no wakeup.
-func (s *shard) take() func() {
-	if task := s.pop(); task != nil {
-		return task
-	}
-	shards := s.pool.shards
-	start := int(cheaprandn(uint32(len(shards))))
-	for i := range shards {
-		if other := &shards[(start+i)%len(shards)]; other != s && other.hasTask() {
-			if task := other.pop(); task != nil {
-				return task
+		// A shard found no worker anywhere in the pool: now that this one is suspended, notify every shard once. The
+		// flag is cleared first, so a shard that still finds none sets it again.
+		if p.starving.Load() && p.starving.CompareAndSwap(true, false) {
+			for i := range p.shards {
+				p.shards[i].notify()
 			}
 		}
+		target = <-wakeup
 	}
-	return nil
 }
 
 // help runs task when the queue is full, then helps take the remaining tasks in the queue before exiting.

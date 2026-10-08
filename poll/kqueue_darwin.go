@@ -4,7 +4,6 @@ package poll
 
 import (
 	"os"
-	"runtime"
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
@@ -17,18 +16,16 @@ var zeroTimeout unix.Timespec
 type Poller struct {
 	kqueueFd int
 	waking   atomic.Bool // coalesces concurrent Wake calls, avoiding triggering the user event repeatedly
-	events   []unix.Kevent_t
-	timeout  *unix.Timespec // &zeroTimeout when the previous round had events (poll non-blocking first), otherwise nil (blocking)
 }
 
-// New creates a Poller.
+// New creates a Poller, whose waits block the calling thread in the kernel.
 func New() (*Poller, error) {
 	kq, err := unix.Kqueue()
 	if err != nil {
 		return nil, os.NewSyscallError("kqueue", err)
 	}
 	unix.CloseOnExec(kq)
-	p := &Poller{kqueueFd: kq, events: make([]unix.Kevent_t, 1024)}
+	p := &Poller{kqueueFd: kq}
 	// Register the user event (EV_CLEAR: reset automatically once retrieved), used to wake up from another goroutine.
 	if err := p.ctl(0, unix.EVFILT_USER, unix.EV_ADD|unix.EV_CLEAR, 0); err != nil {
 		unix.Close(kq)
@@ -37,15 +34,8 @@ func New() (*Poller, error) {
 	return p, nil
 }
 
-// NewBlocking creates a Poller for Poll and Block; with kqueue it is the same as New, whose waits already block the
-// calling thread in the kernel.
-func NewBlocking() (*Poller, error) { return New() }
-
 // Close releases the fd the Poller occupies.
 func (p *Poller) Close() error { return os.NewSyscallError("close", unix.Close(p.kqueueFd)) }
-
-// AddRead registers fd, watching for readable events.
-func (p *Poller) AddRead(fd int) error { return p.ctl(fd, unix.EVFILT_READ, unix.EV_ADD, 0) }
 
 // AddListener registers a listening socket, edge-triggered (EV_CLEAR): one notification when connections arrive,
 // after which they are accepted until EAGAIN.
@@ -86,7 +76,7 @@ func (p *Poller) ctl(fd int, filter int16, flags uint16, fflags uint32) error {
 	return os.NewSyscallError("kevent", err)
 }
 
-// Wake wakes the event loop blocked in Wait, or one goroutine blocked in Block; it may be called from any goroutine.
+// Wake wakes one goroutine blocked in Block; it may be called from any goroutine.
 func (p *Poller) Wake() error {
 	if !p.waking.CompareAndSwap(false, true) {
 		return nil // there is already a wakeup signal that has not been consumed
@@ -96,39 +86,6 @@ func (p *Poller) Wake() error {
 		p.waking.Store(false)
 	}
 	return err
-}
-
-// Wait waits for ready events and invokes fn for every ready fd; if a Wake signal arrives in the meantime it returns
-// woken=true. When interrupted by a signal or when this round has no events it returns (false, nil), and the caller
-// should call it in a loop.
-//
-// The strategy: when the previous round had events, this round polls without blocking first, and if there are no events
-// it yields the CPU and then switches to blocking, reducing the thread-switching cost of blocking syscalls while busy.
-func (p *Poller) Wait(fn func(fd int, ev Event)) (woken bool, err error) {
-	n, err := unix.Kevent(p.kqueueFd, nil, p.events, p.timeout)
-	if n <= 0 || err != nil {
-		if err != nil && err != unix.EINTR {
-			return false, os.NewSyscallError("kevent", err)
-		}
-		if p.timeout != nil {
-			p.timeout = nil
-			runtime.Gosched()
-		}
-		return false, nil
-	}
-	p.timeout = &zeroTimeout
-	for i := range n {
-		ev := &p.events[i]
-		if ev.Filter == unix.EVFILT_USER {
-			p.waking.Store(false) // reset first and let the caller handle the tasks after, so later Wake calls are not lost
-			woken = true
-			continue
-		}
-		if fd, e, ok := convert(ev); ok {
-			fn(fd, e)
-		}
-	}
-	return woken, nil
 }
 
 // Batch holds the events one Poll or Block call retrieved; goroutines polling at the same time each need their own.
