@@ -3,29 +3,27 @@
 package fnet
 
 import (
+	"context"
 	"errors"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// listener is one listening socket: the fd connections are accepted on, and the address it is bound to.
-type listener struct {
-	fd   int
-	addr net.Addr
-}
-
 // Server is a TCP server based on the main/sub-reactor model.
 type Server struct {
-	handler   Handler
-	opts      Options
-	listeners []listener    // the listening sockets, watched by the first loop's Poller (see loop.accept)
-	loops     []*loop       // sub-reactors
-	nextLoop  atomic.Uint32 // round-robin over the loops for the accepted connections
+	handler     Handler
+	opts        Options
+	addrs       []net.Addr    // the addresses listened on, one per address given to NewServerAddrs
+	listenerFds []int         // the listening sockets, one per address and loop or one per address (see listenerPerLoop)
+	loops       []*loop       // sub-reactors
+	nextLoop    atomic.Uint32 // round-robin over the loops for the connections of a listener they share
 	// acceptMu is held for reading while a connection is accepted and counted in openConnsWg, and taken once for
 	// writing by Serve after setting draining, so that no connection is counted once it waits for them.
 	acceptMu sync.RWMutex
@@ -66,7 +64,7 @@ func NewServerAddrs(addrs []string, handler Handler, opts Options) (*Server, err
 		closing: make(chan struct{}),
 		done:    make(chan struct{}),
 	}
-	// The loops come first: the first one watches the listeners.
+	// The loops come first: they watch the listeners.
 	for range s.opts.NumLoops {
 		l, err := newLoop(s)
 		if err != nil {
@@ -75,33 +73,33 @@ func NewServerAddrs(addrs []string, handler Handler, opts Options) (*Server, err
 		}
 		s.loops = append(s.loops, l)
 	}
+	sockets := 1
+	if listenerPerLoop {
+		sockets = len(s.loops)
+	}
 	for _, addr := range addrs {
-		fd, laddr, err := listen(addr)
+		fds, laddr, err := listen(addr, sockets)
 		if err != nil {
 			s.release()
 			return nil, err
 		}
-		if err := s.loops[0].watchListener(fd); err != nil {
-			unix.Close(fd) // not in s.listeners yet, so release does not cover it
-			s.release()
-			return nil, err
+		s.addrs = append(s.addrs, laddr)
+		s.listenerFds = append(s.listenerFds, fds...) // release closes them from here on
+		for i, fd := range fds {
+			if err := s.loops[i].watchListener(fd); err != nil {
+				s.release()
+				return nil, err
+			}
 		}
-		s.listeners = append(s.listeners, listener{fd: fd, addr: laddr})
 	}
 	return s, nil
 }
 
 // Addr returns the first address actually being listened on; see Addrs for all of them.
-func (s *Server) Addr() net.Addr { return s.listeners[0].addr }
+func (s *Server) Addr() net.Addr { return s.addrs[0] }
 
 // Addrs returns all the addresses actually being listened on, in the order they were given to NewServerAddrs.
-func (s *Server) Addrs() []net.Addr {
-	addrs := make([]net.Addr, 0, len(s.listeners))
-	for _, ln := range s.listeners {
-		addrs = append(addrs, ln.addr)
-	}
-	return addrs
-}
+func (s *Server) Addrs() []net.Addr { return slices.Clone(s.addrs) }
 
 // Serve starts the sub-reactors' workers, which accept the connections and hand their tasks to the Executor, and blocks
 // until Close is called (returning ErrServerClosed) or a fatal error occurs.
@@ -200,26 +198,30 @@ func (s *Server) tick() {
 }
 
 func (s *Server) release() {
-	for _, ln := range s.listeners {
-		unix.Close(ln.fd)
+	for _, fd := range s.listenerFds {
+		unix.Close(fd)
 	}
 	for _, l := range s.loops {
 		l.close()
 	}
 }
 
-// acceptConn accepts a connection on listenerFd for a loop chosen in round-robin order, with its open task pending
-// (see loop.watch), and counts it in openConnsWg; it returns nil when there is none left to accept or the server is
-// draining.
-func (s *Server) acceptConn(listenerFd int) *conn {
+// acceptConn accepts a connection on listenerFd, a listener of loop l, with its open task pending (see loop.watch), and
+// counts it in openConnsWg; it returns nil when there is none left to accept or the server is draining. The connection
+// belongs to l, or, when the loops share the listener (see listenerPerLoop), to a loop chosen in round-robin order.
+func (s *Server) acceptConn(listenerFd int, l *loop) *conn {
 	s.acceptMu.RLock()
 	defer s.acceptMu.RUnlock()
 	for !s.draining.Load() {
 		fd, remote, err := accept(listenerFd)
 		if err == nil {
-			l := s.loops[s.nextLoop.Add(1)%uint32(len(s.loops))]
+			if !listenerPerLoop {
+				l = s.loops[s.nextLoop.Add(1)%uint32(len(s.loops))]
+			}
 			c := &conn{fd: fd, loop: l, remote: remote}
-			c.task = c.run
+			if s.opts.Executor != nil {
+				c.task = c.run
+			}
 			c.state.Store(scheduledBit | evOpen)
 			s.openConnsWg.Add(1) // decremented again in close after the OnClose callback has finished
 			return c
@@ -245,11 +247,53 @@ func (s *Server) acceptConn(listenerFd int) *conn {
 	return nil
 }
 
-// listen creates the listening socket with the help of the standard library (address resolution, dual stack,
-// SO_REUSEADDR and backlog are all handled by the standard library), then duplicates a separate fd for the
-// server to manage, after which the standard library's listener is closed right away.
-func listen(addr string) (int, net.Addr, error) {
-	ln, err := net.Listen("tcp", addr)
+// listen creates n listening sockets on addr, sharing it through SO_REUSEPORT when n > 1, and returns the address
+// actually listened on.
+//
+// The first socket is bound like net.Listen's, without the option, so that an address in use is reported as such rather
+// than shared with another process listening on it with SO_REUSEPORT. It takes the option once it listens, which lets
+// the others join it on the address it got (its port, for port 0).
+func listen(addr string, n int) ([]int, net.Addr, error) {
+	fd, laddr, err := listenSocket(addr, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	fds := []int{fd}
+	if n > 1 {
+		err = os.NewSyscallError("setsockopt", unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1))
+	}
+	for len(fds) < n && err == nil {
+		if fd, _, err = listenSocket(laddr.String(), true); err == nil {
+			fds = append(fds, fd)
+		}
+	}
+	if err != nil {
+		for _, fd := range fds {
+			unix.Close(fd)
+		}
+		return nil, nil, err
+	}
+	return fds, laddr, nil
+}
+
+// listenSocket creates a listening socket with the help of the standard library (address resolution, dual stack,
+// SO_REUSEADDR and backlog are all handled by the standard library), setting its options (see setListenerOptions) and,
+// with reusePort, SO_REUSEPORT before it is bound; it then duplicates a separate fd for the server to manage, after which
+// the standard library's listener is closed right away.
+func listenSocket(addr string, reusePort bool) (int, net.Addr, error) {
+	lc := net.ListenConfig{Control: func(_, _ string, rc syscall.RawConn) error {
+		var err error
+		if cerr := rc.Control(func(fd uintptr) {
+			setListenerOptions(int(fd))
+			if reusePort {
+				err = os.NewSyscallError("setsockopt", unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1))
+			}
+		}); cerr != nil {
+			return cerr
+		}
+		return err
+	}}
+	ln, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		return -1, nil, err
 	}

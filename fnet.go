@@ -1,11 +1,15 @@
 // Package fnet is an event-driven TCP network library based on the Reactor model.
 //
 // On Linux (epoll) / macOS (kqueue) it uses a main/sub-reactor structure:
-//   - listeners (a server may listen on several addresses): watched by the first sub-reactor's Poller; the
-//     worker that finds one ready accepts, distributing the connections to the sub-reactors in round-robin order;
+//   - listeners (a server may listen on several addresses): on Linux every sub-reactor listens on each address
+//     with a socket of its own, sharing it through SO_REUSEPORT, so that the kernel spreads the connections over
+//     them and each accepts and keeps its own; on macOS the first sub-reactor's Poller watches the one listener of
+//     each address, and the connections are distributed to the sub-reactors in round-robin order. The worker that
+//     finds a listener ready accepts;
 //   - sub-reactor (event loop): a Poller for the events of the connections it owns (edge-triggered), polled by
-//     the loop's worker, which hands the tasks of the connections it finds ready to the executor (see
-//     Options.Executor), helps the other loops when its own has nothing to do, and only then waits in the kernel;
+//     the loop's worker, by default one per loop and one loop per P, which hands the tasks of the connections it
+//     finds ready to the executor (see Options.Executor), helps the other loops when its own has nothing to do,
+//     and only then waits in the kernel;
 //   - connection task: run by the executor, it reads the data, invokes the Handler callbacks, keeps draining the
 //     send buffer and closes the connection; a connection has at most one task at a time, and the data read
 //     borrows a buffer from a pool that is returned as soon as the callback returns;
@@ -150,7 +154,8 @@ func (c *detachedConn) WriteTo(w io.Writer) (int64, error) {
 
 // Options holds the engine parameters; the zero value is the default configuration.
 type Options struct {
-	// NumLoops is the number of sub-reactors (event loops); max(2, runtime.GOMAXPROCS(0)/8) when <=0. Linux/macOS only.
+	// NumLoops is the number of sub-reactors (event loops); runtime.GOMAXPROCS(0) when <=0, so that every worker has a
+	// Poller of its own (see Executor). Linux/macOS only.
 	NumLoops int
 	// ReadBufferSize is the buffer size of a single read; 16KB when <=0. A connection's task borrows from the
 	// buffer pool only while reading and returns the buffer once the callback returns, so idle connections
@@ -172,7 +177,7 @@ type Options struct {
 
 func (o Options) withDefaults() Options {
 	if o.NumLoops <= 0 {
-		o.NumLoops = max(2, runtime.GOMAXPROCS(0)/8)
+		o.NumLoops = runtime.GOMAXPROCS(0)
 	}
 	if o.ReadBufferSize <= 0 {
 		o.ReadBufferSize = 16 * units.KB

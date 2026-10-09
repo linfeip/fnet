@@ -518,18 +518,14 @@ func TestNewServerAddrsPartialBindFailure(t *testing.T) {
 	again.Close()
 }
 
-// TestDefaultNumLoopsFollowsGOMAXPROCS verifies the default number of event loops is one eighth of the Ps the
-// process may actually use, with a minimum of two: GOMAXPROCS can be lower than runtime.NumCPU() (taskset, a
-// container CPU quota, an explicit setting), and loops beyond the Ps only compete with the tasks for them.
+// TestDefaultNumLoopsFollowsGOMAXPROCS verifies the default number of event loops is the number of Ps the process
+// may actually use: GOMAXPROCS can be lower than runtime.NumCPU() (taskset, a container CPU quota, an explicit
+// setting), and the loops' workers are sized by the Ps.
 func TestDefaultNumLoopsFollowsGOMAXPROCS(t *testing.T) {
 	previous := runtime.GOMAXPROCS(24)
 	defer runtime.GOMAXPROCS(previous)
-	if got := (Options{}).withDefaults().NumLoops; got != 3 {
-		t.Fatalf("默认 NumLoops = %d, 期望 GOMAXPROCS(0)/8 = 3", got)
-	}
-	runtime.GOMAXPROCS(15)
-	if got := (Options{}).withDefaults().NumLoops; got != 2 {
-		t.Fatalf("默认 NumLoops = %d, 期望最小值 2", got)
+	if got := (Options{}).withDefaults().NumLoops; got != 24 {
+		t.Fatalf("默认 NumLoops = %d, 期望 GOMAXPROCS(0) = 24", got)
 	}
 	if got := (Options{NumLoops: 5}).withDefaults().NumLoops; got != 5 {
 		t.Fatalf("显式 NumLoops 被覆盖: %d", got)

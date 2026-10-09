@@ -79,15 +79,14 @@ func (c *conn) handle(ev uint32) {
 		return
 	}
 	if ev&evOpen != 0 {
-		// The connection is watched and its socket options are set here rather than where it is accepted: accepts on
-		// a listener are serialized (the kernel locks it), and doing it there would put an epoll_ctl and five
-		// setsockopt calls per connection on that path, capping the rate at which connections are accepted. Nothing is written to the
-		// socket before OnOpen, so the options are in place before the first byte goes out.
+		// The connection is watched here rather than where it is accepted: accepts on a listener are serialized (the
+		// kernel locks it), and an epoll_ctl per connection on that path would cap the rate at which connections are
+		// accepted. Nothing is written to the socket before OnOpen, so its options are in place before the first byte
+		// goes out.
 		if !c.loop.watch(c) {
 			return
 		}
-		unix.SetsockoptInt(c.fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-		setKeepAlive(c.fd)
+		setConnOptions(c.fd)
 		c.loop.srv.handler.OnOpen(c)
 	}
 	// The poller reports a writable socket along with every event, so evWrite is nearly always set: only a backlog

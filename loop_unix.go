@@ -46,13 +46,13 @@ func (l *loop) watchListener(fd int) error {
 	return nil
 }
 
-// accept accepts the connections waiting on the listening socket fd until there are none left, handing them to the
-// loops in round-robin order, whatever listener they arrived on, so that they spread evenly; the first task of each
-// watches it (see watch), sets its socket options and invokes OnOpen. The listener is edge-triggered and a worker finds
-// it like any connection: while one accepts, the connections arriving meanwhile bring in other workers, which accept
-// at the same time, and no goroutine waits in the netpoller for the listener.
+// accept accepts the connections waiting on the loop's listening socket fd until there are none left; they belong to the
+// loop, or are spread over the loops in round-robin order when the loops share the listener (see listenerPerLoop). The
+// first task of each watches it (see watch) and invokes OnOpen. The listener is edge-triggered and a worker finds it
+// like any connection: while one accepts, the connections arriving meanwhile bring in other workers polling the loop,
+// which accept at the same time, and no goroutine waits in the netpoller for the listener.
 func (l *loop) accept(listenerFd int) {
-	for c := l.srv.acceptConn(listenerFd); c != nil; c = l.srv.acceptConn(listenerFd) {
+	for c := l.srv.acceptConn(listenerFd, l); c != nil; c = l.srv.acceptConn(listenerFd, l) {
 		c.schedule()
 	}
 }

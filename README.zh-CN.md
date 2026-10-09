@@ -33,13 +33,14 @@
 依赖方向是单向的：`websocket → fhttp → fnet → poll`，以及 `fnet → taskpool`。
 
 ```text
-listener ─▶ 主 Reactor（accept）── 轮询 ─▶ 子 Reactor 0 … N-1   （每个：1 个 epoll/kqueue + 1 个 worker）
-                                                │ worker 探测到连接就绪
-                                                ▼
+listeners（SO_REUSEPORT）─▶ 子 Reactor 0 … N-1   （每个：自己的 listener、1 个 epoll/kqueue + 它的 worker；N = GOMAXPROCS）
+                                  │ worker 探测到 listener 或连接就绪
+                                  ▼
                  执行器（taskpool）：同一连接同一时刻一个任务
                  读取（借用缓冲）→ OnData → 续发发送缓冲 → 关闭、OnClose
 ```
 
+- **并行 accept**：Linux 上每个子 Reactor 用自己的 socket 监听同一地址（`SO_REUSEPORT`），自己 accept 到的连接由自己处理，accept 并行进行，连接留在接受它的 worker 上；`TCP_NODELAY` 和 keepalive 只在 listener 上设置一次，accept 出来的 socket 直接继承。macOS 上每个地址一个 listener，按轮询分给各子 Reactor。
 - **一连接一任务**：读取、回调、关闭都在连接的任务里串行完成，同一连接的回调不会重叠且保序。没有每连接一个 goroutine，也没有入站队列。
 - **零拷贝读取，内核背压**：数据直接从借用的缓冲交给 `OnData`。回调返回之前不会再读取该连接，处理慢时由 TCP 流量控制限速，而不是在内存里堆积。
 - **HTTP**：回调里只找每个请求的结束位置（头部结束符 `\r\n\r\n`，以及不超过 `MaxBufferedBodyBytes`（默认 1MB）的 `Content-Length` 请求体），解析和请求体交给 `http.ReadRequest`；Handler 运行在只在连接有待处理请求时才存在的 goroutine 中。更大的或 chunked 的请求体（例如大文件上传）改由 `net/http` 流式处理：连接从 `fnet` 摘下（`Conn.Detach`），交给运行同一个 Handler 的内部 `http.Server`，处理完这个请求后关闭连接。

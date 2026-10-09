@@ -167,9 +167,14 @@ func checkHandshake(r *http.Request) (key string, err error) {
 	return key, nil
 }
 
-// acceptKey computes Sec-WebSocket-Accept (RFC 6455 4.2.2).
+// acceptGUID is the GUID RFC 6455 appends to the key to compute Sec-WebSocket-Accept.
+const acceptGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// acceptKey computes Sec-WebSocket-Accept (RFC 6455 4.2.2). The key and the GUID are joined in a buffer on the stack:
+// checkHandshake lets only 24-byte keys through.
 func acceptKey(key string) string {
-	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	var buf [24 + len(acceptGUID)]byte
+	sum := sha1.Sum(append(append(buf[:0], key...), acceptGUID...))
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 

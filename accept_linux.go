@@ -41,6 +41,22 @@ func networkPort(port uint16) uint16 {
 	return uint16(b[0])<<8 | uint16(b[1])
 }
 
+// listenerPerLoop: every loop listens on each address with a socket of its own, sharing the address through
+// SO_REUSEPORT, and serves the connections it accepts. The kernel spreads the incoming connections over the sockets, so
+// the loops accept in parallel instead of contending for one listener, and a connection stays with the worker that
+// accepted it.
+const listenerPerLoop = true
+
+// setListenerOptions sets TCP_NODELAY and keepalive on a listening socket before it is bound: Linux copies them to the
+// connections accepted from it, which need no setsockopt of their own (see setConnOptions).
+func setListenerOptions(fd int) {
+	unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	setKeepAlive(fd)
+}
+
+// setConnOptions sets the options of an accepted connection: none, it inherits them from its listener.
+func setConnOptions(int) {}
+
 // setKeepAlive enables TCP keepalive with the same parameters as the standard library net defaults: probing starts
 // after 15s of idle time, at a 15s interval, and the connection is considered down after 9 unanswered probes.
 func setKeepAlive(fd int) {

@@ -53,6 +53,37 @@ func loopFds(l *loop) []int {
 	return fds
 }
 
+// TestListenerPerLoop checks how the loops listen: with listenerPerLoop every loop has a socket of its own on the
+// address and keeps the connections it accepts, otherwise the first loop listens for all of them; either way the
+// connections spread over the loops, and the address stays the server's alone, so a second server on it fails as it
+// would with net.Listen.
+func TestListenerPerLoop(t *testing.T) {
+	const numLoops, numConns = 4, 64
+	opened := make(chan *conn, numConns)
+	srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c.(*conn) }}, Options{NumLoops: numLoops})
+	for i, l := range srv.loops {
+		want := 0
+		if listenerPerLoop || i == 0 {
+			want = 1
+		}
+		if len(l.listenerFds) != want {
+			t.Fatalf("loop %d 监听了 %d 个 socket, 期望 %d", i, len(l.listenerFds), want)
+		}
+	}
+	loops := map[*loop]bool{}
+	for range numConns {
+		dial(t, srv)
+		loops[(<-opened).loop] = true
+	}
+	if len(loops) < 2 {
+		t.Fatalf("%d 个连接只落在了 %d 个 loop 上", numConns, len(loops))
+	}
+	if other, err := NewServer(srv.Addr().String(), &funcHandler{}, Options{NumLoops: numLoops}); err == nil {
+		other.Close()
+		t.Fatalf("%v 已被监听, NewServer 应返回错误", srv.Addr())
+	}
+}
+
 // TestCollectConnsDropsClosed checks that the loop's connection list catches up with connections that have closed:
 // they are not returned and are dropped from the list, while the ones still open are returned.
 func TestCollectConnsDropsClosed(t *testing.T) {
