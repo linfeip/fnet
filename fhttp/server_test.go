@@ -539,3 +539,46 @@ func TestTimeouts(t *testing.T) {
 		}
 	})
 }
+
+func TestParseFastUpgradeRequest(t *testing.T) {
+	msg := []byte("GET /ws HTTP/1.1\r\nHost: 127.0.0.1:18080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+	fast := parseFastUpgradeRequest(msg)
+	if fast == nil {
+		t.Fatal("expected non-nil fastUpgradeRequest")
+	}
+	defer releaseFastUpgradeRequest(fast)
+
+	req := &fast.request
+	if req.Method != "GET" || req.Proto != "HTTP/1.1" || req.ProtoMajor != 1 || req.ProtoMinor != 1 {
+		t.Fatalf("unexpected request line: %+v", req)
+	}
+	if req.Host != "127.0.0.1:18080" || req.URL.Path != "/ws" {
+		t.Fatalf("unexpected host or path: host=%q path=%q", req.Host, req.URL.Path)
+	}
+	if req.Header.Get("Upgrade") != "websocket" || req.Header.Get("Connection") != "Upgrade" ||
+		req.Header.Get("Sec-WebSocket-Version") != "13" || req.Header.Get("Sec-WebSocket-Key") != "dGhlIHNhbXBsZSBub25jZQ==" {
+		t.Fatalf("unexpected headers: %+v", req.Header)
+	}
+
+	// Missing Host
+	if fast2 := parseFastUpgradeRequest([]byte("GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")); fast2 != nil {
+		t.Fatal("expected nil for missing Host")
+	}
+
+	// Plain GET request
+	if fast3 := parseFastUpgradeRequest([]byte("GET /hello HTTP/1.1\r\nHost: a\r\n\r\n")); fast3 != nil {
+		t.Fatal("expected nil for plain GET")
+	}
+}
+
+func BenchmarkParseFastUpgradeRequest(b *testing.B) {
+	msg := []byte("GET /ws HTTP/1.1\r\nHost: 127.0.0.1:18080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		fast := parseFastUpgradeRequest(msg)
+		if fast == nil {
+			b.Fatal("nil")
+		}
+		releaseFastUpgradeRequest(fast)
+	}
+}

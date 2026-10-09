@@ -33,14 +33,14 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 Dependencies are one-way: `websocket → fhttp → fnet → poll`, and `fnet → taskpool`.
 
 ```text
-listeners (SO_REUSEPORT) ─▶ sub-reactor 0 … N-1   (each: its own listener, 1 epoll/kqueue + its worker; N = max(2, GOMAXPROCS/8))
+listeners (SO_REUSEPORT) ─▶ sub-reactor 0 … N-1   (each: 1 epoll/kqueue + its worker, with ReusePort also its own listener; N = max(2, GOMAXPROCS/8))
                                      │ a worker polls, accepts or finds a connection ready
                                      ▼
                  executor (taskpool): one task per connection at a time
                  read (borrowed buffer) → OnData → flush the send buffer → close, OnClose
 ```
 
-- **Parallel accept**: on Linux every sub-reactor listens on the address with a socket of its own (`SO_REUSEPORT`) and keeps the connections it accepts, so accepts run in parallel and a connection stays with the worker that accepted it; `TCP_NODELAY` and keepalive are set once on the listener, which the accepted sockets inherit. On macOS one listener per address feeds the sub-reactors in round-robin order.
+- **Parallel accept**: with `Options.ReusePort`, on Linux every sub-reactor listens on the address with a socket of its own (`SO_REUSEPORT`) and keeps the connections it accepts, so accepts run in parallel and a connection stays with the worker that accepted it; otherwise, and always on macOS, one listener per address feeds the sub-reactors in round-robin order. On Linux keepalive and `TCP_NODELAY` (with `Options.NoDelay`) are set once on the listener, which the accepted sockets inherit.
 - **One task per connection**: reading, callbacks and closing run serially in the connection's task, so the callbacks of one connection never overlap and stay in order. There is no goroutine per connection and no inbound queue.
 - **Zero-copy reads, kernel backpressure**: data is handed to `OnData` straight from a borrowed buffer. A connection is not read again until its callback returns, so a slow handler is throttled by TCP flow control instead of piling up memory.
 - **HTTP**: the callback only looks for the end of each request (the header terminator `\r\n\r\n`, then a `Content-Length` body of up to `MaxBufferedBodyBytes`, 1MB by default); parsing and the body are left to `http.ReadRequest`, and the Handler runs on a goroutine that exists only while the connection has pending requests. A larger or chunked body (say a big file upload) is streamed by `net/http` instead: the connection is detached from `fnet` (`Conn.Detach`) and handed to an internal `http.Server` running the same Handler, which closes it after that request.

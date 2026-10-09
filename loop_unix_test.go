@@ -3,6 +3,7 @@
 package fnet
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"runtime"
@@ -53,34 +54,42 @@ func loopFds(l *loop) []int {
 	return fds
 }
 
-// TestListenerPerLoop checks how the loops listen: with listenerPerLoop every loop has a socket of its own on the
-// address and keeps the connections it accepts, otherwise the first loop listens for all of them; either way the
-// connections spread over the loops, and the address stays the server's alone, so a second server on it fails as it
-// would with net.Listen.
+// TestListenerPerLoop checks how the loops listen: with listenerPerLoop (Options.ReusePort where SO_REUSEPORT spreads
+// the connections) every loop has a socket of its own on the address and keeps the connections it accepts, otherwise
+// the first loop listens for all of them; either way the connections spread over the loops, and the address stays the
+// server's alone, so a second server on it fails as it would with net.Listen.
 func TestListenerPerLoop(t *testing.T) {
-	const numLoops, numConns = 4, 64
-	opened := make(chan *conn, numConns)
-	srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c.(*conn) }}, Options{NumLoops: numLoops})
-	for i, l := range srv.loops {
-		want := 0
-		if listenerPerLoop || i == 0 {
-			want = 1
-		}
-		if len(l.listenerFds) != want {
-			t.Fatalf("loop %d 监听了 %d 个 socket, 期望 %d", i, len(l.listenerFds), want)
-		}
-	}
-	loops := map[*loop]bool{}
-	for range numConns {
-		dial(t, srv)
-		loops[(<-opened).loop] = true
-	}
-	if len(loops) < 2 {
-		t.Fatalf("%d 个连接只落在了 %d 个 loop 上", numConns, len(loops))
-	}
-	if other, err := NewServer(srv.Addr().String(), &funcHandler{}, Options{NumLoops: numLoops}); err == nil {
-		other.Close()
-		t.Fatalf("%v 已被监听, NewServer 应返回错误", srv.Addr())
+	for _, reusePort := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ReusePort=%v", reusePort), func(t *testing.T) {
+			const numLoops, numConns = 4, 64
+			opts := Options{NumLoops: numLoops, ReusePort: reusePort}
+			opened := make(chan *conn, numConns)
+			srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c.(*conn) }}, opts)
+			if want := reusePortSpreads && reusePort; srv.listenerPerLoop != want {
+				t.Fatalf("listenerPerLoop = %v, 期望 %v", srv.listenerPerLoop, want)
+			}
+			for i, l := range srv.loops {
+				want := 0
+				if srv.listenerPerLoop || i == 0 {
+					want = 1
+				}
+				if len(l.listenerFds) != want {
+					t.Fatalf("loop %d 监听了 %d 个 socket, 期望 %d", i, len(l.listenerFds), want)
+				}
+			}
+			loops := map[*loop]bool{}
+			for range numConns {
+				dial(t, srv)
+				loops[(<-opened).loop] = true
+			}
+			if len(loops) < 2 {
+				t.Fatalf("%d 个连接只落在了 %d 个 loop 上", numConns, len(loops))
+			}
+			if other, err := NewServer(srv.Addr().String(), &funcHandler{}, opts); err == nil {
+				other.Close()
+				t.Fatalf("%v 已被监听, NewServer 应返回错误", srv.Addr())
+			}
+		})
 	}
 }
 

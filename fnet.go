@@ -1,11 +1,11 @@
 // Package fnet is an event-driven TCP network library based on the Reactor model.
 //
 // On Linux (epoll) / macOS (kqueue) it uses a main/sub-reactor structure:
-//   - listeners (a server may listen on several addresses): on Linux every sub-reactor listens on each address
-//     with a socket of its own, sharing it through SO_REUSEPORT, so that the kernel spreads the connections over
-//     them and each accepts and keeps its own; on macOS the first sub-reactor's Poller watches the one listener of
-//     each address, and the connections are distributed to the sub-reactors in round-robin order. The worker that
-//     finds a listener ready accepts;
+//   - listeners (a server may listen on several addresses): the first sub-reactor's Poller watches the one
+//     listener of each address, and the connections are distributed to the sub-reactors in round-robin order; with
+//     Options.ReusePort on Linux every sub-reactor listens on each address with a socket of its own, sharing it
+//     through SO_REUSEPORT, so that the kernel spreads the connections over them and each accepts and keeps its
+//     own. The worker that finds a listener ready accepts;
 //   - sub-reactor (event loop): a Poller for the events of the connections it owns (edge-triggered), polled by
 //     the loop's worker, one per loop and by default one loop per 8 Ps, which hands the tasks of the connections it
 //     finds ready to the executor (see Options.Executor), helps the other loops when its own has nothing to do,
@@ -176,6 +176,15 @@ type Options struct {
 	// logs the panic), which puts the tasks of a connection always in the shard key selects rather than in a
 	// random one each time. Linux/macOS only.
 	Executor func(key int, task func())
+	// ReusePort has every loop listen on each address with a socket of its own, sharing it through SO_REUSEPORT, so
+	// that the loops accept in parallel and a connection stays with the loop that accepted it; otherwise the loops
+	// share one listening socket per address, from which the connections accepted are spread over them in round-robin
+	// order. Linux only: macOS's SO_REUSEPORT does not spread the connections over the sockets sharing an address, so
+	// the loops always share one listener there.
+	ReusePort bool
+	// NoDelay sets TCP_NODELAY on the accepted connections, so that every write goes out at once; otherwise Nagle's
+	// algorithm coalesces small writes. Linux/macOS only.
+	NoDelay bool
 }
 
 func (o Options) withDefaults() Options {

@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/internal/bytepool"
 	"github.com/linfeip/fnet/internal/units"
+	"github.com/linfeip/fnet/taskpool"
 )
 
 // maxPipeline is the upper bound on requests queued for processing on a single connection; going beyond it is
@@ -324,7 +326,7 @@ func (c *conn) push(data []byte, status int) bool {
 	}
 	c.mu.Unlock()
 	if submit {
-		go c.serve()
+		taskpool.DefaultTaskPool.Submit(c.serve)
 	}
 	return true
 }
@@ -387,6 +389,206 @@ var readerPool = sync.Pool{New: func() any {
 // continueResponse is the interim response that asks the client to send the request body.
 var continueResponse = []byte("HTTP/1.1 100 Continue\r\n\r\n")
 
+// fastUpgradeRequest pools the http.Request, url.URL and Header structures for WebSocket upgrade requests,
+// avoiding the allocations of http.ReadRequest and its large MIMEHeader map.
+type fastUpgradeRequest struct {
+	request http.Request
+	url     url.URL
+	header  http.Header
+	slots   [12][1]string
+}
+
+var fastUpgradePool = sync.Pool{
+	New: func() any {
+		f := &fastUpgradeRequest{header: make(http.Header, 8)}
+		f.request.URL = &f.url
+		f.request.Header = f.header
+		return f
+	},
+}
+
+func releaseFastUpgradeRequest(f *fastUpgradeRequest) {
+	for key := range f.header {
+		delete(f.header, key)
+	}
+	f.url = url.URL{}
+	f.request = http.Request{Header: f.header, URL: &f.url}
+	fastUpgradePool.Put(f)
+}
+
+func parseFastUpgradeRequest(msg []byte) *fastUpgradeRequest {
+	end := bytes.Index(msg, headerTerminator)
+	if end < 0 || end+len(headerTerminator) != len(msg) {
+		return nil
+	}
+	firstLineEnd := bytes.Index(msg, []byte("\r\n"))
+	if firstLineEnd <= 0 || firstLineEnd+2 >= end {
+		return nil
+	}
+	firstLine := msg[:firstLineEnd]
+	if !bytes.HasPrefix(firstLine, []byte("GET ")) || !bytes.HasSuffix(firstLine, []byte(" HTTP/1.1")) {
+		return nil
+	}
+	uriBytes := firstLine[4 : len(firstLine)-9]
+	if len(uriBytes) == 0 || uriBytes[0] != '/' || bytes.ContainsAny(uriBytes, " #%") {
+		return nil
+	}
+	pathBytes := uriBytes
+	var rawQuery string
+	if i := bytes.IndexByte(uriBytes, '?'); i >= 0 {
+		pathBytes = uriBytes[:i]
+		rawQuery = string(uriBytes[i+1:])
+	}
+	path := string(pathBytes)
+
+	f := fastUpgradePool.Get().(*fastUpgradeRequest)
+	req := &f.request
+	req.Method = http.MethodGet
+	req.Proto = "HTTP/1.1"
+	req.ProtoMajor = 1
+	req.ProtoMinor = 1
+	if rawQuery == "" {
+		req.RequestURI = path
+	} else {
+		req.RequestURI = string(uriBytes)
+	}
+	f.url.Path = path
+	f.url.RawQuery = rawQuery
+	req.Body = http.NoBody
+	req.ContentLength = 0
+	req.Close = false
+
+	headers := msg[firstLineEnd+2 : end]
+	slotIndex := 0
+	hasUpgrade := false
+	hasConnection := false
+	hasVersion := false
+	var host string
+
+	for len(headers) > 0 {
+		lineEnd := bytes.Index(headers, []byte("\r\n"))
+		var field []byte
+		if lineEnd < 0 {
+			field, headers = headers, nil
+		} else {
+			field, headers = headers[:lineEnd], headers[lineEnd+2:]
+		}
+		if len(field) == 0 {
+			break
+		}
+		colon := bytes.IndexByte(field, ':')
+		if colon <= 0 || slotIndex >= len(f.slots) {
+			releaseFastUpgradeRequest(f)
+			return nil
+		}
+		name := field[:colon]
+		value := bytes.TrimSpace(field[colon+1:])
+
+		var canonicalKey, val string
+		switch {
+		case bytes.EqualFold(name, []byte("Host")):
+			if host != "" || len(value) == 0 || !validHostBytes(value) {
+				releaseFastUpgradeRequest(f)
+				return nil
+			}
+			host = string(value)
+			req.Host = host
+			continue
+		case bytes.EqualFold(name, []byte("Upgrade")):
+			canonicalKey = "Upgrade"
+			hasUpgrade = bytes.EqualFold(value, []byte("websocket"))
+			if hasUpgrade {
+				val = "websocket"
+			} else {
+				val = string(value)
+			}
+		case bytes.EqualFold(name, []byte("Connection")):
+			canonicalKey = "Connection"
+			hasConnection = bytesHasToken(value, []byte("upgrade"))
+			if bytes.EqualFold(value, []byte("Upgrade")) {
+				val = "Upgrade"
+			} else {
+				val = string(value)
+			}
+		case bytes.EqualFold(name, []byte("Sec-WebSocket-Version")):
+			canonicalKey = "Sec-Websocket-Version"
+			hasVersion = bytes.Equal(value, []byte("13"))
+			if hasVersion {
+				val = "13"
+			} else {
+				val = string(value)
+			}
+		case bytes.EqualFold(name, []byte("Sec-WebSocket-Key")):
+			if len(value) != 24 {
+				releaseFastUpgradeRequest(f)
+				return nil
+			}
+			canonicalKey = "Sec-Websocket-Key"
+			val = string(value)
+		case bytes.EqualFold(name, []byte("Sec-WebSocket-Protocol")):
+			canonicalKey = "Sec-Websocket-Protocol"
+			val = string(value)
+		case bytes.EqualFold(name, []byte("Sec-WebSocket-Extensions")):
+			canonicalKey = "Sec-Websocket-Extensions"
+			val = string(value)
+		case bytes.EqualFold(name, []byte("Origin")):
+			canonicalKey = "Origin"
+			val = string(value)
+		case bytes.EqualFold(name, []byte("User-Agent")):
+			canonicalKey = "User-Agent"
+			val = string(value)
+		case bytes.EqualFold(name, []byte("Cookie")):
+			canonicalKey = "Cookie"
+			val = string(value)
+		default:
+			releaseFastUpgradeRequest(f)
+			return nil
+		}
+
+		if _, exists := f.header[canonicalKey]; exists {
+			releaseFastUpgradeRequest(f)
+			return nil
+		}
+		f.slots[slotIndex][0] = val
+		f.header[canonicalKey] = f.slots[slotIndex][:1]
+		slotIndex++
+	}
+
+	if host == "" || !hasUpgrade || !hasConnection || !hasVersion || f.header.Get("Sec-Websocket-Key") == "" {
+		releaseFastUpgradeRequest(f)
+		return nil
+	}
+
+	return f
+}
+
+func bytesHasToken(value []byte, token []byte) bool {
+	for len(value) > 0 {
+		var part []byte
+		if i := bytes.IndexByte(value, ','); i >= 0 {
+			part, value = value[:i], value[i+1:]
+		} else {
+			part, value = value, nil
+		}
+		if bytes.EqualFold(bytes.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
+}
+
+func validHostBytes(host []byte) bool {
+	for _, c := range host {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case strings.IndexByte("!$%&'()*+,-.:;=[]_~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // handle parses and processes one request, and reports whether to keep the connection alive.
 func (c *conn) handle(r request) bool {
 	switch r.status {
@@ -401,44 +603,59 @@ func (c *conn) handle(r request) bool {
 		c.writeError(r.status)
 		return false
 	}
-	rd := readerPool.Get().(*reader)
-	rd.bytesReader.Reset(r.msg.Bytes())
-	rd.bufferedReader.Reset(&rd.bytesReader)
-	defer func() {
-		rd.bytesReader.Reset(nil)
-		readerPool.Put(rd)
-	}()
 
-	req, err := http.ReadRequest(rd.bufferedReader)
-	if err != nil {
-		c.writeError(http.StatusBadRequest)
-		return false
+	var (
+		req     *http.Request
+		cleanup func()
+	)
+	msg := r.msg.Bytes()
+	if fast := parseFastUpgradeRequest(msg); fast != nil {
+		req = &fast.request
+		cleanup = func() { releaseFastUpgradeRequest(fast) }
+	} else {
+		rd := readerPool.Get().(*reader)
+		rd.bytesReader.Reset(msg)
+		rd.bufferedReader.Reset(&rd.bytesReader)
+		defer func() {
+			rd.bytesReader.Reset(nil)
+			readerPool.Put(rd)
+		}()
+
+		var err error
+		req, err = http.ReadRequest(rd.bufferedReader)
+		if err != nil {
+			c.writeError(http.StatusBadRequest)
+			return false
+		}
+		// Same as the net/http server: only HTTP/1.x is supported, and it is rejected before Host is checked.
+		if req.ProtoMajor != 1 {
+			c.writeError(http.StatusHTTPVersionNotSupported)
+			return false
+		}
+		// The message ends where framer said, so what the standard library takes for the body must be exactly the rest
+		// of it. Otherwise the two disagree on the framing: a field framer did not recognize (see bodyLength), or an empty
+		// line made of a bare LF, which the standard library accepts as a line break, ending the headers early. The
+		// remainder must not be silently discarded or executed (an upstream proxy may frame it differently, misaligning
+		// the responses), so it is handled as a bad request.
+		if int64(rd.bufferedReader.Buffered()+rd.bytesReader.Len()) != req.ContentLength {
+			c.writeError(http.StatusBadRequest)
+			return false
+		}
+		// Same as the net/http server: an HTTP/1.1 request must carry Host (multiple Hosts are already rejected by
+		// ReadRequest).
+		if req.Host == "" && req.ProtoAtLeast(1, 1) && req.Method != http.MethodConnect {
+			c.writeError(http.StatusBadRequest)
+			return false
+		}
+		// Same as the net/http server: reject an invalid Host. The standard library's ReadRequest does not validate it,
+		// while Handlers often use r.Host to build URLs or redirect addresses.
+		if !validHost(req.Host) {
+			c.writeError(http.StatusBadRequest)
+			return false
+		}
 	}
-	// Same as the net/http server: only HTTP/1.x is supported, and it is rejected before Host is checked.
-	if req.ProtoMajor != 1 {
-		c.writeError(http.StatusHTTPVersionNotSupported)
-		return false
-	}
-	// The message ends where framer said, so what the standard library takes for the body must be exactly the rest
-	// of it. Otherwise the two disagree on the framing: a field framer did not recognize (see bodyLength), or an empty
-	// line made of a bare LF, which the standard library accepts as a line break, ending the headers early. The
-	// remainder must not be silently discarded or executed (an upstream proxy may frame it differently, misaligning
-	// the responses), so it is handled as a bad request.
-	if int64(rd.bufferedReader.Buffered()+rd.bytesReader.Len()) != req.ContentLength {
-		c.writeError(http.StatusBadRequest)
-		return false
-	}
-	// Same as the net/http server: an HTTP/1.1 request must carry Host (multiple Hosts are already rejected by
-	// ReadRequest).
-	if req.Host == "" && req.ProtoAtLeast(1, 1) && req.Method != http.MethodConnect {
-		c.writeError(http.StatusBadRequest)
-		return false
-	}
-	// Same as the net/http server: reject an invalid Host. The standard library's ReadRequest does not validate it,
-	// while Handlers often use r.Host to build URLs or redirect addresses.
-	if !validHost(req.Host) {
-		c.writeError(http.StatusBadRequest)
-		return false
+	if cleanup != nil {
+		defer cleanup()
 	}
 	if c.remoteAddr == "" {
 		c.remoteAddr = c.connection.RemoteAddr().String()

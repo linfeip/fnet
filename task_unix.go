@@ -86,7 +86,7 @@ func (c *conn) handle(ev uint32) {
 		if !c.loop.watch(c) {
 			return
 		}
-		setConnOptions(c.fd)
+		setConnOptions(c.fd, c.loop.srv.opts.NoDelay)
 		c.loop.srv.handler.OnOpen(c)
 	}
 	// The poller reports a writable socket along with every event, so evWrite is nearly always set: only a backlog

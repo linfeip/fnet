@@ -30,16 +30,18 @@ func accept(fd int) (int, netip.AddrPort, error) {
 	return nfd, sockaddrToAddrPort(sa), nil
 }
 
-// listenerPerLoop: macOS's SO_REUSEPORT does not spread connections over the sockets sharing an address, so the loops
-// share one listener per address, and the connections accepted from it are spread over them in round-robin order.
-const listenerPerLoop = false
+// reusePortSpreads: macOS's SO_REUSEPORT does not spread connections over the sockets sharing an address, so the loops
+// always share one listener per address (see Server.listenerPerLoop).
+const reusePortSpreads = false
 
 // setListenerOptions does nothing: the connections set their options themselves (see setConnOptions).
-func setListenerOptions(int) {}
+func setListenerOptions(int, bool) {}
 
-// setConnOptions sets TCP_NODELAY and keepalive on an accepted connection.
-func setConnOptions(fd int) {
-	unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+// setConnOptions sets TCP_NODELAY (with noDelay) and keepalive on an accepted connection.
+func setConnOptions(fd int, noDelay bool) {
+	if noDelay {
+		unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	}
 	setKeepAlive(fd)
 }
 
