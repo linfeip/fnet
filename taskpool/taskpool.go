@@ -82,7 +82,17 @@ func New(shards, maxWorkers, capacity int) *Pool {
 // Submit 异步提交任务，不阻塞调用者；worker 已启动、不触发扩容或溢出时不分配。
 // 任务 panic 会被记录，不影响后续任务。
 func (p *Pool) Submit(task func()) {
-	s := &p.shards[cheaprandn(uint32(len(p.shards)))]
+	p.shards[cheaprandn(uint32(len(p.shards)))].submit(task)
+}
+
+// SubmitTo 与 Submit 相同，但提交到 key 选定的分片（key 对分片数取模）：同一个 key 的任务总是进同一个队列，
+// 由这个分片的 worker 执行。
+func (p *Pool) SubmitTo(key int, task func()) {
+	p.shards[uint(key)%uint(len(p.shards))].submit(task)
+}
+
+// submit 把任务放进本分片的队列并确保有 worker 来取；队列满时由临时 goroutine 执行并协助排空。
+func (s *shard) submit(task func()) {
 	if !s.push(task) {
 		go s.help(task)
 		return

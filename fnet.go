@@ -7,7 +7,7 @@
 //     each address, and the connections are distributed to the sub-reactors in round-robin order. The worker that
 //     finds a listener ready accepts;
 //   - sub-reactor (event loop): a Poller for the events of the connections it owns (edge-triggered), polled by
-//     the loop's worker, by default one per loop and one loop per P, which hands the tasks of the connections it
+//     the loop's worker, one per loop and by default one loop per 8 Ps, which hands the tasks of the connections it
 //     finds ready to the executor (see Options.Executor), helps the other loops when its own has nothing to do,
 //     and only then waits in the kernel;
 //   - connection task: run by the executor, it reads the data, invokes the Handler callbacks, keeps draining the
@@ -154,8 +154,9 @@ func (c *detachedConn) WriteTo(w io.Writer) (int64, error) {
 
 // Options holds the engine parameters; the zero value is the default configuration.
 type Options struct {
-	// NumLoops is the number of sub-reactors (event loops); runtime.GOMAXPROCS(0) when <=0, so that every worker has a
-	// Poller of its own (see Executor). Linux/macOS only.
+	// NumLoops is the number of sub-reactors (event loops); max(2, runtime.GOMAXPROCS(0)/8) when <=0. Each loop has
+	// one worker polling it, and a few loops leave the Ps to the executor's goroutines running the tasks, while
+	// every poll returns a larger batch. Linux/macOS only.
 	NumLoops int
 	// ReadBufferSize is the buffer size of a single read; 16KB when <=0. A connection's task borrows from the
 	// buffer pool only while reading and returns the buffer once the callback returns, so idle connections
@@ -164,26 +165,28 @@ type Options struct {
 	ReadBufferSize int
 	// Executor runs a connection's tasks (reading, invoking the Handler callbacks, draining the send buffer,
 	// closing): it is called once when a connection has events, a connection has at most one task at a time,
-	// and it is called again when more events arrive while one is being processed.
+	// and it is called again when more events arrive while one is being processed. key is the connection's fd,
+	// the same for all of its tasks, so an executor may use it to keep a connection's tasks on one queue.
 	// Executor may be called from any goroutine (the event loops' workers, the executor's own goroutines, the
 	// application goroutines calling Write and Close) and must not block; the task must run asynchronously
 	// (it must not run directly on the caller's stack) and must not be dropped.
 	// When a callback panics the connection is closed with ErrHandlerPanic and the task panics, so Executor
 	// must recover, otherwise the process exits.
-	// When nil it is the Submit of taskpool.DefaultTaskPool (lock-free submission, worker reuse, recovers and
-	// logs the panic). Linux/macOS only.
-	Executor func(task func())
+	// When nil it is the SubmitTo of taskpool.DefaultTaskPool (lock-free submission, worker reuse, recovers and
+	// logs the panic), which puts the tasks of a connection always in the shard key selects rather than in a
+	// random one each time. Linux/macOS only.
+	Executor func(key int, task func())
 }
 
 func (o Options) withDefaults() Options {
 	if o.NumLoops <= 0 {
-		o.NumLoops = runtime.GOMAXPROCS(0)
+		o.NumLoops = max(2, runtime.GOMAXPROCS(0)/8)
 	}
 	if o.ReadBufferSize <= 0 {
 		o.ReadBufferSize = 16 * units.KB
 	}
 	if o.Executor == nil {
-		o.Executor = taskpool.DefaultTaskPool.Submit
+		o.Executor = taskpool.DefaultTaskPool.SubmitTo
 	}
 	return o
 }

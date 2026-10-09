@@ -114,4 +114,5 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ## 5. Git 提交与推送
 
 - 默认不要自动执行 `git commit`、`git push` 等提交或推送操作；只有在用户主动且明确要求提交代码时，才可以执行对应操作。
+- 修改或新增代码注释时，注释内容必须使用英文。
 - 执行 `git commit` 时，commit message 必须使用英文。

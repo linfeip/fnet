@@ -33,7 +33,7 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 Dependencies are one-way: `websocket → fhttp → fnet → poll`, and `fnet → taskpool`.
 
 ```text
-listeners (SO_REUSEPORT) ─▶ sub-reactor 0 … N-1   (each: its own listener, 1 epoll/kqueue + its worker; N = GOMAXPROCS)
+listeners (SO_REUSEPORT) ─▶ sub-reactor 0 … N-1   (each: its own listener, 1 epoll/kqueue + its worker; N = max(2, GOMAXPROCS/8))
                                      │ a worker polls, accepts or finds a connection ready
                                      ▼
                  executor (taskpool): one task per connection at a time

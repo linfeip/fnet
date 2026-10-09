@@ -20,7 +20,7 @@ import (
 func TestHandleEventOwnLoopOnly(t *testing.T) {
 	var tasks atomic.Int32
 	opened := make(chan Conn, 1)
-	srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c }}, Options{NumLoops: 2, Executor: func(task func()) {
+	srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c }}, Options{NumLoops: 2, Executor: func(_ int, task func()) {
 		tasks.Add(1)
 		go task()
 	}})
@@ -230,7 +230,7 @@ func TestCloseWhileOpening(t *testing.T) {
 	closed := make(chan error, 1)
 	srv, err := NewServer("127.0.0.1:0", &funcHandler{close: func(_ Conn, err error) { closed <- err }}, Options{
 		NumLoops: 1,
-		Executor: func(task func()) {
+		Executor: func(_ int, task func()) {
 			if holding.CompareAndSwap(true, false) { // the first task is the open task of the first connection
 				held <- task
 				return

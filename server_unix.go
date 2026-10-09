@@ -219,9 +219,7 @@ func (s *Server) acceptConn(listenerFd int, l *loop) *conn {
 				l = s.loops[s.nextLoop.Add(1)%uint32(len(s.loops))]
 			}
 			c := &conn{fd: fd, loop: l, remote: remote}
-			if s.opts.Executor != nil {
-				c.task = c.run
-			}
+			c.task = c.run
 			c.state.Store(scheduledBit | evOpen)
 			s.openConnsWg.Add(1) // decremented again in close after the OnClose callback has finished
 			return c

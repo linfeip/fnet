@@ -491,7 +491,7 @@ func TestOpenDoesNotBlockExecutor(t *testing.T) {
 
 	h := &gateHandler{gate: make(chan struct{})}
 	h.closed = make(chan error, 8)
-	srv := newGateServer(t, h, fnet.Options{NumLoops: 1, Executor: func(task func()) { tasks <- task }})
+	srv := newGateServer(t, h, fnet.Options{NumLoops: 1, Executor: func(_ int, task func()) { tasks <- task }})
 	var release sync.Once
 	t.Cleanup(func() { release.Do(func() { close(h.gate) }) }) // runs before srv.Close; failures never hang in OnOpen
 
@@ -1184,7 +1184,7 @@ func BenchmarkEchoScheduling(b *testing.B) {
 				b.Run(fmt.Sprintf("loops=%d/pipeline=%d/batch=%t", loops, pipeline, batch), func(b *testing.B) {
 					engine := fnet.Options{NumLoops: loops}
 					if !batch {
-						engine.Executor = func(task func()) { taskpool.DefaultTaskPool.Submit(task) }
+						engine.Executor = func(_ int, task func()) { taskpool.DefaultTaskPool.Submit(task) }
 					}
 					mux := http.NewServeMux()
 					mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {

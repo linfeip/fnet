@@ -56,6 +56,31 @@ func TestEveryTaskRunsOnce(t *testing.T) {
 	}
 }
 
+// TestSubmitToKeyShard checks that SubmitTo runs the tasks of a key on the shard the key selects modulo the number of
+// shards, negative keys included: submitted one at a time, so that the shard never has to borrow, they start workers in
+// that shard only.
+func TestSubmitToKeyShard(t *testing.T) {
+	p := New(4, 1, 64)
+	for _, key := range []int{1, 5, -3, 1<<40 + 1} { // all select shard 1
+		done := make(chan struct{})
+		p.SubmitTo(key, func() { close(done) })
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("key %d 的任务没有执行", key)
+		}
+	}
+	for i := range p.shards {
+		want := int32(0)
+		if i == 1 {
+			want = 1
+		}
+		if n := p.shards[i].liveWorkers.Load(); n != want {
+			t.Fatalf("分片 %d 启动了 %d 个 worker, 期望 %d", i, n, want)
+		}
+	}
+}
+
 // TestWakeAfterIdle submits only after the worker has suspended every time: no wakeup may be lost.
 func TestWakeAfterIdle(t *testing.T) {
 	done := make(chan struct{})

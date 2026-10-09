@@ -17,7 +17,7 @@ import (
 // TestExecutor verifies the connection's task is run by Options.Executor.
 func TestExecutor(t *testing.T) {
 	var tasks atomic.Int32
-	srv := startServerWith(t, &funcHandler{data: echo}, Options{NumLoops: 1, Executor: func(task func()) {
+	srv := startServerWith(t, &funcHandler{data: echo}, Options{NumLoops: 1, Executor: func(_ int, task func()) {
 		tasks.Add(1)
 		go task()
 	}})
@@ -45,7 +45,7 @@ func TestHandlerPanic(t *testing.T) {
 			return echo(c, b)
 		},
 		close: func(c Conn, err error) { reasons <- err },
-	}, Options{NumLoops: 1, Executor: func(task func()) {
+	}, Options{NumLoops: 1, Executor: func(_ int, task func()) {
 		go func() {
 			defer func() { recover() }()
 			task()
@@ -74,7 +74,7 @@ func TestExecutorNotCalledUnderConnLock(t *testing.T) {
 	var held, armed atomic.Bool
 	var target atomic.Pointer[conn]
 	opened := make(chan Conn, 1)
-	srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c }}, Options{NumLoops: 1, Executor: func(task func()) {
+	srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c }}, Options{NumLoops: 1, Executor: func(_ int, task func()) {
 		if c := target.Load(); c != nil && armed.Load() {
 			if !c.mu.TryLock() {
 				held.Store(true)

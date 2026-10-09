@@ -35,8 +35,9 @@ type conn struct {
 	peerClosed bool          // the peer closed or an error occurred (see evHup), accessed only by the task
 	loop       *loop
 	fd         int
-	task       func() // run bound once when there is an Executor, so that handing the task over does not allocate each time
+	task       func() // run bound once, so that handing the task over does not allocate a method value each time
 	ctx        any
+	in         bytepool.Buffer // unconsumed inbound data, accessed only by the task
 
 	mu       sync.Mutex
 	out      bytepool.Buffer // send buffer, the data to send is out.Bytes()[outPos:]; empty when nothing is backed up

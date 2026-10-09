@@ -33,7 +33,7 @@
 依赖方向是单向的：`websocket → fhttp → fnet → poll`，以及 `fnet → taskpool`。
 
 ```text
-listeners（SO_REUSEPORT）─▶ 子 Reactor 0 … N-1   （每个：自己的 listener、1 个 epoll/kqueue + 它的 worker；N = GOMAXPROCS）
+listeners（SO_REUSEPORT）─▶ 子 Reactor 0 … N-1   （每个：自己的 listener、1 个 epoll/kqueue + 它的 worker；N = max(2, GOMAXPROCS/8)）
                                   │ worker 探测到 listener 或连接就绪
                                   ▼
                  执行器（taskpool）：同一连接同一时刻一个任务
