@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
 
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/internal/bytepool"
@@ -80,8 +81,17 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 	b := &w.buf
 	b.buffer = bytepool.Get(units.KB / 2)
 	b.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
-	w.header.Write(b)
-	b.WriteString("\r\n")
+	accept := w.header.Get("Sec-WebSocket-Accept")
+	if len(w.header) == 3 && accept != "" &&
+		strings.EqualFold(w.header.Get("Upgrade"), "websocket") &&
+		strings.EqualFold(w.header.Get("Connection"), "Upgrade") {
+		b.WriteString("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
+		b.WriteString(accept)
+		b.WriteString("\r\n\r\n")
+	} else {
+		w.header.Write(b)
+		b.WriteString("\r\n")
+	}
 	c.connection.Write(b.buffer.Bytes())
 	b.buffer.Release()
 	return nil

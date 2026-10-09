@@ -165,7 +165,7 @@ type Options struct {
 	ReadBufferSize int
 	// Executor runs a connection's tasks (reading, invoking the Handler callbacks, draining the send buffer,
 	// closing): it is called once when a connection has events, a connection has at most one task at a time,
-	// and it is called again when more events arrive while one is being processed. key is the connection's fd,
+	// and it is called again when more events arrive while one is being processed. key is a connection key,
 	// the same for all of its tasks, so an executor may use it to keep a connection's tasks on one queue.
 	// Executor may be called from any goroutine (the event loops' workers, the executor's own goroutines, the
 	// application goroutines calling Write and Close) and must not block; the task must run asynchronously

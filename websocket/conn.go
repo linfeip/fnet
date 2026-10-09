@@ -271,6 +271,26 @@ func parseHeader(data []byte) (h ws.Header, n int, err error) {
 	return h, size, nil
 }
 
+// applyMask unmasks payload in place using mask (RFC 6455 5.3).
+func applyMask(b []byte, mask [4]byte) {
+	mask32 := binary.LittleEndian.Uint32(mask[:])
+	mask64 := uint64(mask32) | uint64(mask32)<<32
+	for len(b) >= 32 {
+		binary.LittleEndian.PutUint64(b, binary.LittleEndian.Uint64(b)^mask64)
+		binary.LittleEndian.PutUint64(b[8:], binary.LittleEndian.Uint64(b[8:])^mask64)
+		binary.LittleEndian.PutUint64(b[16:], binary.LittleEndian.Uint64(b[16:])^mask64)
+		binary.LittleEndian.PutUint64(b[24:], binary.LittleEndian.Uint64(b[24:])^mask64)
+		b = b[32:]
+	}
+	for len(b) >= 8 {
+		binary.LittleEndian.PutUint64(b, binary.LittleEndian.Uint64(b)^mask64)
+		b = b[8:]
+	}
+	for i := range b {
+		b[i] ^= mask[i&3]
+	}
+}
+
 // OnData implements fhttp.Protocol: it processes inbound data frame by frame and returns the number of consumed
 // bytes. An unfragmented message goes straight to the OnMessage callback, with the payload being a slice of data,
 // neither queued nor copied. When data still holds further frames, the frames written while processing them are
@@ -365,7 +385,7 @@ func (c *Conn) readFrame(data []byte) int {
 	}
 	end := start + int(h.Length)
 	payload := data[start:end]
-	ws.Cipher(payload, h.Mask, 0) // unmask in place: this data is consumed right now
+	applyMask(payload, h.Mask) // unmask in place: this data is consumed right now
 	if end < len(data) && !c.corking {
 		c.cork(len(data) - start) // more data follows: cork frames from callbacks; OnData writes them all at once when done
 	}

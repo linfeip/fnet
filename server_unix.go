@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -65,12 +66,15 @@ func NewServerAddrs(addrs []string, handler Handler, opts Options) (*Server, err
 		done:    make(chan struct{}),
 	}
 	// The loops come first: they watch the listeners.
-	for range s.opts.NumLoops {
+	shardsPerLoop := max(1, runtime.GOMAXPROCS(0)/s.opts.NumLoops)
+	for i := range s.opts.NumLoops {
 		l, err := newLoop(s)
 		if err != nil {
 			s.release()
 			return nil, err
 		}
+		l.keyBase = i * shardsPerLoop
+		l.keySpan = shardsPerLoop
 		s.loops = append(s.loops, l)
 	}
 	sockets := 1

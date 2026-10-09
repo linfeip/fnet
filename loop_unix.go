@@ -20,6 +20,9 @@ type loop struct {
 	poller      *poll.Poller // the readiness of the loop's connections, see poll.New
 	listenerFds []int        // the listening sockets the Poller watches as well (see accept), set before Serve
 
+	keyBase int // first shard key for this loop's connections
+	keySpan int // number of shard keys per loop
+
 	mu    sync.Mutex
 	conns []*conn // the connections registered with this loop, see collectConns
 
@@ -36,6 +39,11 @@ func newLoop(s *Server) (*loop, error) {
 
 // close releases the Poller; it must be called after the workers have exited.
 func (l *loop) close() { l.poller.Close() }
+
+// taskKey maps connection fd to a key within the loop's assigned shard range.
+func (l *loop) taskKey(fd int) int {
+	return l.keyBase + (fd % l.keySpan)
+}
 
 // watchListener has the loop's Poller watch the listening socket fd as well.
 func (l *loop) watchListener(fd int) error {

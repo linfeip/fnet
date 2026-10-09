@@ -232,6 +232,24 @@ func TestConnSize(t *testing.T) {
 	}
 }
 
+// TestApplyMaskMatchesCipher checks that applyMask produces identical output to ws.Cipher for all payload lengths.
+func TestApplyMaskMatchesCipher(t *testing.T) {
+	mask := [4]byte{0x12, 0x34, 0x56, 0x78}
+	for size := 0; size <= 1024; size++ {
+		src := make([]byte, size)
+		for i := range src {
+			src[i] = byte(i * 17)
+		}
+		want := slices.Clone(src)
+		ws.Cipher(want, mask, 0)
+		got := slices.Clone(src)
+		applyMask(got, mask)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("size %d: got %x want %x", size, got, want)
+		}
+	}
+}
+
 // TestAppendFrameHeader checks that the frame header encoding is byte-for-byte identical to ws.WriteHeader:
 // RFC 6455 requires the shortest encoding for the payload length, which the peer does not necessarily check
 // when parsing.

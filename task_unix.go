@@ -39,8 +39,8 @@ func (c *conn) notify(ev uint32) bool {
 }
 
 // schedule submits the connection's task to the Executor (taskpool.DefaultTaskPool.SubmitTo by default), keyed by the
-// connection's fd. The caller must hold the task, see markEvents.
-func (c *conn) schedule() { c.loop.srv.opts.Executor(c.fd, c.task) }
+// connection's loop-affine key. The caller must hold the task, see markEvents.
+func (c *conn) schedule() { c.loop.srv.opts.Executor(c.loop.taskKey(c.fd), c.task) }
 
 // markEvents 合并事件并取得唯一任务的提交权；返回 true 的调用方必须负责提交，不能丢弃。
 func (c *conn) markEvents(ev uint32) bool {
