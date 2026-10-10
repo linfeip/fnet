@@ -36,11 +36,11 @@ func TestHandleEventOwnLoopOnly(t *testing.T) {
 	before := tasks.Load()
 	other.handleEvent(c.fd, poll.EventRead)
 	if got := tasks.Load(); got != before {
-		t.Fatalf("另一个 loop 的事件通知了连接：Executor 多被调用了 %d 次", got-before)
+		t.Fatalf("another loop's event notified the connection: Executor was called %d extra times", got-before)
 	}
 	own.handleEvent(c.fd, poll.EventRead)
 	if got := tasks.Load(); got != before+1 {
-		t.Fatalf("所属 loop 的事件没有通知连接：Executor 被调用了 %d 次, 期望 1 次", got-before)
+		t.Fatalf("the owning loop's event did not notify the connection: Executor was called %d times, want 1", got-before)
 	}
 }
 
@@ -66,7 +66,7 @@ func TestListenerPerLoop(t *testing.T) {
 			opened := make(chan *conn, numConns)
 			srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c.(*conn) }}, opts)
 			if want := reusePortSpreads && reusePort; srv.listenerPerLoop != want {
-				t.Fatalf("listenerPerLoop = %v, 期望 %v", srv.listenerPerLoop, want)
+				t.Fatalf("listenerPerLoop = %v, want %v", srv.listenerPerLoop, want)
 			}
 			for i, l := range srv.loops {
 				want := 0
@@ -74,7 +74,7 @@ func TestListenerPerLoop(t *testing.T) {
 					want = 1
 				}
 				if len(l.listenerFds) != want {
-					t.Fatalf("loop %d 监听了 %d 个 socket, 期望 %d", i, len(l.listenerFds), want)
+					t.Fatalf("loop %d listens on %d sockets, want %d", i, len(l.listenerFds), want)
 				}
 			}
 			loops := map[*loop]bool{}
@@ -83,11 +83,11 @@ func TestListenerPerLoop(t *testing.T) {
 				loops[(<-opened).loop] = true
 			}
 			if len(loops) < 2 {
-				t.Fatalf("%d 个连接只落在了 %d 个 loop 上", numConns, len(loops))
+				t.Fatalf("%d connections landed on only %d loops", numConns, len(loops))
 			}
 			if other, err := NewServer(srv.Addr().String(), &funcHandler{}, opts); err == nil {
 				other.Close()
-				t.Fatalf("%v 已被监听, NewServer 应返回错误", srv.Addr())
+				t.Fatalf("%v is already listened on, NewServer should return an error", srv.Addr())
 			}
 		})
 	}
@@ -116,19 +116,19 @@ func TestCollectConnsDropsClosed(t *testing.T) {
 	select {
 	case <-closed:
 	case <-time.After(5 * time.Second):
-		t.Fatal("连接没有关闭")
+		t.Fatal("connection did not close")
 	}
 
 	l := srv.loops[0]
 	want := slices.Sorted(slices.Values([]int{fds[0], fds[2]}))
 	if got := loopFds(l); !slices.Equal(got, want) {
-		t.Fatalf("返回了 %v, 期望 %v", got, want)
+		t.Fatalf("got %v, want %v", got, want)
 	}
 	l.mu.Lock()
 	n := len(l.conns)
 	l.mu.Unlock()
 	if n != 2 {
-		t.Fatalf("列表里有 %d 个连接, 期望已关闭的被丢掉、剩 2 个", n)
+		t.Fatalf("the list holds %d connections, want the closed one dropped and 2 left", n)
 	}
 }
 
@@ -156,7 +156,7 @@ func TestConnChurn(t *testing.T) {
 					return
 				}
 				if _, err := io.ReadFull(c, make([]byte, 4)); err != nil {
-					t.Errorf("echo 没有返回: %v", err)
+					t.Errorf("echo did not return: %v", err)
 					return
 				}
 				c.Close()
@@ -166,12 +166,12 @@ func TestConnChurn(t *testing.T) {
 	wg.Wait()
 	for deadline := time.Now().Add(5 * time.Second); closed.Load() != clients*rounds; time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
-			t.Fatalf("只关闭了 %d/%d 个连接", closed.Load(), clients*rounds)
+			t.Fatalf("only %d/%d connections closed", closed.Load(), clients*rounds)
 		}
 	}
 	for i, l := range srv.loops {
 		if fds := loopFds(l); len(fds) != 0 {
-			t.Fatalf("loop %d 在所有连接关闭之后仍留着 %d 个连接", i, len(fds))
+			t.Fatalf("loop %d still holds %d connections after all connections closed", i, len(fds))
 		}
 	}
 }
@@ -201,7 +201,7 @@ func TestBlockedCallbacksDoNotHoldUpOthers(t *testing.T) {
 	c.SetDeadline(time.Now().Add(5 * time.Second))
 	c.Write([]byte("ping"))
 	if _, err := io.ReadFull(c, make([]byte, 4)); err != nil {
-		t.Fatalf("多个回调阻塞时其他连接得不到服务: %v", err)
+		t.Fatalf("other connections are not served while several callbacks block: %v", err)
 	}
 }
 
@@ -219,14 +219,14 @@ func TestGoexitInCallback(t *testing.T) {
 		c.SetDeadline(time.Now().Add(5 * time.Second))
 		c.Write([]byte("exit"))
 		if _, err := c.Read(make([]byte, 1)); err != io.EOF {
-			t.Fatalf("Goexit 的连接应被关闭, got %v", err)
+			t.Fatalf("the connection that called Goexit should be closed, got %v", err)
 		}
 	}
 	c := dial(t, srv)
 	c.SetDeadline(time.Now().Add(5 * time.Second))
 	c.Write([]byte("ping"))
 	if _, err := io.ReadFull(c, make([]byte, 4)); err != nil {
-		t.Fatalf("执行器的 goroutine 因 Goexit 退出后没有被替换: %v", err)
+		t.Fatalf("the executor's goroutine was not replaced after exiting through Goexit: %v", err)
 	}
 }
 
@@ -266,9 +266,9 @@ func TestCloseWhileOpening(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("打开中的连接没有关闭, Close 没有返回")
+		t.Fatal("the opening connection did not close and Close did not return")
 	}
 	if err := <-closed; err != ErrServerClosed {
-		t.Fatalf("OnClose(%v), 期望 ErrServerClosed", err)
+		t.Fatalf("OnClose(%v), want ErrServerClosed", err)
 	}
 }

@@ -23,7 +23,7 @@ func (echo) OnMessage(c *websocket.Conn, op ws.OpCode, data []byte) { c.WriteMes
 func (echo) OnClose(c *websocket.Conn, err error)                   {}
 
 func main() {
-	addr := flag.String("addr", ":9001", "监听地址")
+	addr := flag.String("addr", ":9001", "listen address")
 	flag.Parse()
 
 	// The largest message in 9.* is 16MB, the default 1MB is not enough.

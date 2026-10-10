@@ -2,16 +2,23 @@
 // cost of creating and destroying a goroutine per task. DefaultTaskPool can be used directly, and websocket uses it to
 // run callbacks by default.
 //
-// 每个分片使用有界无锁队列，最多保留 maxWorkers 个 worker。大批次均匀分到各分片，
-// 小批次保留随机选择并合并通知；每个分片入队后只判断一次唤醒（已有 worker 在赶来时不再唤醒）。
-// 运行中的 worker 数只受 maxWorkers 限制，不再设 GOMAXPROCS 软预算：回调阻塞时 worker 仍算“在运行”，
-// 软预算会让池无法扩到足以吸收阻塞的规模，同时让就绪任务在队列里多等，实测只拉高尾延迟，没有省下可测的调度开销。
-// 总 worker 数上限是 分片数 × maxWorkers，由所有分片共享：一个分片的 worker 全在执行任务（达到它的上限）时，
-// 它的任务由别的分片挂起的 worker 来取，或在还有余量的分片新建一个 worker 来取（见 Pool.borrow）；整个池都没有
-// 可用 worker 时任务排队，下一个挂起的 worker 会来取（见 Pool.starving）。只有分片饱和时才跨分片，正常负载下
-// worker 只取本分片的任务：常开的跨分片窃取实测拉高了尾延迟。要容纳 N 个同时阻塞的回调，总上限需要大于 N。
-// 队列满时沿用临时 goroutine 执行并协助排空的策略，提交者不阻塞。
-// worker 启动后保持驻留（不回收）。
+// Each shard uses a bounded lock-free queue and keeps at most maxWorkers workers. Large batches are spread evenly
+// across the shards; small batches keep their random placement and merge notifications, and each shard decides once
+// whether to wake a worker after enqueuing (when one is already on its way there is no second wakeup).
+// The number of running workers is bounded only by maxWorkers; there is no GOMAXPROCS soft budget any more: a worker
+// whose callback blocks still counts as running, and a soft budget keeps the pool from growing enough to absorb the
+// blocking while leaving ready tasks waiting in the queue, which in measurements only raised tail latency without
+// saving measurable scheduling cost.
+// The total worker limit is shards * maxWorkers, shared by all shards: when every worker of a shard is running a task
+// (the shard has reached its own limit), its tasks are taken by a suspended worker of another shard, or a new worker
+// is started in a shard that still has room (see Pool.borrow); when no worker is available anywhere in the pool the
+// task is queued and the next worker to suspend comes for it (see Pool.starving). Only a saturated shard crosses
+// shards; under normal load a worker takes tasks only from its own shard, because always-on work stealing raised tail
+// latency in measurements. To accommodate N callbacks that block at the same time the total limit has to be greater
+// than N.
+// When the queue is full it falls back to running the task in a temporary goroutine that helps drain the queue, so
+// submitters never block.
+// A worker stays resident once started (it is never reclaimed).
 // When a task panics it is logged (with the stack trace), and the goroutine running it goes on with the following tasks.
 package taskpool
 
@@ -79,19 +86,21 @@ func New(shards, maxWorkers, capacity int) *Pool {
 	return p
 }
 
-// Submit 异步提交任务，不阻塞调用者；worker 已启动、不触发扩容或溢出时不分配。
-// 任务 panic 会被记录，不影响后续任务。
+// Submit submits a task asynchronously and does not block the caller; it allocates nothing when a worker is already
+// started and neither growth nor overflow is triggered.
+// A panicking task is logged and does not affect the following tasks.
 func (p *Pool) Submit(task func()) {
 	p.shards[cheaprandn(uint32(len(p.shards)))].submit(task)
 }
 
-// SubmitTo 与 Submit 相同，但提交到 key 选定的分片（key 对分片数取模）：同一个 key 的任务总是进同一个队列，
-// 由这个分片的 worker 执行。
+// SubmitTo is like Submit but submits to the shard selected by key (key modulo the number of shards): tasks with the
+// same key always go to the same queue and are run by that shard's workers.
 func (p *Pool) SubmitTo(key int, task func()) {
 	p.shards[uint(key)%uint(len(p.shards))].submit(task)
 }
 
-// submit 把任务放进本分片的队列并确保有 worker 来取；队列满时由临时 goroutine 执行并协助排空。
+// submit puts the task into this shard's queue and makes sure a worker comes for it; when the queue is full a
+// temporary goroutine runs the task and helps drain the queue.
 func (s *shard) submit(task func()) {
 	if !s.push(task) {
 		go s.help(task)
@@ -100,8 +109,10 @@ func (s *shard) submit(task func()) {
 	s.notify()
 }
 
-// SubmitBatch 异步提交一个批次；返回前不保留 tasks 切片，调用方可以立即清空并复用。
-// 分片内任务仍逐个执行，每批不独占尚未执行的任务，与 Submit 共享同一溢出协助策略。
+// SubmitBatch submits a batch asynchronously; it keeps no reference to the tasks slice after returning, so the caller
+// may immediately clear and reuse it.
+// Within a shard the tasks still run one by one, a batch never reserves tasks that have not run yet, and it shares
+// the same overflow-helping policy as Submit.
 func (p *Pool) SubmitBatch(tasks []func()) {
 	if len(tasks) == 0 {
 		return
@@ -111,8 +122,10 @@ func (p *Pool) SubmitBatch(tasks []func()) {
 		return
 	}
 	count := len(p.shards)
-	// 小批次保留随机选择，避免强行散到不同分片反而增加挂起队列的唤醒数。
-	// 常见 <=64 分片使用栈上位图合并通知；更宽的池退回原有单任务路径。
+	// Small batches keep their random placement: force-spreading them across shards would only increase the number of
+	// wakeups for queued work.
+	// The common case of <=64 shards merges notifications with a stack bitmap; wider pools fall back to the
+	// one-task-at-a-time path.
 	if len(tasks) < count {
 		if count > 64 {
 			for _, task := range tasks {
@@ -177,7 +190,7 @@ type slot struct {
 
 // shard is one shard of the pool. Submitters write tail, workers write head, and the worker state occupies yet another
 // cache line; keeping the three apart means modifying one does not invalidate the cache lines holding the other two.
-const cacheLineSize = 128 // 同时覆盖常见的 64B 和 128B 缓存行
+const cacheLineSize = 128 // covering both the common 64B and 128B cache lines
 
 type shard struct {
 	slots      []slot
@@ -248,14 +261,18 @@ func (s *shard) hasTask() bool {
 	return s.slots[pos&s.mask].seq.Load() == pos+1
 }
 
-// notify 确保有 worker 来取队列里的任务：已有 worker 在赶来（持有 wakingWorkers）时什么也不做；否则唤醒本分片
-// 挂起的 worker，或新建一个；本分片已达上限且全在执行任务时，从别的分片借一个（见 Pool.borrow）。找到的 worker
-// 接过本函数取得的 wakingWorkers，到达队列时释放；失败路径由本函数释放。整个池都没有可用 worker 时置 starving，
-// 由下一个挂起的 worker 来取。
+// notify makes sure a worker comes for the tasks in the queue: when a worker is already on its way (holding
+// wakingWorkers) it does nothing; otherwise it wakes a suspended worker of this shard or starts a new one, and when
+// the shard is at its limit with every worker running a task it borrows one from another shard (see Pool.borrow). The
+// worker it finds takes over the wakingWorkers this function acquired and releases them on reaching the queue; on the
+// failure path this function releases them. When the whole pool has no available worker it sets starving, and the next
+// worker to suspend comes for the tasks.
 //
-// 不会丢失唤醒。分片内：提交者先写任务再看 worker，worker 先登记挂起再看队列，两边至少有一边看到另一边。
-// 跨分片：先释放 wakingWorkers 再置 starving，之后再看一遍全池有没有挂起的 worker；worker 先登记挂起再读
-// starving，所以要么它看到标志（这时 wakingWorkers 已释放，它的 notify 能取得），要么这里的第二遍看到它并重试。
+// Wakeups are never lost. Within a shard: the submitter writes the task before looking at the workers and a worker
+// registers as suspended before looking at the queue, so at least one side sees the other. Across shards: this sets
+// wakingWorkers and starving before looking once more for suspended workers pool-wide, while a worker registers as
+// suspended before reading starving, so either it sees the flag (by then wakingWorkers has been released, and its
+// notify can acquire it) or the second pass here sees it and retries.
 func (s *shard) notify() {
 	p := s.pool
 	for s.hasTask() && s.wakingWorkers.Load() == 0 && s.wakingWorkers.CompareAndSwap(0, 1) {

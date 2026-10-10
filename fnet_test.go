@@ -59,7 +59,7 @@ func startServerWith(t *testing.T, h Handler, opts Options) *Server {
 	t.Cleanup(func() {
 		srv.Close()
 		if err := <-served; !errors.Is(err, ErrServerClosed) {
-			t.Errorf("Serve 返回 %v, 期望 ErrServerClosed", err)
+			t.Errorf("Serve returned %v, want ErrServerClosed", err)
 		}
 	})
 	return srv
@@ -100,7 +100,7 @@ func TestEcho(t *testing.T) {
 				}
 				got := make([]byte, len(msg))
 				if _, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, msg) {
-					t.Errorf("echo 不一致: got %q err %v", got, err)
+					t.Errorf("echo mismatch: got %q err %v", got, err)
 					return
 				}
 			}
@@ -142,7 +142,7 @@ func TestPartialConsume(t *testing.T) {
 	}()
 	got := make([]byte, len(want))
 	if _, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, want) {
-		t.Fatalf("帧数据不一致, err=%v", err)
+		t.Fatalf("frame data mismatch, err=%v", err)
 	}
 }
 
@@ -161,7 +161,7 @@ func TestLargeWriteThenClose(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // don't read yet, let the server's send buffer back up
 	got, err := io.ReadAll(c)
 	if err != nil || !bytes.Equal(got, payload) {
-		t.Fatalf("收到 %d 字节, 期望 %d, err=%v", len(got), len(payload), err)
+		t.Fatalf("received %d bytes, want %d, err=%v", len(got), len(payload), err)
 	}
 }
 
@@ -180,17 +180,17 @@ func TestWritev(t *testing.T) {
 	}
 	srv := startServer(t, &funcHandler{open: func(c Conn) {
 		if n, err := c.Writev(bs); n != len(want) || err != nil {
-			t.Errorf("Writev = %d, %v, 期望 %d, nil", n, err, len(want))
+			t.Errorf("Writev = %d, %v, want %d, nil", n, err, len(want))
 		}
 		if !bytes.Equal(bytes.Join(bs, nil), want) {
-			t.Error("Writev 修改了 bs")
+			t.Error("Writev modified bs")
 		}
 		c.Close()
 	}})
 	c := dial(t, srv)
 	got, err := io.ReadAll(c)
 	if err != nil || !bytes.Equal(got, want) {
-		t.Fatalf("收到 %d 字节, 期望 %d, err=%v", len(got), len(want), err)
+		t.Fatalf("received %d bytes, want %d, err=%v", len(got), len(want), err)
 	}
 }
 
@@ -208,7 +208,7 @@ func TestLargeWritevThenClose(t *testing.T) {
 	want = append(want, tail...)
 	srv := startServer(t, &funcHandler{open: func(c Conn) {
 		if n, err := c.Writev(segments); n != len(want)-len(tail) || err != nil {
-			t.Errorf("Writev = %d, %v, 期望 %d, nil", n, err, len(want)-len(tail))
+			t.Errorf("Writev = %d, %v, want %d, nil", n, err, len(want)-len(tail))
 		}
 		c.Write(tail)
 		c.Close()
@@ -217,7 +217,7 @@ func TestLargeWritevThenClose(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // don't read yet, let the server's send buffer back up
 	got, err := io.ReadAll(c)
 	if err != nil || !bytes.Equal(got, want) {
-		t.Fatalf("收到 %d 字节, 期望 %d, err=%v", len(got), len(want), err)
+		t.Fatalf("received %d bytes, want %d, err=%v", len(got), len(want), err)
 	}
 }
 
@@ -241,7 +241,7 @@ func TestWriteFromOtherGoroutines(t *testing.T) {
 	c.Write([]byte("0123456789"))
 	got, err := io.ReadAll(c)
 	if err != nil || len(got) != 100 {
-		t.Fatalf("收到 %d 字节, err=%v", len(got), err)
+		t.Fatalf("received %d bytes, err=%v", len(got), err)
 	}
 }
 
@@ -271,16 +271,16 @@ func TestPauseRead(t *testing.T) {
 	c.SetDeadline(time.Now().Add(5 * time.Second))
 	got := make([]byte, len(out))
 	if _, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, out) {
-		t.Fatalf("暂停读取期间写出的数据不一致, err=%v", err)
+		t.Fatalf("data written while reading is paused does not match, err=%v", err)
 	}
 
 	c.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
 	n, err := c.Write(in)
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("对端写入应被阻塞, 写出 %d 字节, err=%v", n, err)
+		t.Fatalf("peer write should block, wrote %d bytes, err=%v", n, err)
 	}
 	if got := received.Load(); got != 0 {
-		t.Fatalf("暂停期间回调了 OnData, 收到 %d 字节", got)
+		t.Fatalf("OnData was called while paused, received %d bytes", got)
 	}
 
 	sc.ResumeRead()
@@ -291,7 +291,7 @@ func TestPauseRead(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatalf("恢复读取后只收到 %d 字节, 期望 %d", received.Load(), len(in))
+		t.Fatalf("after resuming read only %d bytes were received, want %d", received.Load(), len(in))
 	}
 }
 
@@ -308,7 +308,7 @@ func TestCloseReasons(t *testing.T) {
 	<-opened
 	c.Close()
 	if err := <-reasons; err != io.EOF {
-		t.Fatalf("对端关闭: %v", err)
+		t.Fatalf("peer close: %v", err)
 	}
 
 	// local side closes -> nil, and writing after the close returns net.ErrClosed
@@ -316,13 +316,13 @@ func TestCloseReasons(t *testing.T) {
 	sc := <-opened
 	sc.Close()
 	if err := <-reasons; err != nil {
-		t.Fatalf("主动关闭: %v", err)
+		t.Fatalf("local close: %v", err)
 	}
 	if _, err := sc.Write([]byte("x")); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("关闭后写入: %v", err)
+		t.Fatalf("write after close: %v", err)
 	}
 	if _, err := sc.Writev([][]byte{[]byte("x")}); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("关闭后 Writev: %v", err)
+		t.Fatalf("Writev after close: %v", err)
 	}
 }
 
@@ -346,11 +346,11 @@ func TestAddrs(t *testing.T) {
 
 			c := dial(t, srv)
 			if got := <-opened; got != [2]string{c.RemoteAddr().String(), c.LocalAddr().String()} {
-				t.Fatalf("OnOpen 中 LocalAddr/RemoteAddr = %v, 期望 %v/%v", got, c.RemoteAddr(), c.LocalAddr())
+				t.Fatalf("LocalAddr/RemoteAddr in OnOpen = %v, want %v/%v", got, c.RemoteAddr(), c.LocalAddr())
 			}
 			c.Close()
 			if got := <-closed; got != c.LocalAddr().String() {
-				t.Fatalf("OnClose 中 RemoteAddr = %s, 期望 %s", got, c.LocalAddr())
+				t.Fatalf("RemoteAddr in OnClose = %s, want %s", got, c.LocalAddr())
 			}
 		})
 	}
@@ -384,15 +384,15 @@ func TestServerClose(t *testing.T) {
 	}
 	srv.Close() // every OnClose has already run by the time it returns
 	if n := closed.Load(); n != 20 {
-		t.Fatalf("OnClose(ErrServerClosed) 次数 = %d", n)
+		t.Fatalf("OnClose(ErrServerClosed) calls = %d", n)
 	}
 	if err := <-served; !errors.Is(err, ErrServerClosed) {
-		t.Fatalf("Serve 返回 %v", err)
+		t.Fatalf("Serve returned %v", err)
 	}
 	for _, c := range clients {
 		c.SetReadDeadline(time.Now().Add(time.Second))
 		if _, err := c.Read(make([]byte, 1)); err != io.EOF {
-			t.Fatalf("客户端应读到 EOF, got %v", err)
+			t.Fatalf("client should read EOF, got %v", err)
 		}
 	}
 	// A Server that was never Served can also be Closed directly.
@@ -402,7 +402,7 @@ func TestServerClose(t *testing.T) {
 	}
 	s2.Close()
 	if err := s2.Serve(); !errors.Is(err, ErrServerClosed) {
-		t.Fatalf("Close 之后 Serve 返回 %v, 期望 ErrServerClosed", err)
+		t.Fatalf("Serve after Close returned %v, want ErrServerClosed", err)
 	}
 }
 
@@ -412,10 +412,10 @@ func TestNewServerSingleAddr(t *testing.T) {
 	srv := startServer(t, &funcHandler{data: echo})
 	addrs := srv.Addrs()
 	if len(addrs) != 1 {
-		t.Fatalf("Addrs() 返回 %d 个地址, 期望 1", len(addrs))
+		t.Fatalf("Addrs() returned %d addresses, want 1", len(addrs))
 	}
 	if srv.Addr().String() != addrs[0].String() {
-		t.Fatalf("Addr() = %v, 期望等于 Addrs()[0] = %v", srv.Addr(), addrs[0])
+		t.Fatalf("Addr() = %v, want Addrs()[0] = %v", srv.Addr(), addrs[0])
 	}
 }
 
@@ -436,10 +436,10 @@ func TestServerMultipleAddrs(t *testing.T) {
 
 	addrs := srv.Addrs()
 	if len(addrs) != numAddrs {
-		t.Fatalf("Addrs() 返回 %d 个地址, 期望 %d", len(addrs), numAddrs)
+		t.Fatalf("Addrs() returned %d addresses, want %d", len(addrs), numAddrs)
 	}
 	if srv.Addr().String() != addrs[0].String() {
-		t.Fatalf("Addr() = %v, 期望等于 Addrs()[0] = %v", srv.Addr(), addrs[0])
+		t.Fatalf("Addr() = %v, want Addrs()[0] = %v", srv.Addr(), addrs[0])
 	}
 	// Every address gets its own listener, so they are all different and all echo.
 	ports := make(map[string]struct{}, numAddrs)
@@ -447,7 +447,7 @@ func TestServerMultipleAddrs(t *testing.T) {
 		ports[addr.String()] = struct{}{}
 		c, err := net.Dial("tcp", addr.String())
 		if err != nil {
-			t.Fatalf("连接 %v 失败: %v", addr, err)
+			t.Fatalf("dial %v failed: %v", addr, err)
 		}
 		defer c.Close()
 		c.SetDeadline(time.Now().Add(5 * time.Second))
@@ -456,34 +456,34 @@ func TestServerMultipleAddrs(t *testing.T) {
 		}
 		got := make([]byte, 5)
 		if _, err := io.ReadFull(c, got); err != nil {
-			t.Fatalf("%v 没有回显: %v", addr, err)
+			t.Fatalf("%v did not echo: %v", addr, err)
 		}
 		if string(got) != "hello" {
-			t.Fatalf("%v 回显 %q", addr, got)
+			t.Fatalf("%v echoed %q", addr, got)
 		}
 	}
 	if len(ports) != numAddrs {
-		t.Fatalf("Addrs() 里有重复地址: %v", addrs)
+		t.Fatalf("Addrs() contains duplicate addresses: %v", addrs)
 	}
 
 	srv.Close() // closing the one server closes the connections of all the addresses
 	for range numAddrs {
 		if err := <-closed; !errors.Is(err, ErrServerClosed) {
-			t.Fatalf("OnClose 的 err = %v, 期望 ErrServerClosed", err)
+			t.Fatalf("OnClose err = %v, want ErrServerClosed", err)
 		}
 	}
 	if err := <-served; !errors.Is(err, ErrServerClosed) {
-		t.Fatalf("Serve 返回 %v, 期望 ErrServerClosed", err)
+		t.Fatalf("Serve returned %v, want ErrServerClosed", err)
 	}
 }
 
 // TestNewServerAddrsNoAddrs verifies a server without an address to listen on is rejected rather than started
 // as a server that can never be reached.
 func TestNewServerAddrsNoAddrs(t *testing.T) {
-	for name, addrs := range map[string][]string{"nil": nil, "空切片": {}} {
+	for name, addrs := range map[string][]string{"nil": nil, "empty slice": {}} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := NewServerAddrs(addrs, &funcHandler{}, Options{}); err == nil {
-				t.Fatal("NewServerAddrs 没有地址时应返回错误")
+				t.Fatal("NewServerAddrs should return an error when there are no addresses")
 			}
 		})
 	}
@@ -507,13 +507,13 @@ func TestNewServerAddrsPartialBindFailure(t *testing.T) {
 	}
 	defer taken.Close()
 	if _, err := NewServerAddrs([]string{addr, taken.Addr().String()}, &funcHandler{}, Options{}); err == nil {
-		t.Fatal("NewServerAddrs 绑定一个已占用的地址时应返回错误")
+		t.Fatal("NewServerAddrs should return an error when binding an address already in use")
 	}
 
 	// The first listener was released, so the port is free again.
 	again, err := net.Listen("tcp", addr)
 	if err != nil {
-		t.Fatalf("第一个 listener 没有被释放, %v 仍被占用: %v", addr, err)
+		t.Fatalf("the first listener was not released, %v is still in use: %v", addr, err)
 	}
 	again.Close()
 }
@@ -525,14 +525,14 @@ func TestDefaultNumLoopsFollowsGOMAXPROCS(t *testing.T) {
 	previous := runtime.GOMAXPROCS(24)
 	defer runtime.GOMAXPROCS(previous)
 	if got := (Options{}).withDefaults().NumLoops; got != 3 {
-		t.Fatalf("默认 NumLoops = %d, 期望 GOMAXPROCS(0)/8 = 3", got)
+		t.Fatalf("default NumLoops = %d, want GOMAXPROCS(0)/8 = 3", got)
 	}
 	runtime.GOMAXPROCS(4)
 	if got := (Options{}).withDefaults().NumLoops; got != 2 {
-		t.Fatalf("默认 NumLoops = %d, 期望至少 2", got)
+		t.Fatalf("default NumLoops = %d, want at least 2", got)
 	}
 	if got := (Options{NumLoops: 5}).withDefaults().NumLoops; got != 5 {
-		t.Fatalf("显式 NumLoops 被覆盖: %d", got)
+		t.Fatalf("explicit NumLoops was overridden: %d", got)
 	}
 }
 
@@ -564,19 +564,19 @@ func TestDeadline(t *testing.T) {
 	select {
 	case err := <-reasons:
 		if err != os.ErrDeadlineExceeded {
-			t.Fatalf("期限到期: OnClose(%v)", err)
+			t.Fatalf("deadline expired: OnClose(%v)", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("期限到期后连接未关闭")
+		t.Fatal("the connection was not closed after the deadline expired")
 	}
 	expired.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := expired.Read(make([]byte, 1)); err != io.EOF {
-		t.Fatalf("客户端应读到 EOF, got %v", err)
+		t.Fatalf("client should read EOF, got %v", err)
 	}
 	kept.SetDeadline(time.Now().Add(time.Second))
 	kept.Write([]byte("x"))
 	if _, err := io.ReadFull(kept, make([]byte, 1)); err != nil {
-		t.Fatalf("取消期限的连接: %v", err)
+		t.Fatalf("connection whose deadline was cleared: %v", err)
 	}
 }
 
@@ -591,13 +591,13 @@ func TestSerialCallbacks(t *testing.T) {
 	enter := func(t *testing.T, c Conn, first bool) {
 		st := c.Context().(*state)
 		if st.active.Add(1) != 1 {
-			t.Error("同一连接的回调并发执行")
+			t.Error("callbacks of one connection ran concurrently")
 		}
 		if st.closed.Load() {
-			t.Error("OnClose 之后仍有回调")
+			t.Error("a callback ran after OnClose")
 		}
 		if (st.events.Add(1) == 1) != first {
-			t.Error("OnOpen 不是第一个回调")
+			t.Error("OnOpen was not the first callback")
 		}
 	}
 	closed := make(chan struct{})
@@ -643,7 +643,7 @@ func TestReadBufferSmaller(t *testing.T) {
 	got := make([]byte, len(msg))
 	c.SetReadDeadline(time.Now().Add(10 * time.Second))
 	if _, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, msg) {
-		t.Fatalf("回显的数据不一致, err=%v", err)
+		t.Fatalf("echoed data mismatch, err=%v", err)
 	}
 }
 
@@ -654,7 +654,7 @@ func TestCloseInCallback(t *testing.T) {
 		c.Write(b)
 		c.Close()
 		if _, err := c.Write(b); !errors.Is(err, net.ErrClosed) {
-			t.Errorf("Close 之后写入: %v", err)
+			t.Errorf("write after Close: %v", err)
 		}
 		return len(b)
 	}})
@@ -662,7 +662,7 @@ func TestCloseInCallback(t *testing.T) {
 	c.Write([]byte("bye"))
 	got, err := io.ReadAll(c)
 	if err != nil || string(got) != "bye" {
-		t.Fatalf("收到 %q, err=%v", got, err)
+		t.Fatalf("received %q, err=%v", got, err)
 	}
 }
 
@@ -690,7 +690,7 @@ func TestCloseAfterData(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for received.Load() != clients || closed.Load() != clients {
 		if time.Now().After(deadline) {
-			t.Fatalf("收到 %d 字节, %d 个连接以 EOF 关闭, 期望都是 %d", received.Load(), closed.Load(), clients)
+			t.Fatalf("received %d bytes, %d connections closed with EOF, want all %d", received.Load(), closed.Load(), clients)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -722,10 +722,10 @@ func TestCloseWhilePaused(t *testing.T) {
 	select {
 	case err := <-reasons:
 		if err != io.EOF || received.Load() != 1 {
-			t.Fatalf("OnClose(%v), 收到 %d 字节", err, received.Load())
+			t.Fatalf("OnClose(%v), received %d bytes", err, received.Load())
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatalf("恢复读取后没有读到对端的关闭, 收到 %d 字节", received.Load())
+		t.Fatalf("did not read the peer close after resuming read, received %d bytes", received.Load())
 	}
 }
 
@@ -753,15 +753,15 @@ func TestPeerCloseKeepsBacklog(t *testing.T) {
 	c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	got, err := io.ReadAll(c)
 	if err != nil || !bytes.Equal(got, payload) {
-		t.Fatalf("收到 %d 字节, 期望 %d, err=%v", len(got), len(payload), err)
+		t.Fatalf("received %d bytes, want %d, err=%v", len(got), len(payload), err)
 	}
 	select {
 	case err := <-reasons:
 		if err != io.EOF {
-			t.Fatalf("OnClose(%v), 期望 io.EOF", err)
+			t.Fatalf("OnClose(%v), want io.EOF", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("没有回调 OnClose")
+		t.Fatal("OnClose was not called")
 	}
 }
 
@@ -786,15 +786,15 @@ func TestCloseThenPeerClose(t *testing.T) {
 	c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	got, err := io.ReadAll(c)
 	if err != nil || !bytes.Equal(got, payload) {
-		t.Fatalf("收到 %d 字节, 期望 %d, err=%v", len(got), len(payload), err)
+		t.Fatalf("received %d bytes, want %d, err=%v", len(got), len(payload), err)
 	}
 	select {
 	case err := <-reasons:
 		if err != nil {
-			t.Fatalf("OnClose(%v), 期望 nil", err)
+			t.Fatalf("OnClose(%v), want nil", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("没有回调 OnClose")
+		t.Fatal("OnClose was not called")
 	}
 }
 
@@ -850,7 +850,7 @@ func TestBackloggedLeftoverIsSmall(t *testing.T) {
 	runtime.GC()
 	runtime.ReadMemStats(&after)
 	if perConn := (int64(after.HeapInuse) - int64(before.HeapInuse)) / conns; perConn > 8*units.KB {
-		t.Fatalf("每个积压的连接占用 %dB，期望只为残留的半个帧占用内存", perConn)
+		t.Fatalf("each backed-up connection uses %dB, want memory only for the leftover half frame", perConn)
 	}
 }
 
@@ -887,7 +887,7 @@ func TestDetach(t *testing.T) {
 	io.WriteString(c, "headtail")
 	got := make([]byte, len(backlog))
 	if _, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, backlog) {
-		t.Fatalf("发送缓冲中的数据不一致, err=%v", err)
+		t.Fatalf("data in the send buffer does not match, err=%v", err)
 	}
 	r := <-detached
 	if r.err != nil {
@@ -899,31 +899,31 @@ func TestDetach(t *testing.T) {
 
 	buf := make([]byte, 4)
 	if _, err := io.ReadFull(nc, buf); err != nil || string(buf) != "tail" {
-		t.Fatalf("未消费的数据: %q %v", buf, err)
+		t.Fatalf("unconsumed data: %q %v", buf, err)
 	}
 	io.WriteString(c, "more")
 	if _, err := io.ReadFull(nc, buf); err != nil || string(buf) != "more" {
-		t.Fatalf("Detach 之后到达的数据: %q %v", buf, err)
+		t.Fatalf("data arriving after Detach: %q %v", buf, err)
 	}
 	io.WriteString(nc, "bye!")
 	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "bye!" {
-		t.Fatalf("经 net.Conn 写出的数据: %q %v", buf, err)
+		t.Fatalf("data written through the net.Conn: %q %v", buf, err)
 	}
 
 	if _, err := r.sc.Write([]byte("x")); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("Detach 后经原 Conn 写入: %v", err)
+		t.Fatalf("write through the original Conn after Detach: %v", err)
 	}
 	if _, err := r.sc.Detach(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("重复 Detach: %v", err)
+		t.Fatalf("second Detach: %v", err)
 	}
 	r.sc.Close() // does nothing to the detached connection
 	io.WriteString(nc, "ok")
 	if _, err := io.ReadFull(c, buf[:2]); err != nil || string(buf[:2]) != "ok" {
-		t.Fatalf("原 Conn 的 Close 影响了 net.Conn: %q %v", buf[:2], err)
+		t.Fatalf("Close of the original Conn affected the net.Conn: %q %v", buf[:2], err)
 	}
 	select {
 	case err := <-closed:
-		t.Fatalf("Detach 后回调了 OnClose(%v)", err)
+		t.Fatalf("OnClose was called after Detach (%v)", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -940,10 +940,10 @@ func TestDetachClosed(t *testing.T) {
 	sc := <-opened
 	sc.Close()
 	if _, err := sc.Detach(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("请求关闭后 Detach: %v", err)
+		t.Fatalf("Detach after close was requested: %v", err)
 	}
 	<-closed
 	if _, err := sc.Detach(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("关闭后 Detach: %v", err)
+		t.Fatalf("Detach after close: %v", err)
 	}
 }

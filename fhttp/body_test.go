@@ -47,7 +47,7 @@ func TestBufferedBody(t *testing.T) {
 	})
 	s := serve(t, mux, Options{})
 
-	t.Run("逐字节到达", func(t *testing.T) {
+	t.Run("one byte at a time", func(t *testing.T) {
 		c, err := net.Dial("tcp", s.Addr().String())
 		if err != nil {
 			t.Fatal(err)
@@ -79,7 +79,7 @@ func TestBufferedBody(t *testing.T) {
 	defer client.CloseIdleConnections()
 	base := "http://" + s.Addr().String()
 
-	t.Run("表单", func(t *testing.T) {
+	t.Run("form", func(t *testing.T) {
 		resp, err := client.PostForm(base+"/form?a=1", url.Values{"b": {"2"}})
 		if err != nil {
 			t.Fatal(err)
@@ -91,7 +91,7 @@ func TestBufferedBody(t *testing.T) {
 		}
 	})
 
-	t.Run("multipart 上传后删除临时文件", func(t *testing.T) {
+	t.Run("temporary file removed after multipart upload", func(t *testing.T) {
 		var form bytes.Buffer
 		mw := multipart.NewWriter(&form)
 		fw, _ := mw.CreateFormFile("file", "a.txt")
@@ -108,7 +108,7 @@ func TestBufferedBody(t *testing.T) {
 		}
 		name := <-onDisk
 		if _, err := os.Stat(name); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("临时文件 %s 未被删除: %v", name, err)
+			t.Fatalf("temporary file %s was not removed: %v", name, err)
 		}
 	})
 }
@@ -122,8 +122,8 @@ func TestExpectContinue(t *testing.T) {
 		body  string
 		close bool
 	}{
-		{"缓冲的请求体", "hello", false},
-		{"交给 net/http 的请求体", "hello!", true},
+		{"buffered body", "hello", false},
+		{"body handed to net/http", "hello!", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c, err := net.Dial("tcp", s.Addr().String())
@@ -136,10 +136,10 @@ func TestExpectContinue(t *testing.T) {
 				"POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: "+strconv.Itoa(len(tt.body))+"\r\n\r\n")
 			br := bufio.NewReader(c)
 			if resp, body := readResp(t, br); resp.StatusCode != 200 || body != "hello world" {
-				t.Fatalf("第一个响应: %d %q", resp.StatusCode, body)
+				t.Fatalf("first response: %d %q", resp.StatusCode, body)
 			}
 			if resp, _ := readResp(t, br); resp.StatusCode != http.StatusContinue {
-				t.Fatalf("期望 100 Continue, got %d", resp.StatusCode)
+				t.Fatalf("want 100 Continue, got %d", resp.StatusCode)
 			}
 			io.WriteString(c, tt.body)
 			if resp, got := readResp(t, br); resp.StatusCode != 200 || got != tt.body || resp.Close != tt.close {
@@ -217,7 +217,7 @@ func TestHandoff(t *testing.T) {
 		return resp, string(body)
 	}
 
-	t.Run("Handler 在请求体到齐前开始执行", func(t *testing.T) {
+	t.Run("Handler starts before the request body arrives", func(t *testing.T) {
 		const size = 8 * units.MB
 		pr, pw := io.Pipe()
 		go func() {
@@ -225,7 +225,7 @@ func TestHandoff(t *testing.T) {
 			select { // a server buffering the body would never start the Handler here
 			case <-started:
 			case <-time.After(5 * time.Second):
-				pw.CloseWithError(errors.New("Handler 没有在请求体到齐前开始执行"))
+				pw.CloseWithError(errors.New("Handler did not start before the request body arrived"))
 				return
 			}
 			pw.Write(make([]byte, size-64*units.KB))
@@ -238,11 +238,11 @@ func TestHandoff(t *testing.T) {
 		}
 		// The connection was closed after that request: the next one is served by fnet again.
 		if resp, _ := get(t, client, base+"/hello"); resp.StatusCode != 200 || resp.Close {
-			t.Fatalf("之后的请求: %d close=%v", resp.StatusCode, resp.Close)
+			t.Fatalf("following request: %d close=%v", resp.StatusCode, resp.Close)
 		}
 	})
 
-	t.Run("流式 multipart 上传大文件", func(t *testing.T) {
+	t.Run("streaming multipart upload of a large file", func(t *testing.T) {
 		data := make([]byte, 32*units.MB)
 		for i := range data {
 			data[i] = byte(rand.Uint32())
@@ -261,15 +261,15 @@ func TestHandoff(t *testing.T) {
 		}
 	})
 
-	t.Run("先回复之前的请求", func(t *testing.T) {
+	t.Run("reply to the earlier request first", func(t *testing.T) {
 		body := strings.Repeat("y", 2*units.KB)
 		br := dialRaw(t, s, "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"+
 			"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 2048\r\n\r\n"+body)
 		if resp, got := readResp(t, br); resp.StatusCode != 200 || got != "hello world" || resp.Close {
-			t.Fatalf("第一个响应: %d %q close=%v", resp.StatusCode, got, resp.Close)
+			t.Fatalf("first response: %d %q close=%v", resp.StatusCode, got, resp.Close)
 		}
 		if resp, got := readResp(t, br); resp.StatusCode != 200 || got != body || !resp.Close {
-			t.Fatalf("第二个响应: %d %d 字节 close=%v", resp.StatusCode, len(got), resp.Close)
+			t.Fatalf("second response: %d, %d bytes, close=%v", resp.StatusCode, len(got), resp.Close)
 		}
 		expectClosed(t, br)
 	})
@@ -293,12 +293,12 @@ func TestHandoffClose(t *testing.T) {
 	<-reading
 	s.Close()
 	if err := <-served; !errors.Is(err, http.ErrServerClosed) {
-		t.Fatalf("Serve 返回 %v", err)
+		t.Fatalf("Serve returned %v", err)
 	}
 	if err := <-done; err == nil {
-		t.Fatal("服务端关闭后 Handler 应读到错误")
+		t.Fatal("Handler should read an error after the server closes")
 	}
 	if _, err := br.ReadByte(); err == nil {
-		t.Fatal("期望连接被关闭")
+		t.Fatal("want the connection to be closed")
 	}
 }

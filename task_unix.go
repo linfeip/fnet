@@ -42,7 +42,8 @@ func (c *conn) notify(ev uint32) bool {
 // connection's loop-affine key. The caller must hold the task, see markEvents.
 func (c *conn) schedule() { c.loop.srv.opts.Executor(c.loop.taskKey(c.fd), c.task) }
 
-// markEvents 合并事件并取得唯一任务的提交权；返回 true 的调用方必须负责提交，不能丢弃。
+// markEvents merges events and takes the right to submit the connection's single task; a caller it returns true for
+// must submit it, never drop it.
 func (c *conn) markEvents(ev uint32) bool {
 	return c.state.Or(ev|scheduledBit)&scheduledBit == 0
 }

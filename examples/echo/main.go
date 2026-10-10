@@ -22,7 +22,7 @@ func (echo) OnData(c fnet.Conn, data []byte) int {
 func (echo) OnClose(c fnet.Conn, err error) {}
 
 func main() {
-	addr := flag.String("addr", ":9000", "监听地址")
+	addr := flag.String("addr", ":9000", "listen address")
 	flag.Parse()
 
 	srv, err := fnet.NewServer(*addr, echo{}, fnet.Options{})

@@ -42,6 +42,6 @@ func TestSocketOptions(t *testing.T) {
 // if adding, removing or reordering fields pushes it over, the fields have to be rearranged.
 func TestConnSize(t *testing.T) {
 	if size := unsafe.Sizeof(conn{}); unsafe.Sizeof(uintptr(0)) == 8 && size > 176 {
-		t.Fatalf("conn 为 %dB，超出 176B 的内存分级", size)
+		t.Fatalf("conn is %dB, over the 176B size class", size)
 	}
 }

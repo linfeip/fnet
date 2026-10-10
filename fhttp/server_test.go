@@ -62,7 +62,7 @@ func serve(t *testing.T, handler http.Handler, opts Options) *Server {
 	t.Cleanup(func() {
 		s.Close()
 		if err := <-served; !errors.Is(err, http.ErrServerClosed) {
-			t.Errorf("Serve 返回 %v", err)
+			t.Errorf("Serve returned %v", err)
 		}
 	})
 	return s
@@ -98,7 +98,7 @@ func TestClient(t *testing.T) {
 	_, addr1 := get(t, client, base+"/remote")
 	_, addr2 := get(t, client, base+"/remote")
 	if addr1 != addr2 {
-		t.Fatalf("连接未复用: %s vs %s", addr1, addr2)
+		t.Fatalf("connection was not reused: %s vs %s", addr1, addr2)
 	}
 
 	// A small body with Content-Length is buffered and served on fnet, keeping the connection alive; a chunked one
@@ -117,7 +117,7 @@ func TestClient(t *testing.T) {
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil || resp.StatusCode != 200 || string(body) != "ping" || resp.Close != tt.close {
-			t.Fatalf("带请求体的 POST: %d %q close=%v err=%v", resp.StatusCode, body, resp.Close, err)
+			t.Fatalf("POST with a body: %d %q close=%v err=%v", resp.StatusCode, body, resp.Close, err)
 		}
 	}
 
@@ -131,7 +131,7 @@ func TestClient(t *testing.T) {
 		t.Fatalf("GET /missing: %d", resp.StatusCode)
 	}
 	if _, body := get(t, client, base+"/big"); len(body) != 4*units.MB {
-		t.Fatalf("GET /big: %d 字节", len(body))
+		t.Fatalf("GET /big: %d bytes", len(body))
 	}
 
 	// Silence the log from the Handler panic. slog.SetDefault also rewrites the output and flags of the
@@ -141,7 +141,7 @@ func TestClient(t *testing.T) {
 	defer slog.SetDefault(slog.Default())
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if _, err := client.Get(base + "/panic"); err == nil {
-		t.Fatal("Handler panic 后连接应被关闭")
+		t.Fatal("the connection should be closed after a Handler panic")
 	}
 }
 
@@ -175,7 +175,7 @@ func readResp(t *testing.T, br *bufio.Reader) (*http.Response, string) {
 func expectClosed(t *testing.T, br *bufio.Reader) {
 	t.Helper()
 	if b, err := br.ReadByte(); err != io.EOF {
-		t.Fatalf("期望连接被关闭, got %q %v", b, err)
+		t.Fatalf("want the connection to be closed, got %q %v", b, err)
 	}
 }
 
@@ -211,13 +211,13 @@ func (discardConn) RemoteAddr() net.Addr  { return &net.TCPAddr{} }
 // connection a whole size class.
 func TestConnSize(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) != 8 {
-		t.Skip("尺寸按 64 位平台检查")
+		t.Skip("size checked for 64-bit platforms")
 	}
 	if size := unsafe.Sizeof(conn{}); size > 112 {
-		t.Fatalf("conn 为 %dB，超出 112B 的内存分级", size)
+		t.Fatalf("conn is %dB, over the 112B size class", size)
 	}
 	if size := unsafe.Sizeof(request{}); size > 32 {
-		t.Fatalf("request 为 %dB，超出 32B", size)
+		t.Fatalf("request is %dB, over 32B", size)
 	}
 }
 
@@ -233,14 +233,14 @@ func TestQueueCapacity(t *testing.T) {
 	}
 	c.serve()
 	if cap(c.queue) > maxRetainedQueueCapacity {
-		t.Fatalf("突发后队列容量 %d, 期望不超过 %d", cap(c.queue), maxRetainedQueueCapacity)
+		t.Fatalf("queue capacity after a burst %d, want no more than %d", cap(c.queue), maxRetainedQueueCapacity)
 	}
 
 	c.busy = true
 	c.push([]byte(req), 0)
 	c.serve()
 	if cap(c.queue) != 1 {
-		t.Fatalf("单个请求后队列容量 %d, 期望保留 1", cap(c.queue))
+		t.Fatalf("queue capacity after a single request %d, want to retain 1", cap(c.queue))
 	}
 }
 
@@ -265,7 +265,7 @@ func TestConnectionManagement(t *testing.T) {
 	// HTTP/1.1 Connection: close.
 	br = dialRaw(t, s, "GET /hello HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
 	if resp, _ := readResp(t, br); !resp.Close {
-		t.Fatal("响应应带 Connection: close")
+		t.Fatal("response should carry Connection: close")
 	}
 	expectClosed(t, br)
 }
@@ -318,10 +318,10 @@ func TestBadRequests(t *testing.T) {
 	} {
 		br := dialRaw(t, s, "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"+tt.req)
 		if resp, _ := readResp(t, br); resp.StatusCode != 200 {
-			t.Fatalf("第一个响应: %d", resp.StatusCode)
+			t.Fatalf("first response: %d", resp.StatusCode)
 		}
 		if resp, _ := readResp(t, br); resp.StatusCode != tt.status {
-			t.Fatalf("第二个响应: got %d, want %d", resp.StatusCode, tt.status)
+			t.Fatalf("second response: got %d, want %d", resp.StatusCode, tt.status)
 		}
 		expectClosed(t, br)
 	}
@@ -335,14 +335,14 @@ func TestValidHost(t *testing.T) {
 		"a_b-c.d~e", "a+b", "a,b", "a;b", "a=b", "a'b", "a!b", "a$b", "a(b)", "a*b", "a&b",
 	} {
 		if !validHost(host) {
-			t.Errorf("validHost(%q) = false, 期望 true", host)
+			t.Errorf("validHost(%q) = false, want true", host)
 		}
 	}
 	for _, host := range []string{
 		"a b", "a\tb", "a\"b", "a/b", "a\\b", "a<b>", "a@b", "a?b", "a#b", "a{b}", "a|b", "a^b", "a`b", "a\x00b", "a\x7fb", "aéb",
 	} {
 		if validHost(host) {
-			t.Errorf("validHost(%q) = true, 期望 false", host)
+			t.Errorf("validHost(%q) = true, want false", host)
 		}
 	}
 }
@@ -385,12 +385,12 @@ func TestH1Spec(t *testing.T) {
 			io.WriteString(c, tt.prefix)
 			c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 			if n, err := c.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
-				t.Fatalf("请求不完整时不应有响应: n=%d err=%v", n, err)
+				t.Fatalf("no response should arrive while the request is incomplete: n=%d err=%v", n, err)
 			}
 			io.WriteString(c, full[len(tt.prefix):])
 			c.SetReadDeadline(time.Now().Add(5 * time.Second))
 			if resp, _ := readResp(t, bufio.NewReader(c)); resp.StatusCode != http.StatusOK {
-				t.Fatalf("补齐请求后: got %d, want 200", resp.StatusCode)
+				t.Fatalf("after completing the request: got %d, want 200", resp.StatusCode)
 			}
 		})
 	}
@@ -479,20 +479,20 @@ func TestTimeouts(t *testing.T) {
 	expectDropped := func(t *testing.T, br *bufio.Reader) {
 		t.Helper()
 		if b, err := br.ReadByte(); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
-			t.Fatalf("期望连接被服务端关闭, got %q %v", b, err)
+			t.Fatalf("want the server to close the connection, got %q %v", b, err)
 		}
 	}
-	t.Run("新连接空闲", func(t *testing.T) {
+	t.Run("idle new connection", func(t *testing.T) {
 		t.Parallel()
 		expectDropped(t, dialRaw(t, s, ""))
 	})
-	t.Run("keep-alive 空闲", func(t *testing.T) {
+	t.Run("idle keep-alive", func(t *testing.T) {
 		t.Parallel()
 		br := dialRaw(t, s, "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n")
 		readResp(t, br)
 		expectDropped(t, br)
 	})
-	t.Run("慢速发送请求头", func(t *testing.T) {
+	t.Run("slow request header", func(t *testing.T) {
 		t.Parallel()
 		c, err := net.Dial("tcp", s.Addr().String())
 		if err != nil {
@@ -511,11 +511,11 @@ func TestTimeouts(t *testing.T) {
 		}()
 		expectDropped(t, bufio.NewReader(c))
 	})
-	t.Run("慢速发送请求体", func(t *testing.T) { // a buffered body is part of the request, under ReadHeaderTimeout
+	t.Run("slow request body", func(t *testing.T) { // a buffered body is part of the request, under ReadHeaderTimeout
 		t.Parallel()
 		expectDropped(t, dialRaw(t, s, "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel"))
 	})
-	t.Run("处理期间收到的不完整请求头", func(t *testing.T) {
+	t.Run("incomplete request header received while handling", func(t *testing.T) {
 		t.Parallel()
 		br := dialRaw(t, s, "GET /sleep HTTP/1.1\r\nHost: a\r\n\r\nGET /hel")
 		if _, body := readResp(t, br); body != "done" {
@@ -523,7 +523,7 @@ func TestTimeouts(t *testing.T) {
 		}
 		expectDropped(t, br)
 	})
-	t.Run("不限制", func(t *testing.T) {
+	t.Run("unlimited", func(t *testing.T) {
 		t.Parallel()
 		c, err := net.Dial("tcp", unlimited.Addr().String())
 		if err != nil {

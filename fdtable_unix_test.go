@@ -14,7 +14,7 @@ func TestFdTable(t *testing.T) {
 	var table fdTable
 	for _, fd := range []int{-1, 0, 5, fdPageSize, maxFd - 1, maxFd} {
 		if c := table.lookup(fd); c != nil {
-			t.Fatalf("空表 lookup(%d) = %v, 期望 nil", fd, c)
+			t.Fatalf("empty table lookup(%d) = %v, want nil", fd, c)
 		}
 	}
 	table.remove(&conn{fd: 7}) // nothing to remove
@@ -26,29 +26,29 @@ func TestFdTable(t *testing.T) {
 	for _, fd := range fds {
 		conns[fd] = &conn{fd: fd}
 		if !table.store(conns[fd]) {
-			t.Fatalf("store(%d) 失败", fd)
+			t.Fatalf("store(%d) failed", fd)
 		}
 		for stored, c := range conns {
 			if got := table.lookup(stored); got != c {
-				t.Fatalf("存入 fd %d 之后 lookup(%d) = %p, 期望 %p", fd, stored, got, c)
+				t.Fatalf("after storing fd %d, lookup(%d) = %p, want %p", fd, stored, got, c)
 			}
 		}
 	}
 	if c := table.lookup(6); c != nil {
-		t.Fatalf("没存过的 fd 6 查到了 %v", c)
+		t.Fatalf("lookup of never-stored fd 6 returned %v", c)
 	}
 	for _, fd := range []int{-1, maxFd, maxFd + 1} {
 		if table.store(&conn{fd: fd}) {
-			t.Fatalf("store(%d) 超出范围却成功了", fd)
+			t.Fatalf("store(%d) succeeded out of range", fd)
 		}
 	}
 
 	table.remove(conns[5])
 	if c := table.lookup(5); c != nil {
-		t.Fatalf("remove 之后 lookup(5) = %v, 期望 nil", c)
+		t.Fatalf("after remove, lookup(5) = %v, want nil", c)
 	}
 	if c := table.lookup(0); c != conns[0] {
-		t.Fatal("remove 一个 fd 影响了别的 fd")
+		t.Fatal("removing one fd affected another fd")
 	}
 }
 
@@ -61,11 +61,11 @@ func TestFdTableRemoveKeepsReusedFd(t *testing.T) {
 	table.store(reused)
 	table.remove(old)
 	if c := table.lookup(9); c != reused {
-		t.Fatalf("lookup(9) = %p, 期望复用 fd 的新连接 %p", c, reused)
+		t.Fatalf("lookup(9) = %p, want the new connection that reused the fd %p", c, reused)
 	}
 	table.remove(reused)
 	if c := table.lookup(9); c != nil {
-		t.Fatalf("lookup(9) = %v, 期望 nil", c)
+		t.Fatalf("lookup(9) = %v, want nil", c)
 	}
 }
 
@@ -95,7 +95,7 @@ func TestFdTableConcurrentFirstStore(t *testing.T) {
 		wg.Wait()
 		for _, c := range conns {
 			if got := table.lookup(c.fd); got != c {
-				t.Fatalf("第 %d 轮: lookup(%d) = %p, 期望 %p (存入的连接被丢弃的页带走了)", round, c.fd, got, c)
+				t.Fatalf("round %d: lookup(%d) = %p, want %p (a discarded page carried the stored connection away)", round, c.fd, got, c)
 			}
 		}
 	}
@@ -115,7 +115,7 @@ func TestFdTableConcurrentReadWrite(t *testing.T) {
 			defer wg.Done()
 			for !stop.Load() {
 				if c := table.lookup(fd); c != nil && c.fd != fd {
-					t.Errorf("lookup(%d) 返回了没有初始化完整的连接: fd=%d", fd, c.fd)
+					t.Errorf("lookup(%d) returned a connection that was not fully initialised: fd=%d", fd, c.fd)
 					return
 				}
 			}

@@ -21,7 +21,7 @@ func waitGroup(t *testing.T, wg *sync.WaitGroup) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("任务未全部执行")
+		t.Fatal("not all tasks ran")
 	}
 }
 
@@ -46,12 +46,12 @@ func TestEveryTaskRunsOnce(t *testing.T) {
 	waitGroup(t, &wg)
 	for i := range runs {
 		if n := runs[i].Load(); n != 1 {
-			t.Fatalf("任务 %d 执行了 %d 次", i, n)
+			t.Fatalf("task %d ran %d times", i, n)
 		}
 	}
 	for i := range p.shards {
 		if n := p.shards[i].liveWorkers.Load(); n > 4 {
-			t.Fatalf("分片 %d 启动了 %d 个 worker，超过上限", i, n)
+			t.Fatalf("shard %d started %d workers, over the limit", i, n)
 		}
 	}
 }
@@ -67,7 +67,7 @@ func TestSubmitToKeyShard(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
-			t.Fatalf("key %d 的任务没有执行", key)
+			t.Fatalf("task for key %d did not run", key)
 		}
 	}
 	for i := range p.shards {
@@ -76,7 +76,7 @@ func TestSubmitToKeyShard(t *testing.T) {
 			want = 1
 		}
 		if n := p.shards[i].liveWorkers.Load(); n != want {
-			t.Fatalf("分片 %d 启动了 %d 个 worker, 期望 %d", i, n, want)
+			t.Fatalf("shard %d started %d workers, want %d", i, n, want)
 		}
 	}
 }
@@ -90,7 +90,7 @@ func TestWakeAfterIdle(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
-			t.Fatalf("第 %d 个任务未执行", i)
+			t.Fatalf("task %d did not run", i)
 		}
 		if i%100 == 0 {
 			time.Sleep(time.Millisecond) // let the worker actually suspend
@@ -158,12 +158,12 @@ func TestSubmitNoAlloc(t *testing.T) {
 	waitGroup(t, &wg)
 	wg.Add(101) // AllocsPerRun does one warm-up run before the 100 measured ones
 	if allocs := testing.AllocsPerRun(100, func() { p.Submit(task) }); allocs != 0 {
-		t.Fatalf("每次投递分配 %v 次", allocs)
+		t.Fatalf("Submit allocated %v times per call", allocs)
 	}
 	waitGroup(t, &wg)
 }
 
-// TestSubmitBatchEveryTaskRunsOnce 覆盖并发批量提交和溢出，每个任务只执行一次。
+// TestSubmitBatchEveryTaskRunsOnce covers concurrent batch submission and overflow, with every task running once.
 func TestSubmitBatchEveryTaskRunsOnce(t *testing.T) {
 	const submitters, batches, batchSize = 8, 100, 32
 	p := New(4, 4, 64)
@@ -179,19 +179,19 @@ func TestSubmitBatchEveryTaskRunsOnce(t *testing.T) {
 					tasks[i] = func() { runs[index].Add(1); wg.Done() }
 				}
 				p.SubmitBatch(tasks)
-				clear(tasks) // 提交后不能继续引用调用者的切片。
+				clear(tasks) // the slice must not be referenced after submission.
 			}
 		}()
 	}
 	waitGroup(t, &wg)
 	for i := range runs {
 		if n := runs[i].Load(); n != 1 {
-			t.Fatalf("任务 %d 执行了 %d 次", i, n)
+			t.Fatalf("task %d ran %d times", i, n)
 		}
 	}
 }
 
-// TestSubmitBatchNoAlloc 验证预热后提交批次不产生临时切片或包装对象。
+// TestSubmitBatchNoAlloc verifies that after warm-up submitting a batch allocates no temporary slice or wrapper.
 func TestSubmitBatchNoAlloc(t *testing.T) {
 	p := New(4, 1, 8192)
 	var wg sync.WaitGroup
@@ -204,16 +204,17 @@ func TestSubmitBatchNoAlloc(t *testing.T) {
 	waitGroup(t, &wg)
 	wg.Add(101 * len(tasks))
 	if allocs := testing.AllocsPerRun(100, func() { p.SubmitBatch(tasks) }); allocs != 0 {
-		t.Fatalf("每批提交分配 %v 次", allocs)
+		t.Fatalf("SubmitBatch allocated %v times per batch", allocs)
 	}
 	waitGroup(t, &wg)
 }
 
-// TestBlockedCallbacksUpToLimit 验证同时阻塞的回调数只受 分片数 × maxWorkers 限制：每个回调都占着一个 worker，
-// 全部必须同时开始运行，而不是排队等其中某一个返回。
+// TestBlockedCallbacksUpToLimit verifies that the number of callbacks blocking at the same time is limited only by
+// shards * maxWorkers: each callback holds one worker, and all of them must start running at the same time instead of
+// queuing behind one of them returning.
 func TestBlockedCallbacksUpToLimit(t *testing.T) {
 	p := New(2, 16, 1024)
-	const blocked = 32 // 随机分到分片后某个分片超过 16 个时，借别的分片的余量
+	const blocked = 32 // after random shard placement one shard exceeds 16, so it borrows room from another shard
 	release := make(chan struct{})
 	defer close(release)
 	var started sync.WaitGroup
@@ -224,7 +225,8 @@ func TestBlockedCallbacksUpToLimit(t *testing.T) {
 	waitGroup(t, &started)
 }
 
-// TestBlockedWorkerIsolation 队列未满时，阻塞回调后面的任务也必须由新的 worker 执行。
+// TestBlockedWorkerIsolation: while the queue is not full, tasks behind a blocking callback must also be run by a new
+// worker.
 func TestBlockedWorkerIsolation(t *testing.T) {
 	p := New(1, 2, 1024)
 	release, started := make(chan struct{}), make(chan struct{})
@@ -240,7 +242,7 @@ func TestBlockedWorkerIsolation(t *testing.T) {
 	p.SubmitBatch(tasks)
 	waitGroup(t, &wg)
 	if workers := p.shards[0].liveWorkers.Load(); workers != 2 {
-		t.Fatalf("阻塞隔离启动 %d 个 worker，期望 2", workers)
+		t.Fatalf("blocking isolation started %d workers, want 2", workers)
 	}
 }
 
@@ -280,17 +282,18 @@ func waitQuiescent(t *testing.T, p *Pool) {
 			}
 		}
 		return true
-	}, "唤醒权或挂起位泄漏")
+	}, "wakeup rights or suspension bits leaked")
 }
 
-// TestBorrowIdleWorker 分片 0 的 worker 已达上限且在阻塞，分片 1 有挂起的 worker：分片 0 的任务由它来执行。
+// TestBorrowIdleWorker: shard 0 is at its worker limit and blocking, while shard 1 has a suspended worker; that worker
+// runs shard 0's task.
 func TestBorrowIdleWorker(t *testing.T) {
 	p := New(2, 1, 64)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	submitTo(p, 1, wg.Done)
 	waitGroup(t, &wg)
-	waitUntil(t, func() bool { return p.shards[1].idleWorkers[0].Load() != 0 }, "分片 1 的 worker 没有挂起")
+	waitUntil(t, func() bool { return p.shards[1].idleWorkers[0].Load() != 0 }, "shard 1's worker did not suspend")
 	release, started := make(chan struct{}), make(chan struct{})
 	submitTo(p, 0, func() { close(started); <-release })
 	<-started
@@ -298,13 +301,14 @@ func TestBorrowIdleWorker(t *testing.T) {
 	submitTo(p, 0, wg.Done)
 	waitGroup(t, &wg)
 	if a, b := p.shards[0].liveWorkers.Load(), p.shards[1].liveWorkers.Load(); a != 1 || b != 1 {
-		t.Fatalf("liveWorkers = %d, %d，期望 1, 1", a, b)
+		t.Fatalf("liveWorkers = %d, %d, want 1, 1", a, b)
 	}
 	close(release)
 	waitQuiescent(t, p)
 }
 
-// TestStartWorkerElsewhere 分片 0 已达上限且在阻塞，别处没有挂起的 worker，但分片 1 还有余量：在分片 1 新建一个。
+// TestStartWorkerElsewhere: shard 0 is at its limit and blocking, no worker is suspended elsewhere, but shard 1 still
+// has room, so a new worker is started there.
 func TestStartWorkerElsewhere(t *testing.T) {
 	p := New(2, 1, 64)
 	release, started := make(chan struct{}), make(chan struct{})
@@ -315,14 +319,14 @@ func TestStartWorkerElsewhere(t *testing.T) {
 	submitTo(p, 0, wg.Done)
 	waitGroup(t, &wg)
 	if n := p.shards[1].liveWorkers.Load(); n != 1 {
-		t.Fatalf("分片 1 liveWorkers = %d，期望 1", n)
+		t.Fatalf("shard 1 liveWorkers = %d, want 1", n)
 	}
 	close(release)
 	waitQuiescent(t, p)
 }
 
-// TestRescueStarvingShard 整个池的 worker 都在阻塞时任务排队并置 starving；分片 1 的 worker 一空出来就接手分片 0
-// 的任务，而分片 0 自己的 worker 仍在阻塞。
+// TestRescueStarvingShard: when every worker in the pool is blocking, a task is queued and starving is set; as soon as
+// shard 1's worker frees up it takes over shard 0's task while shard 0's own worker is still blocking.
 func TestRescueStarvingShard(t *testing.T) {
 	p := New(2, 1, 64)
 	releaseOwn, releaseOther := make(chan struct{}), make(chan struct{})
@@ -336,17 +340,18 @@ func TestRescueStarvingShard(t *testing.T) {
 	wg.Add(1)
 	submitTo(p, 0, func() { ran.Store(true); wg.Done() })
 	if !p.starving.Load() {
-		t.Fatal("整个池没有可用 worker 时没有置 starving")
+		t.Fatal("starving was not set when the whole pool had no available worker")
 	}
 	time.Sleep(10 * time.Millisecond)
 	if ran.Load() {
-		t.Fatal("没有可用 worker 时任务却执行了")
+		t.Fatal("the task ran even though no worker was available")
 	}
 	close(releaseOther)
 	waitGroup(t, &wg)
 }
 
-// TestBlockedCallbacksUpToPoolLimit 阻塞任务全部提交到一个分片，也能用满 分片数 × maxWorkers 个 worker。
+// TestBlockedCallbacksUpToPoolLimit: even when all blocking tasks are submitted to one shard, the pool can still use
+// shards * maxWorkers workers.
 func TestBlockedCallbacksUpToPoolLimit(t *testing.T) {
 	p := New(4, 4, 1024)
 	release := make(chan struct{})
@@ -360,9 +365,10 @@ func TestBlockedCallbacksUpToPoolLimit(t *testing.T) {
 	waitQuiescent(t, p)
 }
 
-// TestSaturatedStress 在 worker 经常用满时混合提交短任务、阻塞任务和调用 Goexit 的任务（配合 -race）：每个任务
-// 恰好执行一次，每个分片的 worker 不超过上限，最后唤醒权和挂起位都没有泄漏。小队列下溢出也频繁发生，大队列下任务
-// 留在队列里，跨分片借用和 starving 的路径用得最多。
+// TestSaturatedStress mixes short tasks, blocking tasks, and tasks calling Goexit (run with -race) while the workers
+// are often saturated: every task runs exactly once, no shard exceeds its worker limit, and no wakeup right or
+// suspension bit leaks. A small queue makes overflow frequent as well; a large queue keeps tasks in the queue and
+// exercises cross-shard borrowing and starving the most.
 func TestSaturatedStress(t *testing.T) {
 	for _, capacity := range []int{16, 1 << 16} {
 		t.Run(fmt.Sprintf("capacity=%d", capacity), func(t *testing.T) { saturatedStress(t, capacity) })
@@ -393,12 +399,12 @@ func saturatedStress(t *testing.T, capacity int) {
 	waitGroup(t, &wg)
 	for i := range runs {
 		if n := runs[i].Load(); n != 1 {
-			t.Fatalf("任务 %d 执行了 %d 次", i, n)
+			t.Fatalf("task %d ran %d times", i, n)
 		}
 	}
 	for i := range p.shards {
 		if n := p.shards[i].liveWorkers.Load(); n > 2 {
-			t.Fatalf("分片 %d 启动了 %d 个 worker，超过上限", i, n)
+			t.Fatalf("shard %d started %d workers, over the limit", i, n)
 		}
 	}
 	waitQuiescent(t, p)
@@ -409,15 +415,16 @@ func TestShardCacheLineSeparation(t *testing.T) {
 	if unsafe.Offsetof(s.head)-unsafe.Offsetof(s.tail) < cacheLineSize ||
 		unsafe.Offsetof(s.wakingWorkers)-unsafe.Offsetof(s.head) < cacheLineSize ||
 		unsafe.Sizeof(s)+unsafe.Offsetof(s.tail)-(unsafe.Offsetof(s.idleWorkers)+unsafe.Sizeof(s.idleWorkers)) < cacheLineSize {
-		t.Fatal("队列头尾或相邻分片的 worker 状态未隔离缓存行")
+		t.Fatal("the queue head/tail or the worker state of adjacent shards is not isolated on its own cache line")
 	}
 	var p Pool
 	if unsafe.Offsetof(p.starving)-unsafe.Offsetof(p.shards) < cacheLineSize {
-		t.Fatal("starving 与每次 Submit 都读的 shards 在同一缓存行")
+		t.Fatal("starving shares a cache line with shards, which every Submit reads")
 	}
 }
 
-// BenchmarkSubmitRounds 模拟 readiness 回合，分别比较随机提交、均匀单个提交和均匀批量提交。
+// BenchmarkSubmitRounds simulates readiness rounds and compares random submission, even individual submission, and even
+// batch submission.
 func BenchmarkSubmitRounds(b *testing.B) {
 	for _, size := range []int{1, 32, 256} {
 		for _, mode := range []string{"random", "round_robin", "batch"} {

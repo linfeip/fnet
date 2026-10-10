@@ -26,7 +26,7 @@ func frameAll(in string, step int) ([]string, error, bool) {
 			}
 			if expect {
 				if expectContinue {
-					return msgs, errors.New("100 Continue 被请求了两次"), true
+					return msgs, errors.New("100 Continue was requested twice"), true
 				}
 				expectContinue = true
 			}
@@ -51,25 +51,25 @@ func TestFramer(t *testing.T) {
 		want []string
 		err  error
 	}{
-		{"单个请求", get, []string{get}, nil},
+		{"single request", get, []string{get}, nil},
 		{"pipelining", get + get + get, []string{get, get, get}, nil},
-		{"请求体按 Content-Length 切出", post + get + post, []string{post, get, post}, nil},
-		{"请求体未到齐", post[:len(post)-1], nil, nil},
-		{"字段名不区分大小写", "POST / HTTP/1.1\r\ncontent-LENGTH:\t3 \r\n\r\nabc", []string{"POST / HTTP/1.1\r\ncontent-LENGTH:\t3 \r\n\r\nabc"}, nil},
+		{"body split out by Content-Length", post + get + post, []string{post, get, post}, nil},
+		{"body not complete", post[:len(post)-1], nil, nil},
+		{"field name case-insensitive", "POST / HTTP/1.1\r\ncontent-LENGTH:\t3 \r\n\r\nabc", []string{"POST / HTTP/1.1\r\ncontent-LENGTH:\t3 \r\n\r\nabc"}, nil},
 		{"Content-Length: 0", "POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n" + get, []string{"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n", get}, nil},
 		// Not recognized as Content-Length: the message ends at the header, and conn.handle rejects it once the
 		// standard library reads a body length out of it.
-		{"冒号前有空格", "POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\n", []string{"POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\n"}, nil},
+		{"space before the colon", "POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\n", []string{"POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\n"}, nil},
 		{"Expect: 100-continue", "POST / HTTP/1.1\r\nExpect: 100-Continue\r\nContent-Length: 1\r\n\r\nx", []string{"POST / HTTP/1.1\r\nExpect: 100-Continue\r\nContent-Length: 1\r\n\r\nx"}, nil},
 		// Earlier messages are split out before the one that goes to net/http.
-		{"请求体过大", get + "POST / HTTP/1.1\r\nContent-Length: 17\r\n\r\n", []string{get}, errStreamBody},
+		{"body too large", get + "POST / HTTP/1.1\r\nContent-Length: 17\r\n\r\n", []string{get}, errStreamBody},
 		{"chunked", "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", nil, errStreamBody},
-		{"非法 Content-Length", "POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n", nil, errStreamBody},
-		{"空 Content-Length", "POST / HTTP/1.1\r\nContent-Length: \r\n\r\n", nil, errStreamBody},
-		{"重复 Content-Length", "POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx", nil, errStreamBody},
-		{"其他 Expect", "POST / HTTP/1.1\r\nExpect: foo\r\n\r\n", nil, errStreamBody},
-		{"头部过大且未结束", "GET / HTTP/1.1\r\nX: " + strings.Repeat("a", 1100), nil, errHeaderTooLarge},
-		{"头部过大", "GET / HTTP/1.1\r\nX: " + strings.Repeat("a", 1100) + "\r\n\r\n", nil, errHeaderTooLarge},
+		{"invalid Content-Length", "POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n", nil, errStreamBody},
+		{"empty Content-Length", "POST / HTTP/1.1\r\nContent-Length: \r\n\r\n", nil, errStreamBody},
+		{"duplicate Content-Length", "POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx", nil, errStreamBody},
+		{"other Expect", "POST / HTTP/1.1\r\nExpect: foo\r\n\r\n", nil, errStreamBody},
+		{"header too large and not ended", "GET / HTTP/1.1\r\nX: " + strings.Repeat("a", 1100), nil, errHeaderTooLarge},
+		{"header too large", "GET / HTTP/1.1\r\nX: " + strings.Repeat("a", 1100) + "\r\n\r\n", nil, errHeaderTooLarge},
 	}
 	for _, tt := range tests {
 		for _, step := range []int{len(tt.in), 1, 7} {
@@ -91,11 +91,11 @@ func TestFramerExpectContinue(t *testing.T) {
 		step int
 		want bool
 	}{
-		{"请求体未到", header, len(header), true},
-		{"请求体分开到达", header + "x", len(header), true},
-		{"请求体随头部一起到达", header + "x", len(header) + 1, false},
+		{"body not arrived", header, len(header), true},
+		{"body arrives separately", header + "x", len(header), true},
+		{"body arrives with the header", header + "x", len(header) + 1, false},
 		{"HTTP/1.0", strings.Replace(header, "HTTP/1.1", "HTTP/1.0", 1), len(header), false},
-		{"没有请求体", "GET / HTTP/1.1\r\nExpect: 100-continue\r\n\r\n", 100, false},
+		{"no request body", "GET / HTTP/1.1\r\nExpect: 100-continue\r\n\r\n", 100, false},
 	}
 	for _, tt := range tests {
 		if _, _, got := frameAll(tt.in, tt.step); got != tt.want {

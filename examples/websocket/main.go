@@ -22,7 +22,7 @@ func (echo) OnMessage(c *websocket.Conn, op ws.OpCode, data []byte) { c.WriteMes
 func (echo) OnClose(c *websocket.Conn, err error)                   {}
 
 func main() {
-	addr := flag.String("addr", ":8080", "监听地址")
+	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
 
 	mux := http.NewServeMux()

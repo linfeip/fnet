@@ -59,8 +59,9 @@ type Conn struct {
 	writeMu     sync.Mutex               // guarantees that no frame is sent after the close frame
 	connection  fnet.Conn
 	handler     Handler
-	// 攒写缓冲区内嵌在连接中，避免每批分配包装对象；仅在持有 writeMu 时访问。
-	// Bytes 为 nil 表示未攒写，每轮结束时归还底层数组，不在空闲连接上保留。
+	// The cork buffer is embedded in the connection to avoid allocating a wrapper per batch; it is accessed only while
+	// holding writeMu. A nil Bytes means nothing is corked, and the underlying array is returned at the end of each
+	// round so idle connections do not keep it.
 	corkBuffer     bytepool.Buffer
 	message        bytepool.Buffer // the fragmented message being reassembled (already unmasked); callbacks only
 	maxMessageSize int

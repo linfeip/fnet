@@ -61,7 +61,7 @@ func TestDelete(t *testing.T) {
 	unix.Write(b, []byte("y"))
 	p.Wake()
 	if got, woken := waitOnce(t, p); !woken || len(got) != 0 {
-		t.Fatalf("注销后不应有事件, got %v woken=%v", got, woken)
+		t.Fatalf("no events should arrive after deregistration, got %v woken=%v", got, woken)
 	}
 }
 
@@ -75,23 +75,23 @@ func TestEdgeTriggered(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got, _ := waitOnce(t, p); got[a] != EventWrite {
-		t.Fatalf("期望注册时报告可写, got %v", got)
+		t.Fatalf("want writable reported at registration, got %v", got)
 	}
 
 	// epoll reports every event the fd is ready for at that moment, so a readability notification may carry
 	// writability along with it.
 	unix.Write(b, []byte("x"))
 	if got, _ := waitOnce(t, p); got[a]&EventRead == 0 {
-		t.Fatalf("期望可读事件, got %v", got)
+		t.Fatalf("want readable event, got %v", got)
 	}
 	p.Wake() // use Wake to guarantee Block returns
 	if got, woken := waitOnce(t, p); !woken || len(got) != 0 {
-		t.Fatalf("边沿触发下数据未读走也不应重复报告, got %v woken=%v", got, woken)
+		t.Fatalf("under edge-triggered mode there should be no repeat report while the data is unread, got %v woken=%v", got, woken)
 	}
 
 	unix.Write(b, []byte("y"))
 	if got, _ := waitOnce(t, p); got[a]&EventRead == 0 {
-		t.Fatalf("新数据到达应再次报告可读, got %v", got)
+		t.Fatalf("new data should be reported readable again, got %v", got)
 	}
 }
 
@@ -128,10 +128,10 @@ func TestPoll(t *testing.T) {
 	}()
 	<-done
 	if !woken || len(got) != 1 || got[a]&EventRead == 0 {
-		t.Fatalf("期望取到可读事件和唤醒信号, got %v woken=%v", got, woken)
+		t.Fatalf("want a readable event and a wakeup signal, got %v woken=%v", got, woken)
 	}
 	if woken := p.Poll(&batch); woken || batch.Len() != 0 {
-		t.Fatalf("已取走的事件和唤醒信号不应重复报告, got %v woken=%v", batchEvents(&batch), woken)
+		t.Fatalf("taken events and wakeup signals should not be reported again, got %v woken=%v", batchEvents(&batch), woken)
 	}
 }
 
@@ -158,7 +158,7 @@ func TestBlock(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			t.Fatal("Block 未返回")
+			t.Fatal("Block did not return")
 		}
 	}
 }
@@ -177,14 +177,14 @@ func TestEdgeHup(t *testing.T) {
 	unix.Shutdown(b, unix.SHUT_WR)
 	got, _ := waitOnce(t, p)
 	if got[a]&(EventRead|EventHup) != EventRead|EventHup {
-		t.Fatalf("期望可读并带 EventHup, got %v", got)
+		t.Fatalf("want readable with EventHup, got %v", got)
 	}
 	if n, _ := unix.Read(a, make([]byte, 16)); n != 1 {
-		t.Fatalf("期望读到数据, n=%d", n)
+		t.Fatalf("want to read data, n=%d", n)
 	}
 	p.Wake()
 	if got, woken := waitOnce(t, p); !woken || got[a]&EventRead != 0 {
-		t.Fatalf("数据读完后不应再有可读通知, got %v woken=%v", got, woken)
+		t.Fatalf("no readable notification should remain after the data is read, got %v woken=%v", got, woken)
 	}
 }
 
@@ -213,7 +213,7 @@ func TestEdgeWritable(t *testing.T) {
 	}
 	p.Wake() // the event was already ready while the peer read the data; Wake only guarantees Block returns
 	if got, _ := waitOnce(t, p); got[a]&EventWrite == 0 {
-		t.Fatalf("期望可写事件, got %v", got)
+		t.Fatalf("want writable event, got %v", got)
 	}
 }
 
@@ -224,10 +224,10 @@ func TestPeerCloseIsReadable(t *testing.T) {
 	p.AddEdge(a)
 	unix.Close(b)
 	if got, _ := waitOnce(t, p); got[a]&EventRead == 0 {
-		t.Fatalf("对端关闭应报告可读, got %v", got)
+		t.Fatalf("peer close should be reported readable, got %v", got)
 	}
 	if n, _ := unix.Read(a, make([]byte, 16)); n != 0 {
-		t.Fatalf("期望读到 EOF, n=%d", n)
+		t.Fatalf("want EOF, n=%d", n)
 	}
 }
 
@@ -245,11 +245,11 @@ func TestConcurrentWake(t *testing.T) {
 	}
 	wg.Wait()
 	if _, woken := waitOnce(t, p); !woken {
-		t.Fatal("期望被唤醒")
+		t.Fatal("want to be woken")
 	}
 	// Once the wakeup flag has been consumed, a new Wake must take effect again.
 	p.Wake()
 	if _, woken := waitOnce(t, p); !woken {
-		t.Fatal("第二次 Wake 丢失")
+		t.Fatal("second Wake was lost")
 	}
 }

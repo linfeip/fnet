@@ -87,16 +87,16 @@ func TestServeRetriesTemporaryAcceptError(t *testing.T) {
 	c.SetDeadline(time.Now().Add(5 * time.Second))
 	c.Write([]byte("hello"))
 	if _, err := io.ReadFull(c, make([]byte, 5)); err != nil {
-		t.Fatalf("临时错误之后没有继续接受连接: %v", err)
+		t.Fatalf("did not keep accepting connections after a temporary error: %v", err)
 	}
 	srv.Close()
 	if err := <-served; !errors.Is(err, ErrServerClosed) {
-		t.Fatalf("Serve 返回 %v, 期望 ErrServerClosed", err)
+		t.Fatalf("Serve returned %v, want ErrServerClosed", err)
 	}
 
 	records.mu.Lock()
 	defer records.mu.Unlock()
 	if want := []time.Duration{5 * time.Millisecond, 10 * time.Millisecond, 20 * time.Millisecond}; !slices.Equal(records.delays, want) {
-		t.Fatalf("日志中的退避时间 %v, 期望 %v", records.delays, want)
+		t.Fatalf("backoff delays in the log %v, want %v", records.delays, want)
 	}
 }

@@ -36,8 +36,8 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":8080", "监听地址")
-	dir := flag.String("dir", filepath.Join(os.TempDir(), "fhttp-uploads"), "上传文件的保存目录")
+	addr := flag.String("addr", ":8080", "listen address")
+	dir := flag.String("dir", filepath.Join(os.TempDir(), "fhttp-uploads"), "directory for uploaded files")
 	flag.Parse()
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
 		panic(err)

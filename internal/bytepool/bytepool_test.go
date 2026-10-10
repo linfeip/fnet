@@ -19,11 +19,11 @@ func TestGetRelease(t *testing.T) {
 	b.AppendString("hello")
 	b.Release()
 	if b.Bytes() != nil {
-		t.Fatal("Release 后缓冲应为零值")
+		t.Fatal("buffer should be zero after Release")
 	}
 	b.Release() // releasing again is a no-op
 	if b := Get(700); b.Len() != 0 || cap(b.Bytes()) != units.KB {
-		t.Fatalf("复用缓冲: len=%d cap=%d", b.Len(), cap(b.Bytes()))
+		t.Fatalf("reused buffer: len=%d cap=%d", b.Len(), cap(b.Bytes()))
 	}
 	b = Buffer{data: make([]byte, 0, 1000)}
 	b.Release() // a capacity outside the size classes must be ignored
@@ -38,7 +38,7 @@ func TestAppend(t *testing.T) {
 		want = append(want, chunk...)
 	}
 	if !bytes.Equal(buf.Bytes(), want) {
-		t.Fatal("Append 内容不一致")
+		t.Fatal("Append content mismatch")
 	}
 	buf.Release()
 }
@@ -59,7 +59,7 @@ func TestAppendBeyondMaxClass(t *testing.T) {
 		}
 	}
 	if reallocs > 40 {
-		t.Fatalf("追加到 %dMB 重新分配了 %d 次", buf.Len()>>20, reallocs)
+		t.Fatalf("appending to %dMB reallocated %d times", buf.Len()>>20, reallocs)
 	}
 	buf.Release()
 }
@@ -69,11 +69,11 @@ func TestDiscard(t *testing.T) {
 	buf.AppendString("hello world")
 	buf.Discard(6)
 	if string(buf.Bytes()) != "world" {
-		t.Fatalf("Discard 后为 %q", buf.Bytes())
+		t.Fatalf("after Discard got %q", buf.Bytes())
 	}
 	buf.Reset()
 	if buf.Len() != 0 || cap(buf.Bytes()) == 0 {
-		t.Fatalf("Reset 后 len=%d cap=%d", buf.Len(), cap(buf.Bytes()))
+		t.Fatalf("after Reset len=%d cap=%d", buf.Len(), cap(buf.Bytes()))
 	}
 	buf.Release()
 }

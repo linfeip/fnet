@@ -75,10 +75,10 @@ func TestUpgradeReleasesHTTPState(t *testing.T) {
 	select {
 	case st := <-got:
 		if st.queue != nil || st.remoteAddr != "" {
-			t.Fatalf("升级后仍保留 queue(cap=%d) 与 remoteAddr=%q", cap(st.queue), st.remoteAddr)
+			t.Fatalf("queue(cap=%d) and remoteAddr=%q are still retained after the upgrade", cap(st.queue), st.remoteAddr)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("未执行升级")
+		t.Fatal("upgrade was not performed")
 	}
 }
 
@@ -95,16 +95,16 @@ func TestUpgrade(t *testing.T) {
 		io.WriteString(c, "GET /hello HTTP/1.1\r\nHost: a\r\n\r\nGET "+path+" HTTP/1.1\r\nHost: a\r\n\r\n")
 		br := bufio.NewReader(c)
 		if _, body := readResp(t, br); body != "hello world" {
-			t.Fatalf("%s: 升级前的响应 %q", path, body)
+			t.Fatalf("%s: response before the upgrade %q", path, body)
 		}
 		resp, _ := readResp(t, br)
 		if resp.StatusCode != http.StatusSwitchingProtocols || resp.Header.Get("Upgrade") != "echo" {
-			t.Fatalf("%s: 升级响应 %d %v", path, resp.StatusCode, resp.Header)
+			t.Fatalf("%s: upgrade response %d %v", path, resp.StatusCode, resp.Header)
 		}
 		io.WriteString(c, "GET /hello HTTP/1.1\r\n\r\n")
 		buf := make([]byte, 23)
 		if _, err := io.ReadFull(br, buf); err != nil || string(buf) != "GET /hello HTTP/1.1\r\n\r\n" {
-			t.Fatalf("%s: 回显 %q %v", path, buf, err)
+			t.Fatalf("%s: echo %q %v", path, buf, err)
 		}
 		c.Close()
 		select {
@@ -113,7 +113,7 @@ func TestUpgrade(t *testing.T) {
 				t.Fatalf("%s: OnClose(%v)", path, err)
 			}
 		case <-time.After(5 * time.Second):
-			t.Fatalf("%s: 未回调 OnClose", path)
+			t.Fatalf("%s: OnClose was not called", path)
 		}
 	}
 }
@@ -129,6 +129,6 @@ func TestUpgradeEarlyRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n := helloCalls.Load(); n != 0 || strings.Contains(string(out), "hello world") {
-		t.Fatalf("升级请求之后的请求被执行: calls=%d, out=%q", n, out)
+		t.Fatalf("the request after the upgrade request was executed: calls=%d, out=%q", n, out)
 	}
 }

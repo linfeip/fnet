@@ -57,7 +57,7 @@ func (h *testHandler) OnOpen(c *Conn) {
 
 func (h *testHandler) OnMessage(c *Conn, op ws.OpCode, data []byte) {
 	if c.Context() != "opened" {
-		panic("OnMessage 先于 OnOpen")
+		panic("OnMessage before OnOpen")
 	}
 	if h.blocked != nil {
 		<-h.blocked
@@ -88,7 +88,7 @@ func (h *testHandler) waitClose(t *testing.T) error {
 	case err := <-h.closed:
 		return err
 	case <-time.After(5 * time.Second):
-		t.Fatal("未回调 OnClose")
+		t.Fatal("OnClose was not called")
 		return nil
 	}
 }
@@ -109,7 +109,7 @@ func newTestServer(t *testing.T, h *testHandler, opts Options) *fhttp.Server {
 	t.Cleanup(func() {
 		s.Close()
 		if err := <-served; !errors.Is(err, http.ErrServerClosed) {
-			t.Errorf("Serve 返回 %v", err)
+			t.Errorf("Serve returned %v", err)
 		}
 	})
 	return s
@@ -165,15 +165,15 @@ func (c *client) expectClose(t *testing.T, want ws.StatusCode) {
 		f, err = ws.ReadFrame(c)
 	}
 	if err != nil || f.Header.OpCode != ws.OpClose {
-		t.Fatalf("期望关闭帧, got %v %v", f.Header, err)
+		t.Fatalf("want a close frame, got %v %v", f.Header, err)
 	}
 	if code, _ := ws.ParseCloseFrameData(f.Payload); code != want {
-		t.Fatalf("关闭帧状态码 %d, want %d", code, want)
+		t.Fatalf("close frame status code %d, want %d", code, want)
 	}
 	// If the peer is still sending when the server closes (for example data sent after a protocol
 	// error), the kernel ends the connection with RST, so the read returns ECONNRESET instead of EOF.
 	if _, err := c.Read(make([]byte, 1)); err != io.EOF && !errors.Is(err, syscall.ECONNRESET) {
-		t.Fatalf("期望连接被关闭, got %v", err)
+		t.Fatalf("want the connection to be closed, got %v", err)
 	}
 }
 
@@ -196,12 +196,13 @@ func TestEcho(t *testing.T) {
 	c.send(t, ws.OpContinuation, true, "ment")
 	f, err := ws.ReadFrame(c)
 	if err != nil || f.Header.OpCode != ws.OpPong || string(f.Payload) != "p" {
-		t.Fatalf("期望 pong, got %v %q %v", f.Header, f.Payload, err)
+		t.Fatalf("want pong, got %v %q %v", f.Header, f.Payload, err)
 	}
 	c.expectMessage(t, ws.OpText, []byte("fragment"))
 }
 
-// TestEchoPipelined 验证真实 WebSocket 连接连续收发多帧批次，覆盖跨读回合的 Echo 顺序。
+// TestEchoPipelined verifies a real WebSocket connection sending and receiving multi-frame batches back to back,
+// covering Echo ordering across read rounds.
 func TestEchoPipelined(t *testing.T) {
 	for _, size := range []int{7, units.KB} {
 		t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
@@ -214,7 +215,7 @@ func TestEchoPipelined(t *testing.T) {
 			batch := clientFrames(ws.OpBinary, payloads...)
 			for range 3 {
 				if n, err := c.Write(batch); err != nil || n != len(batch) {
-					t.Fatalf("写入 %d/%d 字节, err=%v", n, len(batch), err)
+					t.Fatalf("wrote %d/%d bytes, err=%v", n, len(batch), err)
 				}
 				for _, payload := range payloads {
 					c.expectMessage(t, ws.OpBinary, payload)
@@ -228,7 +229,7 @@ func TestEchoPipelined(t *testing.T) {
 // adding, removing or reordering fields pushes it over, the fields have to be rearranged.
 func TestConnSize(t *testing.T) {
 	if size := unsafe.Sizeof(Conn{}); unsafe.Sizeof(uintptr(0)) == 8 && size > 256 {
-		t.Fatalf("Conn 为 %dB，超出 256B 的内存分级", size)
+		t.Fatalf("Conn is %dB, over the 256B size class", size)
 	}
 }
 
@@ -258,7 +259,7 @@ func TestAppendFrameHeader(t *testing.T) {
 		var want bytes.Buffer
 		ws.WriteHeader(&want, ws.Header{Fin: true, OpCode: ws.OpText, Length: int64(n)})
 		if got := appendFrameHeader(nil, ws.OpText, n); !bytes.Equal(got, want.Bytes()) {
-			t.Errorf("长度 %d: got %x, want %x", n, got, want.Bytes())
+			t.Errorf("length %d: got %x, want %x", n, got, want.Bytes())
 		}
 	}
 }
@@ -273,7 +274,7 @@ func checkParseHeader(t *testing.T, data []byte) {
 	got, n, err := parseHeader(data)
 	if wantErr == io.EOF || wantErr == io.ErrUnexpectedEOF {
 		if n != 0 || err != nil {
-			t.Fatalf("%x: 头部不完整, got n=%d err=%v, want n=0 err=nil", data, n, err)
+			t.Fatalf("%x: incomplete header, got n=%d err=%v, want n=0 err=nil", data, n, err)
 		}
 		return
 	}
@@ -326,7 +327,7 @@ func TestParseHeaderMSB(t *testing.T) {
 		t.Fatalf("err = %v, want %v", err, ws.ErrHeaderLengthMSB)
 	}
 	if _, n, err := parseHeader(data[:len(data)-1]); n != 0 || err != nil {
-		t.Fatalf("头部不完整时 n=%d err=%v, want n=0 err=nil", n, err)
+		t.Fatalf("with an incomplete header n=%d err=%v, want n=0 err=nil", n, err)
 	}
 }
 
@@ -394,14 +395,15 @@ func BenchmarkOnData(b *testing.B) {
 			for range b.N {
 				copy(data, batch) // OnData unmasks in place
 				if n := c.OnData(data); n != len(data) {
-					b.Fatalf("OnData 消费了 %d 字节, want %d", n, len(data))
+					b.Fatalf("OnData consumed %d bytes, want %d", n, len(data))
 				}
 			}
 		})
 	}
 }
 
-// TestOnDataAllocs 验证单帧和多帧 Echo 在缓冲池预热后均不分配，覆盖 cork 包装对象的逃逸回归。
+// TestOnDataAllocs verifies that single-frame and multi-frame Echo allocate nothing once the buffer pool is warm,
+// covering the escape regression of the cork wrapper.
 func TestOnDataAllocs(t *testing.T) {
 	for _, frames := range []int{1, 2, 10, 16} {
 		for _, size := range []int{7, units.KB} {
@@ -412,13 +414,13 @@ func TestOnDataAllocs(t *testing.T) {
 				if allocs := testing.AllocsPerRun(1000, func() {
 					copy(data, batch)
 					if n := c.OnData(data); n != len(data) {
-						t.Fatalf("消费 %d 字节, 期望 %d", n, len(data))
+						t.Fatalf("consumed %d bytes, want %d", n, len(data))
 					}
 				}); allocs != 0 {
-					t.Fatalf("处理 %d 个帧分配了 %v 次, want 0", frames, allocs)
+					t.Fatalf("processing %d frames allocated %v times, want 0", frames, allocs)
 				}
 				if c.corking || c.corkBuffer.Bytes() != nil {
-					t.Fatal("处理完后仍保留攒写缓冲区")
+					t.Fatal("the cork buffer was still retained after handling")
 				}
 			})
 		}
@@ -458,7 +460,7 @@ func TestEarlyData(t *testing.T) {
 	conn.Write(b.Bytes())
 	br := bufio.NewReader(conn)
 	if resp, err := http.ReadResponse(br, nil); err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("握手: %v %v", resp, err)
+		t.Fatalf("handshake: %v %v", resp, err)
 	}
 	time.Sleep(300 * time.Millisecond) // OnOpen has returned
 	wsutil.WriteClientMessage(conn, ws.OpText, []byte("late"))
@@ -539,7 +541,7 @@ func TestServerCloseDuringOpen(t *testing.T) {
 	srv.Close()  // the engine closes the connection while OnOpen has not returned yet
 	select {
 	case err := <-h.closed:
-		t.Fatalf("OnClose 先于 OnOpen 返回: %v", err)
+		t.Fatalf("OnClose returned before OnOpen: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	release.Do(func() { close(h.gate) })
@@ -547,7 +549,7 @@ func TestServerCloseDuringOpen(t *testing.T) {
 		t.Fatalf("OnClose(%v)", err)
 	}
 	if got := []string{<-h.events, <-h.events}; !slices.Equal(got, []string{"open", "close"}) {
-		t.Fatalf("回调顺序 %v", got)
+		t.Fatalf("callback order %v", got)
 	}
 }
 
@@ -560,7 +562,7 @@ func TestCloseDuringOpen(t *testing.T) {
 	c.Close()
 	h.waitClose(t)
 	if got := []string{<-h.events, <-h.events}; !slices.Equal(got, []string{"open", "close"}) {
-		t.Fatalf("回调顺序 %v", got)
+		t.Fatalf("callback order %v", got)
 	}
 }
 
@@ -577,10 +579,10 @@ func TestClose(t *testing.T) {
 	c.Write(buf.Bytes())
 	c.expectClose(t, ws.StatusGoingAway)
 	if err := h.waitClose(t); err != (wsutil.ClosedError{Code: ws.StatusGoingAway, Reason: "bye"}) {
-		t.Fatalf("对端关闭: OnClose(%v)", err)
+		t.Fatalf("peer close: OnClose(%v)", err)
 	}
 	if len(h.received) != 1 || <-h.received != "last" {
-		t.Fatal("关闭帧之前的消息未在 OnClose 之前回调")
+		t.Fatal("a message before the close frame was not delivered before OnClose")
 	}
 
 	// Close from the local side.
@@ -588,7 +590,7 @@ func TestClose(t *testing.T) {
 	wsutil.WriteClientMessage(c, ws.OpText, []byte("close"))
 	c.expectClose(t, ws.StatusNormalClosure)
 	if err := h.waitClose(t); err != nil {
-		t.Fatalf("本端关闭: OnClose(%v)", err)
+		t.Fatalf("local close: OnClose(%v)", err)
 	}
 	<-h.received
 
@@ -596,14 +598,14 @@ func TestClose(t *testing.T) {
 	c = dial(t, s)
 	c.Close()
 	if err := h.waitClose(t); err != io.EOF {
-		t.Fatalf("对端断开: OnClose(%v)", err)
+		t.Fatalf("peer disconnect: OnClose(%v)", err)
 	}
 
 	// The server closes.
 	dial(t, s)
 	s.Close()
 	if err := h.waitClose(t); err != fnet.ErrServerClosed {
-		t.Fatalf("服务关闭: OnClose(%v)", err)
+		t.Fatalf("server close: OnClose(%v)", err)
 	}
 }
 
@@ -618,17 +620,17 @@ func TestProtocolErrors(t *testing.T) {
 		code     ws.StatusCode
 		err      error
 	}{
-		{"未掩码", []ws.Frame{ws.NewTextFrame([]byte("x"))}, true, ws.StatusProtocolError, ws.ErrProtocolMaskRequired},
-		{"RSV 非 0", []ws.Frame{{Header: ws.Header{Fin: true, Rsv: ws.Rsv(true, false, false), OpCode: ws.OpText}}},
+		{"unmasked", []ws.Frame{ws.NewTextFrame([]byte("x"))}, true, ws.StatusProtocolError, ws.ErrProtocolMaskRequired},
+		{"RSV non-zero", []ws.Frame{{Header: ws.Header{Fin: true, Rsv: ws.Rsv(true, false, false), OpCode: ws.OpText}}},
 			false, ws.StatusProtocolError, ws.ErrProtocolNonZeroRsv},
-		{"意外的后续分片", []ws.Frame{ws.NewFrame(ws.OpContinuation, true, nil)},
+		{"unexpected continuation frame", []ws.Frame{ws.NewFrame(ws.OpContinuation, true, nil)},
 			false, ws.StatusProtocolError, ws.ErrProtocolContinuationUnexpected},
-		{"关闭帧只有一个字节", []ws.Frame{ws.NewCloseFrame([]byte{3})},
+		{"close frame with a single byte", []ws.Frame{ws.NewCloseFrame([]byte{3})},
 			false, ws.StatusProtocolError, ws.ErrProtocolStatusCodeNotInUse},
-		{"非法 UTF-8", []ws.Frame{ws.NewTextFrame([]byte{0xff})},
+		{"invalid UTF-8", []ws.Frame{ws.NewTextFrame([]byte{0xff})},
 			false, ws.StatusInvalidFramePayloadData, wsutil.ErrInvalidUTF8},
-		{"消息过大", []ws.Frame{ws.NewBinaryFrame(make([]byte, 2000))}, false, ws.StatusMessageTooBig, errMessageTooBig},
-		{"分片累计过大", []ws.Frame{ws.NewFrame(ws.OpText, false, []byte(long)), ws.NewFrame(ws.OpContinuation, true, []byte(long))},
+		{"message too big", []ws.Frame{ws.NewBinaryFrame(make([]byte, 2000))}, false, ws.StatusMessageTooBig, errMessageTooBig},
+		{"fragments together too big", []ws.Frame{ws.NewFrame(ws.OpText, false, []byte(long)), ws.NewFrame(ws.OpContinuation, true, []byte(long))},
 			false, ws.StatusMessageTooBig, errMessageTooBig},
 	}
 	for _, tt := range tests {
@@ -672,7 +674,7 @@ func TestHandshakeErrors(t *testing.T) {
 			t.Fatalf("%q: got %v %v, want %d", tt.req, resp, err, tt.status)
 		}
 		if tt.status == http.StatusUpgradeRequired && resp.Header.Get("Sec-WebSocket-Version") != "13" {
-			t.Fatalf("426 应带 Sec-WebSocket-Version: %v", resp.Header)
+			t.Fatalf("426 should carry Sec-WebSocket-Version: %v", resp.Header)
 		}
 		conn.Close()
 	}
@@ -700,7 +702,7 @@ func expectPanicLog(t *testing.T) {
 		select {
 		case <-logged:
 		case <-time.After(5 * time.Second):
-			t.Error("panic 未被记录")
+			t.Error("panic was not logged")
 		}
 		slog.SetDefault(logger)
 		log.SetOutput(w)
@@ -725,7 +727,7 @@ func TestPanic(t *testing.T) {
 		t.Fatalf("OnClose(%v)", err)
 	}
 	if len(h.received) != 1 || <-h.received != "panic" {
-		t.Fatal("panic 之后不应再回调消息")
+		t.Fatal("no message should be delivered after a panic")
 	}
 }
 
@@ -762,11 +764,11 @@ func TestSlowHandler(t *testing.T) {
 	c.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
 	n, err := c.Write(stream.Bytes())
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("对端写入应被阻塞, 写出 %d 字节, err=%v", n, err)
+		t.Fatalf("peer write should block, wrote %d bytes, err=%v", n, err)
 	}
 	select {
 	case err := <-h.closed:
-		t.Fatalf("回调期间连接被关闭: %v", err)
+		t.Fatalf("connection was closed during the callback: %v", err)
 	default:
 	}
 
@@ -878,22 +880,23 @@ func TestCorkWrites(t *testing.T) {
 	}
 	in := clientFrames(ws.OpText, payloads...)
 	if n := c.OnData(in); n != len(in) {
-		t.Fatalf("消费 %d 字节, 期望 %d", n, len(in))
+		t.Fatalf("consumed %d bytes, want %d", n, len(in))
 	}
 	if len(rc.events) != 1 || !bytes.Equal(rc.events[0].data, want) {
-		t.Fatalf("10 个帧写出 %d 次, 期望合并为 1 次", len(rc.events))
+		t.Fatalf("10 frames were written %d times, want them merged into 1", len(rc.events))
 	}
 
 	c.OnData(clientFrames(ws.OpText, []byte("one")))
 	if len(rc.events) != 2 || rc.events[1].vectored || !bytes.Equal(rc.events[1].data, frame(ws.OpText, []byte("one"))) {
-		t.Fatalf("单个帧: %+v", rc.events[1:])
+		t.Fatalf("single frame: %+v", rc.events[1:])
 	}
 	if c.corkBuffer.Bytes() != nil {
-		t.Fatal("处理完后仍在攒写")
+		t.Fatal("still corking after handling")
 	}
 }
 
-// TestCorkConcurrentWrites 验证同一连接的并发写共享攒写缓冲区，结束后归还底层数组。
+// TestCorkConcurrentWrites verifies that concurrent writes of one connection share the cork buffer and return its
+// underlying array afterwards.
 func TestCorkConcurrentWrites(t *testing.T) {
 	c, rc := newCorkConn()
 	c.cork(512)
@@ -914,10 +917,10 @@ func TestCorkConcurrentWrites(t *testing.T) {
 	c.uncork()
 	want := bytes.Repeat(frame(ws.OpText, payload), 8*16)
 	if len(rc.events) != 1 || !bytes.Equal(rc.events[0].data, want) {
-		t.Fatalf("并发攒写结果不符, 写出 %d 次", len(rc.events))
+		t.Fatalf("concurrent corking result mismatch, wrote %d times", len(rc.events))
 	}
 	if c.corking || c.corkBuffer.Bytes() != nil {
-		t.Fatal("并发攒写结束后仍保留缓冲区")
+		t.Fatal("the buffer was still retained after concurrent corking finished")
 	}
 }
 
@@ -935,10 +938,10 @@ func TestWriteFrame(t *testing.T) {
 			t.Fatal(err)
 		}
 		if len(rc.events) != 1 || !bytes.Equal(rc.events[0].data, frame(ws.OpBinary, payload)) {
-			t.Fatalf("%dB: 写出 %d 次, 数据不符", tc.size, len(rc.events))
+			t.Fatalf("%dB: wrote %d times, data mismatch", tc.size, len(rc.events))
 		}
 		if rc.events[0].vectored != tc.vectored {
-			t.Fatalf("%dB: vectored=%v, 期望 %v", tc.size, rc.events[0].vectored, tc.vectored)
+			t.Fatalf("%dB: vectored=%v, want %v", tc.size, rc.events[0].vectored, tc.vectored)
 		}
 	}
 }
@@ -962,20 +965,20 @@ func TestCorkLimit(t *testing.T) {
 	var got []byte
 	for _, e := range rc.events {
 		if !e.vectored && len(e.data) > maxCorkBytes {
-			t.Fatalf("一次写出 %d 字节, 超过攒写上限", len(e.data))
+			t.Fatalf("a single write of %d bytes exceeds the cork limit", len(e.data))
 		}
 		got = append(got, e.data...)
 	}
 	if !bytes.Equal(got, want) {
-		t.Fatal("写出的数据与回调写出的顺序不一致")
+		t.Fatal("the written data does not match the order in which the callbacks wrote it")
 	}
 	// After 65 frames of 1000B are corked the 66th does not fit and is written out together with them; the
 	// remaining 34 are corked and written out with the big frame that does not fit; tail comes last.
 	if len(rc.events) != 3 {
-		t.Fatalf("写出 %d 次, 期望 3 次", len(rc.events))
+		t.Fatalf("wrote %d times, want 3", len(rc.events))
 	}
 	if c.corking || c.corkBuffer.Bytes() != nil {
-		t.Fatal("处理大批次后仍保留攒写缓冲区")
+		t.Fatal("the cork buffer was still retained after handling a large batch")
 	}
 }
 
@@ -988,7 +991,7 @@ func TestCorkPerOnData(t *testing.T) {
 	want := slices.Concat(frame(ws.OpText, []byte("a")), frame(ws.OpText, []byte("b")))
 	if len(rc.events) != 2 || !bytes.Equal(rc.events[0].data, want) ||
 		rc.events[1].vectored || !bytes.Equal(rc.events[1].data, frame(ws.OpText, []byte("c"))) {
-		t.Fatalf("写出: %+v", rc.events)
+		t.Fatalf("writes: %+v", rc.events)
 	}
 }
 
@@ -1000,10 +1003,10 @@ func TestCorkEveryOnData(t *testing.T) {
 	for round := range 3 {
 		c.OnData(clientFrames(ws.OpText, []byte("a"), []byte("b"), []byte("c")))
 		if len(rc.events) != round+1 || !bytes.Equal(rc.events[round].data, want) {
-			t.Fatalf("第 %d 批: 写出 %+v, 期望每批合并为 1 次", round, rc.events)
+			t.Fatalf("batch %d: writes %+v, want each batch merged into 1", round, rc.events)
 		}
 		if c.corking || c.corkBuffer.Bytes() != nil {
-			t.Fatal("处理完后仍在攒写")
+			t.Fatal("still corking after handling")
 		}
 	}
 }
@@ -1017,13 +1020,13 @@ func TestCorkClose(t *testing.T) {
 	closeFrame := frame(ws.OpClose, ws.NewCloseFrameBody(ws.StatusNormalClosure, ""))
 	if len(rc.events) != 3 || !bytes.Equal(rc.events[0].data, want) || !bytes.Equal(rc.events[1].data, closeFrame) ||
 		!rc.events[2].close {
-		t.Fatalf("处理中关闭: %+v", rc.events)
+		t.Fatalf("close during handling: %+v", rc.events)
 	}
 	if err := c.WriteMessage(ws.OpText, []byte("after")); err != net.ErrClosed {
-		t.Fatalf("关闭后写入: %v", err)
+		t.Fatalf("write after close: %v", err)
 	}
 	if c.corkBuffer.Bytes() != nil {
-		t.Fatal("处理完后仍在攒写")
+		t.Fatal("still corking after handling")
 	}
 }
 
@@ -1036,14 +1039,14 @@ func TestNoMessageAfterClose(t *testing.T) {
 	c.handler = h
 	in := clientFrames(ws.OpText, []byte("a"), []byte("close"), []byte("b"), []byte("c"))
 	if n := c.OnData(in); n != len(in) {
-		t.Fatalf("消费 %d 字节, 期望 %d", n, len(in))
+		t.Fatalf("consumed %d bytes, want %d", n, len(in))
 	}
 	if got := len(h.received); got != 2 { // "a" and "close"
-		t.Fatalf("Close 之后同批剩下的消息仍被回调：共回调 %d 条, 期望 2 条", got)
+		t.Fatalf("messages left in the same batch were still delivered after Close: %d delivered, want 2", got)
 	}
 	later := clientFrames(ws.OpText, []byte("d"))
 	if n := c.OnData(later); n != len(later) || len(h.received) != 2 {
-		t.Fatalf("Close 之后到达的数据：消费 %d/%d 字节, 共回调 %d 条", n, len(later), len(h.received))
+		t.Fatalf("data arriving after Close: consumed %d/%d bytes, %d delivered", n, len(later), len(h.received))
 	}
 }
 
@@ -1054,7 +1057,7 @@ func TestCorkPanic(t *testing.T) {
 	func() {
 		defer func() {
 			if recover() == nil {
-				t.Error("panic 应继续向上")
+				t.Error("panic should keep propagating up")
 			}
 		}()
 		c.OnData(clientFrames(ws.OpText, []byte("a"), []byte("b"), []byte("panic"), []byte("c")))
@@ -1063,10 +1066,10 @@ func TestCorkPanic(t *testing.T) {
 	closeFrame := frame(ws.OpClose, ws.NewCloseFrameBody(ws.StatusInternalServerError, ""))
 	if len(rc.events) != 3 || !bytes.Equal(rc.events[0].data, want) || !bytes.Equal(rc.events[1].data, closeFrame) ||
 		!rc.events[2].close || c.corkBuffer.Bytes() != nil {
-		t.Fatalf("panic 之后: %+v", rc.events)
+		t.Fatalf("after panic: %+v", rc.events)
 	}
 	if c.closeErr != errHandlerPanic {
-		t.Fatalf("关闭原因 %v", c.closeErr)
+		t.Fatalf("close reason %v", c.closeErr)
 	}
 }
 
@@ -1120,7 +1123,7 @@ func TestTimeouts(t *testing.T) {
 		}()
 		return stopped
 	}
-	t.Run("消息未完成", func(t *testing.T) {
+	t.Run("incomplete message", func(t *testing.T) {
 		t.Parallel()
 		h := &testHandler{}
 		s := newTestServer(t, h, Options{MessageTimeout: 200 * time.Millisecond})
@@ -1131,7 +1134,7 @@ func TestTimeouts(t *testing.T) {
 			t.Fatalf("OnClose(%v)", err)
 		}
 	})
-	t.Run("空闲与连续的消息流", func(t *testing.T) {
+	t.Run("idle and a continuous message stream", func(t *testing.T) {
 		t.Parallel()
 		h := &testHandler{}
 		s := newTestServer(t, h, Options{MessageTimeout: 500 * time.Millisecond})
@@ -1161,7 +1164,7 @@ func TestTimeouts(t *testing.T) {
 			c.expectMessage(t, ws.OpText, fmt.Appendf(nil, "m%02d", i))
 		}
 	})
-	t.Run("回调之后重新计时", func(t *testing.T) {
+	t.Run("timer restarts after a callback", func(t *testing.T) {
 		t.Parallel()
 		h := &testHandler{blocked: make(chan struct{})}
 		s := newTestServer(t, h, Options{MessageTimeout: 200 * time.Millisecond})
@@ -1174,7 +1177,7 @@ func TestTimeouts(t *testing.T) {
 			t.Fatalf("OnClose(%v)", err)
 		}
 	})
-	t.Run("空闲超时", func(t *testing.T) {
+	t.Run("idle timeout", func(t *testing.T) {
 		t.Parallel()
 		h := &testHandler{}
 		s := newTestServer(t, h, Options{IdleTimeout: 500 * time.Millisecond})
@@ -1183,7 +1186,7 @@ func TestTimeouts(t *testing.T) {
 		stop := make(chan struct{})
 		stopped := ping(active, stop) // the client's pings refresh the timer
 		if err := h.waitClose(t); err != os.ErrDeadlineExceeded {
-			t.Fatalf("空闲连接: OnClose(%v)", err)
+			t.Fatalf("idle connection: OnClose(%v)", err)
 		}
 		time.Sleep(time.Second) // let one more check pass
 		close(stop)
@@ -1193,8 +1196,9 @@ func TestTimeouts(t *testing.T) {
 	})
 }
 
-// BenchmarkEchoScheduling 对照批量路径与逐任务路径，同时单独扫描 NumLoops 和 pipeline。
-// 客户端在计时前握手，使用固定帧并校验全部 Echo；同进程结果不能替代 Linux 分机压测。
+// BenchmarkEchoScheduling compares the batch path with the per-task path while also scanning NumLoops and pipeline
+// separately. Clients handshake before timing, use fixed frames, and verify every Echo; in-process results do not
+// replace benchmarks on separate Linux machines.
 func BenchmarkEchoScheduling(b *testing.B) {
 	for _, loops := range []int{8, 16, 32} {
 		for _, pipeline := range []int{1, 16} {
@@ -1264,7 +1268,7 @@ func BenchmarkEchoScheduling(b *testing.B) {
 						client := &clients[int(next.Add(1))-1]
 						for pb.Next() {
 							if n, err := client.connection.Write(request); err != nil || n != len(request) {
-								b.Errorf("写入 %d/%d 字节, err=%v", n, len(request), err)
+								b.Errorf("wrote %d/%d bytes, err=%v", n, len(request), err)
 								return
 							}
 							if _, err := io.ReadFull(client.reader, client.reply); err != nil {
@@ -1272,7 +1276,7 @@ func BenchmarkEchoScheduling(b *testing.B) {
 								return
 							}
 							if !bytes.Equal(client.reply, want) {
-								b.Error("Echo 数据不符")
+								b.Error("Echo data mismatch")
 								return
 							}
 						}
@@ -1284,7 +1288,8 @@ func BenchmarkEchoScheduling(b *testing.B) {
 					for _, count := range samples[0].Value.Float64Histogram().Counts {
 						finished += count
 					}
-					// runtime 每八次调度采样一次；包含客户端与服务端，不等同于精确 worker 唤醒数。
+					// runtime samples scheduling once every eight times; this includes both client and server and is
+					// not the exact number of worker wakeups.
 					b.ReportMetric(float64((finished-scheduled)*8)/float64(b.N*pipeline), "sched/msg")
 				})
 			}
