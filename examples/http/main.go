@@ -1,6 +1,7 @@
 // http is an example HTTP server based on fhttp, whose Handler is fully compatible with the standard library. It shows
 // the common request types: a request body of up to fhttp.Options.MaxBufferedBodyBytes (1MB by default) is served on
-// fnet, a larger or chunked one (such as a big file upload) is streamed by net/http, with the same Handler.
+// fnet, a larger or chunked one (such as a big file upload) is streamed by net/http, with the same Handler. With -tls
+// it serves HTTPS.
 //
 //	cd examples && go run ./http -addr :8080
 //
@@ -18,19 +19,35 @@
 //	curl -F note=hi -F file=@go.mod localhost:8080/upload             # multipart, parsed as a whole
 //	curl -F file=@big.bin localhost:8080/upload/stream                # multipart, streamed part by part
 //	curl -O localhost:8080/files/go.mod                               # download an uploaded file
+//
+// HTTPS takes the same requests at https://. The certificate is a self-signed one generated at startup, which curl
+// accepts with -k:
+//
+//	go run ./http -addr :8443 -tls
+//
+//	curl -k https://localhost:8443/tls                                # TLS version, cipher suite, ALPN protocol
+//	curl -k -T - https://localhost:8443/echo < go.mod                 # streamed by net/http, in the same TLS session
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/linfeip/fnet/fhttp"
 )
@@ -38,6 +55,7 @@ import (
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	dir := flag.String("dir", filepath.Join(os.TempDir(), "fhttp-uploads"), "directory for uploaded files")
+	useTLS := flag.Bool("tls", false, "serve HTTPS, with a self-signed certificate generated at startup")
 	flag.Parse()
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
 		panic(err)
@@ -54,6 +72,14 @@ func main() {
 		fmt.Fprintf(w, "name=%s lang=%s\n", r.FormValue("name"), r.FormValue("lang"))
 	})
 	mux.HandleFunc("POST /json", echoJSON)
+	mux.HandleFunc("GET /tls", func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			io.WriteString(w, "plain HTTP\n")
+			return
+		}
+		fmt.Fprintf(w, "%s %s alpn=%s\n", tls.VersionName(r.TLS.Version), tls.CipherSuiteName(r.TLS.CipherSuite),
+			r.TLS.NegotiatedProtocol)
+	})
 
 	store := &items{data: make(map[string][]byte)}
 	mux.HandleFunc("GET /items/{id}", store.get)
@@ -72,12 +98,37 @@ func main() {
 	mux.HandleFunc("POST /upload/stream", streamUpload(*dir))
 	mux.Handle("GET /files/", http.StripPrefix("/files/", http.FileServer(http.Dir(*dir))))
 
-	srv, err := fhttp.NewServer(*addr, mux, fhttp.Options{})
+	var opts fhttp.Options
+	if *useTLS {
+		opts.TLSConfig = &tls.Config{Certificates: []tls.Certificate{selfSignedCertificate()}}
+	}
+	srv, err := fhttp.NewServer(*addr, mux, opts)
 	if err != nil {
 		panic(err)
 	}
-	slog.Info("http server listening", "addr", srv.Addr().String(), "uploads", *dir)
+	slog.Info("http server listening", "addr", srv.Addr().String(), "https", opts.TLSConfig != nil, "uploads", *dir)
 	panic(srv.Serve())
+}
+
+// selfSignedCertificate generates a certificate for localhost signed with its own key, good for trying HTTPS only:
+// clients do not trust it (curl needs -k). A real server loads its certificate with tls.LoadX509KeyPair instead.
+func selfSignedCertificate() tls.Certificate {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
 // echoJSON decodes a JSON object from the body and sends it back.

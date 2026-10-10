@@ -4,12 +4,18 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	cryptorand "crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"math"
+	"math/big"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -1295,4 +1301,63 @@ func BenchmarkEchoScheduling(b *testing.B) {
 			}
 		}
 	}
+}
+
+// tlsServerConfig returns a server configuration with a self-signed certificate, which the clients do not verify.
+func tlsServerConfig(t *testing.T) *tls.Config {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
+	der, err := x509.CreateCertificate(cryptorand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+}
+
+func TestWSS(t *testing.T) {
+	h := &testHandler{closed: make(chan error, 1)}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		Upgrade(w, r, h, Options{})
+	})
+
+	s, err := fhttp.NewServer("127.0.0.1:0", mux, fhttp.Options{TLSConfig: tlsServerConfig(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- s.Serve() }()
+	t.Cleanup(func() {
+		s.Close()
+		if err := <-served; !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("Serve returned %v", err)
+		}
+	})
+
+	dialer := ws.Dialer{TLSConfig: &tls.Config{InsecureSkipVerify: true}}
+	conn, _, _, err := dialer.Dial(context.Background(), "wss://"+s.Addr().String()+"/ws")
+	if err != nil {
+		t.Fatalf("dial wss: %v", err)
+	}
+	defer conn.Close()
+
+	msg := []byte("hello wss over reactor")
+	if err := wsutil.WriteClientMessage(conn, ws.OpText, msg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	reply, op, err := wsutil.ReadServerData(conn)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if op != ws.OpText || !bytes.Equal(reply, msg) {
+		t.Fatalf("got %s op=%v, want %s", reply, op, msg)
+	}
+
+	conn.Close()
+	h.waitClose(t)
 }

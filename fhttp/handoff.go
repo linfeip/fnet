@@ -1,7 +1,10 @@
 package fhttp
 
 import (
+	"context"
+	"crypto/tls"
 	"net"
+	"net/http"
 	"sync"
 )
 
@@ -18,6 +21,23 @@ func (c *conn) handoff() {
 		return // the connection is closed or closing
 	}
 	c.srv.handoffs.handoff(nc)
+}
+
+// tlsStateKey is the context key of a handed-off TLS connection's state, see serveTLSState.
+type tlsStateKey struct{}
+
+// serveTLSState has the stream server s set Request.TLS on the handed-off TLS connections, which wrap a *tls.Conn (see
+// ftls.Conn.Detach): before Go 1.25, net/http only does so for a *tls.Conn itself.
+func serveTLSState(s *http.Server) {
+	s.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+		state := c.(interface{ ConnectionState() tls.ConnectionState }).ConnectionState()
+		return context.WithValue(ctx, tlsStateKey{}, &state)
+	}
+	handler := s.Handler
+	s.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.TLS = r.Context().Value(tlsStateKey{}).(*tls.ConnectionState)
+		handler.ServeHTTP(w, r)
+	})
 }
 
 // handoffListener is the net.Listener the stream server accepts the handed-off connections from.

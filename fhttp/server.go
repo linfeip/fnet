@@ -23,6 +23,7 @@ package fhttp
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"log/slog"
 	"net"
@@ -36,6 +37,7 @@ import (
 	"time"
 
 	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/ftls"
 	"github.com/linfeip/fnet/internal/bytepool"
 	"github.com/linfeip/fnet/internal/units"
 	"github.com/linfeip/fnet/taskpool"
@@ -69,6 +71,9 @@ type Options struct {
 	IdleTimeout time.Duration
 	// Engine holds the parameters of the underlying fnet engine.
 	Engine fnet.Options
+	// TLSConfig, when non-nil, has the server serve HTTPS (see package ftls), the handshake having to complete within
+	// ReadHeaderTimeout. fhttp speaks HTTP/1.1 only, so h2 is taken out of the protocols offered through ALPN.
+	TLSConfig *tls.Config
 }
 
 func (o Options) withDefaults() Options {
@@ -109,7 +114,11 @@ func NewServerAddrs(addrs []string, handler http.Handler, opts Options) (*Server
 		handler = http.DefaultServeMux
 	}
 	s := &Server{handler: handler, opts: opts.withDefaults()}
-	engine, err := fnet.NewServerAddrs(addrs, engineHandler{s}, s.opts.Engine)
+	var h fnet.Handler = engineHandler{s}
+	if s.opts.TLSConfig != nil {
+		h = ftls.NewHandler(h, http1Config(s.opts.TLSConfig), s.opts.ReadHeaderTimeout)
+	}
+	engine, err := fnet.NewServerAddrs(addrs, h, s.opts.Engine)
 	if err != nil {
 		return nil, err
 	}
@@ -117,17 +126,25 @@ func NewServerAddrs(addrs []string, handler http.Handler, opts Options) (*Server
 	// The header of a handed-off request has already arrived, so of net/http's limits only MaxHeaderBytes matters.
 	s.streams = &http.Server{Handler: handler, MaxHeaderBytes: s.opts.MaxHeaderBytes}
 	s.streams.SetKeepAlivesEnabled(false) // one request per handed-off connection, the next one comes back to fnet
+	if s.opts.TLSConfig != nil {
+		serveTLSState(s.streams)
+	}
 	s.handoffs = newHandoffListener(engine.Addr())
 	return s, nil
 }
 
-// ListenAndServe starts an HTTP server on addr and blocks until an error occurs.
-func ListenAndServe(addr string, handler http.Handler) error {
-	s, err := NewServer(addr, handler, Options{})
-	if err != nil {
-		return err
+// http1Config returns a copy of config offering HTTP/1.1 through ALPN in place of h2, which a client would otherwise
+// pick when config offers it (as autocert's does); its other protocols, such as acme-tls/1, are kept.
+func http1Config(config *tls.Config) *tls.Config {
+	config = config.Clone()
+	protos := []string{"http/1.1"}
+	for _, p := range config.NextProtos {
+		if p != "h2" && p != "http/1.1" {
+			protos = append(protos, p)
+		}
 	}
-	return s.Serve()
+	config.NextProtos = protos
+	return config
 }
 
 // Addr returns the first address actually being listened on; see Addrs for all of them.
@@ -661,6 +678,10 @@ func (c *conn) handle(r request) bool {
 		c.remoteAddr = c.connection.RemoteAddr().String()
 	}
 	req.RemoteAddr = c.remoteAddr
+	if tc, ok := c.connection.(*ftls.Conn); ok {
+		state := tc.ConnectionState()
+		req.TLS = &state
+	}
 
 	w := newResponse(c, req)
 	defer w.release()

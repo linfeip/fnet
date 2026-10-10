@@ -3,11 +3,17 @@ package fhttp
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +27,21 @@ import (
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/internal/units"
 )
+
+// tlsServerConfig returns a server configuration with a self-signed certificate, which the clients do not verify.
+func tlsServerConfig(t *testing.T) *tls.Config {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+}
 
 func testMux() *http.ServeMux {
 	mux := http.NewServeMux()
@@ -580,5 +601,48 @@ func BenchmarkParseFastUpgradeRequest(b *testing.B) {
 			b.Fatal("nil")
 		}
 		releaseFastUpgradeRequest(fast)
+	}
+}
+
+// TestHTTPS serves over TLS, on fnet and, for a streamed body, on net/http after the handoff. The server config offers
+// h2, which fhttp must not negotiate.
+func TestHTTPS(t *testing.T) {
+	mux := testMux()
+	mux.HandleFunc("/tls", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.TLS == nil {
+			http.Error(w, "no TLS state", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, "%s %d", r.TLS.NegotiatedProtocol, len(body))
+	})
+	config := tlsServerConfig(t)
+	config.NextProtos = []string{"h2", "http/1.1"}
+	s := serve(t, mux, Options{TLSConfig: config})
+	if !slices.Equal(config.NextProtos, []string{"h2", "http/1.1"}) {
+		t.Fatalf("NewServer modified the caller's config: %q", config.NextProtos)
+	}
+	base := "https://" + s.Addr().String()
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, ForceAttemptHTTP2: true}}
+	defer client.CloseIdleConnections()
+
+	resp, body := get(t, client, base+"/tls")
+	if resp.ProtoMajor != 1 || body != "http/1.1 0" {
+		t.Fatalf("GET /tls: %s %q", resp.Proto, body)
+	}
+	_, addr1 := get(t, client, base+"/remote")
+	_, addr2 := get(t, client, base+"/remote")
+	if addr1 != addr2 {
+		t.Fatalf("connection not kept alive: %s, %s", addr1, addr2)
+	}
+
+	// A chunked body is not buffered: net/http serves it on the connection detached from fnet.
+	resp, err := client.Post(base+"/tls", "text/plain", io.MultiReader(strings.NewReader("hello")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if b, _ := io.ReadAll(resp.Body); string(b) != "http/1.1 5" {
+		t.Fatalf("chunked POST /tls: %d %q", resp.StatusCode, b)
 	}
 }
