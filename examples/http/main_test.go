@@ -9,22 +9,28 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/fhttp"
 
-	"github.com/valyala/fasthttp"
+	"github.com/gofiber/fiber/v2"
 )
 
 // conns is the number of client connections, each with one request in flight at a time. Far more connections than
 // cores keep every server busy, as real traffic does; with about one per core the benchmark mostly measures how fast
 // the Go scheduler wakes goroutines up.
-var conns = flag.Int("conns", 1000, "BenchmarkGET 的客户端连接数")
+var conns = flag.Int("conns", 1000, "number of client connections for BenchmarkGET")
 
-// BenchmarkGET compares fhttp, net/http and fasthttp serving the same GET /hello over -conns loopback keep-alive
+// reusePort makes fhttp listen with one SO_REUSEPORT socket per loop, so that the loops accept in parallel.
+var reusePort = flag.Bool("reuseport", false, "give each fhttp loop its own SO_REUSEPORT listening socket")
+
+// BenchmarkGET compares fhttp, net/http and fiber serving the same GET /hello over -conns loopback keep-alive
 // connections:
 //
 //	cd examples
@@ -40,9 +46,10 @@ func BenchmarkGET(b *testing.B) {
 	}{
 		{"fhttp", startFhttp},
 		{"nethttp", startNetHTTP},
-		{"fasthttp", startFasthttp},
+		{"fiber", startFiber},
 	} {
 		b.Run(s.name, func(b *testing.B) {
+			idleGoroutines := settleGoroutines()
 			addr, stop := s.start(b)
 			defer stop()
 			clients := make([]*client, *conns)
@@ -54,6 +61,21 @@ func BenchmarkGET(b *testing.B) {
 				defer c.close()
 				clients[i] = c
 			}
+			var peakGoroutines atomic.Int64
+			peakGoroutines.Store(int64(runtime.NumGoroutine()))
+			samplingDone := make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(10 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-samplingDone:
+						return
+					case <-ticker.C:
+						updatePeak(&peakGoroutines, int64(runtime.NumGoroutine()))
+					}
+				}
+			}()
 			b.ReportAllocs()
 			b.ResetTimer()
 			// Every connection sends requests until b.N have been issued in total.
@@ -72,8 +94,38 @@ func BenchmarkGET(b *testing.B) {
 				}()
 			}
 			wg.Wait()
+			close(samplingDone)
+			b.ReportMetric(float64(idleGoroutines), "idle-goroutines")
+			b.ReportMetric(float64(peakGoroutines.Load()), "peak-goroutines")
+			b.ReportMetric(float64(runtime.NumGoroutine()), "end-goroutines")
 			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "req/s")
 		})
+	}
+}
+
+// settleGoroutines waits until the goroutine count stops dropping, so that goroutines left over from the calibration
+// runs of the testing framework do not skew the baseline, and returns the settled count.
+func settleGoroutines() int64 {
+	previous := runtime.NumGoroutine()
+	for i := 0; i < 100; i++ {
+		time.Sleep(50 * time.Millisecond)
+		runtime.GC()
+		current := runtime.NumGoroutine()
+		if current >= previous {
+			return int64(current)
+		}
+		previous = current
+	}
+	return int64(previous)
+}
+
+// updatePeak stores value in target when it is larger than the current maximum.
+func updatePeak(target *atomic.Int64, value int64) {
+	for {
+		current := target.Load()
+		if value <= current || target.CompareAndSwap(current, value) {
+			return
+		}
 	}
 }
 
@@ -87,7 +139,9 @@ func hello(w http.ResponseWriter, r *http.Request) {
 }
 
 func startFhttp(b *testing.B) (string, func()) {
-	srv, err := fhttp.NewServer("127.0.0.1:0", http.HandlerFunc(hello), fhttp.Options{})
+	srv, err := fhttp.NewServer("127.0.0.1:0", http.HandlerFunc(hello), fhttp.Options{
+		Engine: fnet.Options{ReusePort: *reusePort},
+	})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -105,17 +159,24 @@ func startNetHTTP(b *testing.B) (string, func()) {
 	return ln.Addr().String(), func() { srv.Close() }
 }
 
-func startFasthttp(b *testing.B) (string, func()) {
+func startFiber(b *testing.B) (string, func()) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		b.Fatal(err)
 	}
-	srv := &fasthttp.Server{Handler: func(ctx *fasthttp.RequestCtx) {
-		ctx.SetContentType("text/plain; charset=utf-8")
-		ctx.WriteString(helloBody)
-	}}
-	go srv.Serve(ln)
-	return ln.Addr().String(), func() { srv.Shutdown() }
+	// The performance options that fit this route: case-sensitive and strict routing (the path has no trailing
+	// slash) and no request header-name normalization.
+	app := fiber.New(fiber.Config{
+		DisableStartupMessage:    true,
+		CaseSensitive:            true,
+		StrictRouting:            true,
+		DisableHeaderNormalizing: true,
+	})
+	app.Get("/hello", func(ctx *fiber.Ctx) error {
+		return ctx.SendString(helloBody)
+	})
+	go app.Listener(ln)
+	return ln.Addr().String(), func() { app.Shutdown() }
 }
 
 // client is one keep-alive connection sending GET /hello and reading the response without allocating, so that it
