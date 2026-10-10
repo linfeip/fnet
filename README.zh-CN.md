@@ -33,11 +33,23 @@
 依赖方向是单向的：`websocket → fhttp → fnet → poll`，以及 `fnet → taskpool`。
 
 ```text
-listeners（SO_REUSEPORT）─▶ 子 Reactor 0 … N-1   （每个：1 个 epoll/kqueue + 它的 worker，开启 ReusePort 时还有自己的 listener；N = max(2, GOMAXPROCS/8)）
-                                  │ worker 探测到 listener 或连接就绪
-                                  ▼
-                 执行器（taskpool）：同一连接同一时刻一个任务
-                 读取（借用缓冲）→ OnData → 续发发送缓冲 → 关闭、OnClose
+listener
+│  默认每个地址 1 个，新连接按轮询分给各子 Reactor
+│  开启 ReusePort（Linux）时每个子 Reactor 各 1 个，连接归 accept 它的子 Reactor
+▼
+子 Reactor × N（N = max(2, GOMAXPROCS/8)）
+│  每个 = 1 个 epoll/kqueue + 1 个 worker goroutine，worker 不运行用户代码
+│  worker 轮询自己的 Poller，空闲时帮其它子 Reactor 轮询，都空闲才阻塞等待
+▼  连接就绪：提交它的任务（同一时刻最多一个），同一连接固定进同一分片
+执行器（taskpool）
+│
+▼
+连接任务（串行执行，回调不重叠）
+   首次：注册到 Poller → OnOpen
+   之后：续发发送缓冲 → 读取（借用缓冲）→ OnData → 需要时关闭 → OnClose
+
+Conn.Write（任意 goroutine）
+   没有积压时直接写 socket，其余进发送缓冲，可写时由连接任务续发
 ```
 
 - **并行 accept**：开启 `Options.ReusePort` 时，Linux 上每个子 Reactor 用自己的 socket 监听同一地址（`SO_REUSEPORT`），自己 accept 到的连接由自己处理，accept 并行进行，连接留在接受它的 worker 上；否则（macOS 上总是如此）每个地址一个 listener，按轮询分给各子 Reactor。Linux 上 keepalive 和 `TCP_NODELAY`（开启 `Options.NoDelay` 时）只在 listener 上设置一次，accept 出来的 socket 直接继承。
@@ -78,27 +90,91 @@ log.Fatal(srv.Serve())
 
 ### HTTP
 
+Handler 就是普通的 `net/http` Handler。下面是 [examples/http](examples/http/main.go) 的精简版，完整示例还包含 PUT/PATCH/DELETE/OPTIONS、multipart 上传和文件下载：
+
 ```go
-mux := http.NewServeMux()
-mux.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
-	io.WriteString(w, "hello world")
-})
-log.Fatal(fhttp.ListenAndServe(":8080", mux))
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+
+	"github.com/linfeip/fnet/fhttp"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "hello world")
+	})
+	mux.HandleFunc("GET /query", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "hello %s\n", r.URL.Query().Get("name"))
+	})
+	mux.HandleFunc("POST /form", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "name=%s lang=%s\n", r.FormValue("name"), r.FormValue("lang"))
+	})
+	mux.HandleFunc("POST /json", func(w http.ResponseWriter, r *http.Request) {
+		var v map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&v); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"received": v})
+	})
+	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(w, r.Body) // a chunked or large body is streamed by net/http
+	})
+
+	srv, err := fhttp.NewServer(":8080", mux, fhttp.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Fatal(srv.Serve())
+}
 ```
 
 ### WebSocket
 
+一个 echo 服务端，与 [examples/websocket](examples/websocket/main.go) 相同：
+
 ```go
+package main
+
+import (
+	"log"
+	"net/http"
+
+	"github.com/linfeip/fnet/fhttp"
+	"github.com/linfeip/fnet/websocket"
+
+	"github.com/gobwas/ws"
+)
+
 type echo struct{}
 
 func (echo) OnOpen(c *websocket.Conn)                               {}
-func (echo) OnMessage(c *websocket.Conn, op ws.OpCode, data []byte) { c.WriteMessage(op, data) } // 完整消息
+func (echo) OnMessage(c *websocket.Conn, op ws.OpCode, data []byte) { c.WriteMessage(op, data) } // a complete message
 func (echo) OnClose(c *websocket.Conn, err error)                   {}
 
-mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-	websocket.Upgrade(w, r, echo{}, websocket.Options{})
-})
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		websocket.Upgrade(w, r, echo{}, websocket.Options{})
+	})
+
+	srv, err := fhttp.NewServer(":8080", mux, fhttp.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Fatal(srv.Serve())
+}
 ```
+
+Linux 上设置 `fhttp.Options{Engine: fnet.Options{ReusePort: true}}` 后，每个子 Reactor 都有自己的 listener。
 
 回调由执行器执行（默认 `taskpool.DefaultTaskPool`，可通过 `fnet.Options.Executor` 替换），因此必须快速返回。超时与各项上限在 `fnet.Options`、`fhttp.Options`、`websocket.Options` 中设置，详见其文档注释。
 
@@ -118,27 +194,13 @@ go test ./http -run XXX -bench GET   # GET 压测：fhttp、net/http、fasthttp 
 
 ---
 
-## 实测数据
-
-macOS、10 核，wrk 与服务端运行在同一台机器上，hello world Handler：
-
-| 场景 | fhttp | net/http |
-| --- | --- | --- |
-| `wrk -t4 -c256 -d10s` 吞吐 | 约 21.1 万 req/s | 约 20.9 万 req/s |
-| 15000 个空闲 keep-alive 连接，RSS 增量 | 13MB（约 1KB/连接） | 271MB（约 19KB/连接） |
-| 15000 个空闲连接时的 goroutine 数 | 12 | 15003 |
-
-吞吐持平是因为 CPU 主要耗在系统调用（回环网络栈）上；收益在于大量连接下的内存与 goroutine 数量。
-
----
-
 ## 当前限制
 
 - 发送缓冲没有上限，也没有写超时：只发请求却从不读取的客户端会让它持续增长。
 - 不支持 TLS、HTTP/2。响应体完整缓存在内存中（不支持 `http.Flusher` / `http.Hijacker`），为流式请求体交给 `net/http` 的连接除外。
 - WebSocket：不支持 permessage-deflate，发送的消息总是单帧。
 - 不支持半关闭：读到 EOF 后，发完已缓冲的数据就关闭连接。
-- kqueue 路径已在 macOS 上完整测试；epoll 路径已交叉编译并通过 `go vet`，但**尚未在 Linux 上实际运行**，上线前请在 Linux 上执行 `go test -race ./...`。
+- kqueue 路径已在 macOS 上完整测试；epoll 路径已在 Linux 上跑过 HttpArena 的 WebSocket 压测，并通过其校验。上线前请在目标 Linux 环境执行 `go test -race ./...`。
 
 ---
 

@@ -33,11 +33,24 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 Dependencies are one-way: `websocket → fhttp → fnet → poll`, and `fnet → taskpool`.
 
 ```text
-listeners (SO_REUSEPORT) ─▶ sub-reactor 0 … N-1   (each: 1 epoll/kqueue + its worker, with ReusePort also its own listener; N = max(2, GOMAXPROCS/8))
-                                     │ a worker polls, accepts or finds a connection ready
-                                     ▼
-                 executor (taskpool): one task per connection at a time
-                 read (borrowed buffer) → OnData → flush the send buffer → close, OnClose
+listener
+│  by default one per address; new connections go to the sub-reactors in round-robin order
+│  with ReusePort (Linux) one per sub-reactor, which keeps the connections it accepts
+▼
+sub-reactor × N (N = max(2, GOMAXPROCS/8))
+│  each = 1 epoll/kqueue + 1 worker goroutine; the worker never runs user code
+│  the worker polls its own Poller, helps the other sub-reactors when idle, blocks when all are idle
+▼  connection ready: submit its task (at most one at a time), always to the same shard
+executor (taskpool)
+│
+▼
+connection task (serial, callbacks never overlap)
+   first: register with the Poller → OnOpen
+   then:  flush the send buffer → read (borrowed buffer) → OnData → close if requested → OnClose
+
+Conn.Write (any goroutine)
+   writes to the socket directly when nothing is backed up; the rest goes to the send buffer,
+   which the connection task flushes when the socket is writable
 ```
 
 - **Parallel accept**: with `Options.ReusePort`, on Linux every sub-reactor listens on the address with a socket of its own (`SO_REUSEPORT`) and keeps the connections it accepts, so accepts run in parallel and a connection stays with the worker that accepted it; otherwise, and always on macOS, one listener per address feeds the sub-reactors in round-robin order. On Linux keepalive and `TCP_NODELAY` (with `Options.NoDelay`) are set once on the listener, which the accepted sockets inherit.
@@ -78,27 +91,91 @@ log.Fatal(srv.Serve())
 
 ### HTTP
 
+Handlers are plain `net/http` ones. A shorter version of [examples/http](examples/http/main.go), which also covers PUT/PATCH/DELETE/OPTIONS, multipart uploads and file downloads:
+
 ```go
-mux := http.NewServeMux()
-mux.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
-	io.WriteString(w, "hello world")
-})
-log.Fatal(fhttp.ListenAndServe(":8080", mux))
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+
+	"github.com/linfeip/fnet/fhttp"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "hello world")
+	})
+	mux.HandleFunc("GET /query", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "hello %s\n", r.URL.Query().Get("name"))
+	})
+	mux.HandleFunc("POST /form", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "name=%s lang=%s\n", r.FormValue("name"), r.FormValue("lang"))
+	})
+	mux.HandleFunc("POST /json", func(w http.ResponseWriter, r *http.Request) {
+		var v map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&v); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"received": v})
+	})
+	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(w, r.Body) // a chunked or large body is streamed by net/http
+	})
+
+	srv, err := fhttp.NewServer(":8080", mux, fhttp.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Fatal(srv.Serve())
+}
 ```
 
 ### WebSocket
 
+An echo server, the same as [examples/websocket](examples/websocket/main.go):
+
 ```go
+package main
+
+import (
+	"log"
+	"net/http"
+
+	"github.com/linfeip/fnet/fhttp"
+	"github.com/linfeip/fnet/websocket"
+
+	"github.com/gobwas/ws"
+)
+
 type echo struct{}
 
 func (echo) OnOpen(c *websocket.Conn)                               {}
 func (echo) OnMessage(c *websocket.Conn, op ws.OpCode, data []byte) { c.WriteMessage(op, data) } // a complete message
 func (echo) OnClose(c *websocket.Conn, err error)                   {}
 
-mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-	websocket.Upgrade(w, r, echo{}, websocket.Options{})
-})
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		websocket.Upgrade(w, r, echo{}, websocket.Options{})
+	})
+
+	srv, err := fhttp.NewServer(":8080", mux, fhttp.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Fatal(srv.Serve())
+}
 ```
+
+On Linux, `fhttp.Options{Engine: fnet.Options{ReusePort: true}}` gives every sub-reactor a listener of its own.
 
 Callbacks run on the executor (`taskpool.DefaultTaskPool` by default, replaceable through `fnet.Options.Executor`), so they must return quickly. Timeouts and limits are set in `fnet.Options`, `fhttp.Options` and `websocket.Options`; see their doc comments.
 
@@ -118,27 +195,13 @@ go test ./http -run XXX -bench GET   # GET benchmark: fhttp vs net/http vs fasth
 
 ---
 
-## Benchmarks
-
-macOS, 10 cores, wrk and the server on the same machine, hello world Handler:
-
-| Scenario | fhttp | net/http |
-| --- | --- | --- |
-| `wrk -t4 -c256 -d10s` throughput | about 211k req/s | about 209k req/s |
-| 15000 idle keep-alive connections, RSS increase | 13MB (about 1KB/connection) | 271MB (about 19KB/connection) |
-| Goroutines with 15000 idle connections | 12 | 15003 |
-
-Throughput is on par because most CPU goes to system calls (the loopback stack); the gain is memory and goroutine count with many connections.
-
----
-
 ## Limitations
 
 - The send buffer has no upper bound and there is no write timeout: a client that never reads makes it grow.
 - No TLS or HTTP/2. Responses are fully buffered (no `http.Flusher` / `http.Hijacker`), except on connections handed to `net/http` for a streamed request body.
 - WebSocket: no permessage-deflate; messages are always sent as a single frame.
 - Half-close is not supported: after EOF the connection is closed once the buffered data has been sent.
-- The kqueue path is fully tested on macOS; the epoll path is cross-compiled and passes `go vet` but **has not been run on Linux yet**. Run `go test -race ./...` on Linux before going live.
+- The kqueue path is fully tested on macOS; the epoll path has run HttpArena's WebSocket benchmarks on Linux and passes their validation. Run `go test -race ./...` on your Linux target before going live.
 
 ---
 
