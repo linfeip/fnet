@@ -178,9 +178,16 @@ func (c *client) expectClose(t *testing.T, want ws.StatusCode) {
 	}
 	// If the peer is still sending when the server closes (for example data sent after a protocol
 	// error), the kernel ends the connection with RST, so the read returns ECONNRESET instead of EOF.
-	if _, err := c.Read(make([]byte, 1)); err != io.EOF && !errors.Is(err, syscall.ECONNRESET) {
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF && !isConnReset(err) {
 		t.Fatalf("want the connection to be closed, got %v", err)
 	}
+}
+
+// isConnReset reports whether err is the connection having been reset by the peer. On Windows that is WSAECONNRESET,
+// which does not match syscall.ECONNRESET (a placeholder value there).
+func isConnReset(err error) bool {
+	const wsaeconnreset = syscall.Errno(10054)
+	return errors.Is(err, syscall.ECONNRESET) || runtime.GOOS == "windows" && errors.Is(err, wsaeconnreset)
 }
 
 func TestEcho(t *testing.T) {
@@ -717,6 +724,9 @@ func expectPanicLog(t *testing.T) {
 }
 
 func TestPanic(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the standard library implementation does not recover a panic in a callback (see fnet.ErrHandlerPanic)")
+	}
 	expectPanicLog(t)
 	// Two messages arrive while OnOpen runs and are received in the same read: after the panic the
 	// connection is closed with 1011, the remaining messages of that batch are not delivered, and
@@ -753,8 +763,13 @@ func TestOpenPanic(t *testing.T) {
 // blocked by TCP flow control, the connection is not closed because of that, and nothing is timed while the
 // callback runs; once the application recovers, all messages are delivered in order.
 func TestSlowHandler(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a Windows TCP send does not block while the peer does not read, so the peer cannot be blocked")
+	}
 	h := &testHandler{blocked: make(chan struct{})}
 	s := newTestServer(t, h, Options{MessageTimeout: 300 * time.Millisecond})
+	var unblock sync.Once
+	t.Cleanup(func() { unblock.Do(func() { close(h.blocked) }) }) // before the server closes: a failure never hangs
 	c := dial(t, s)
 
 	head, rest := backlog()
@@ -778,7 +793,7 @@ func TestSlowHandler(t *testing.T) {
 	default:
 	}
 
-	close(h.blocked)
+	unblock.Do(func() { close(h.blocked) })
 	c.SetDeadline(time.Now().Add(10 * time.Second))
 	written := make(chan error, 1)
 	go func() {

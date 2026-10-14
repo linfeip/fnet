@@ -161,12 +161,8 @@ func (s *Server) serveConn(c *stdConn) {
 	var in []byte
 	var err error
 	for err == nil {
-		if c.waitResumed() { // detached: hand the unconsumed data over and leave the connection open
-			s.mu.Lock()
-			delete(s.conns, c)
-			s.mu.Unlock()
-			c.in = in
-			close(c.detached)
+		if c.waitResumed() {
+			s.handOver(c, in)
 			return
 		}
 		var n int
@@ -181,6 +177,12 @@ func (s *Server) serveConn(c *stdConn) {
 		if len(in) > 0 {
 			in = append(in, data...)
 			data = in
+		}
+		// PauseRead may have been called while the Read was blocked: the data just read waits here until reading
+		// resumes (it is not delivered meanwhile, as on Linux/macOS), or is handed over if the connection is detached.
+		if c.waitResumed() {
+			s.handOver(c, data)
+			return
 		}
 		consumed := min(max(s.handler.OnData(c, data), 0), len(data))
 		in = append(in[:0], data[consumed:]...)
@@ -200,6 +202,16 @@ func (s *Server) serveConn(c *stdConn) {
 		}
 	}
 	s.handler.OnClose(c, err)
+}
+
+// handOver is the end of the read loop of a detached connection: it hands the unconsumed data over to Detach and leaves
+// the connection open.
+func (s *Server) handOver(c *stdConn, in []byte) {
+	s.mu.Lock()
+	delete(s.conns, c)
+	s.mu.Unlock()
+	c.in = in
+	close(c.detached)
 }
 
 const (

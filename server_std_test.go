@@ -100,3 +100,58 @@ func TestServeRetriesTemporaryAcceptError(t *testing.T) {
 		t.Fatalf("backoff delays in the log %v, want %v", records.delays, want)
 	}
 }
+
+// TestPauseReadWhileBlocked checks that PauseRead takes effect when it is called while the read loop is already blocked
+// in a Read: the data that arrives then is held back until ResumeRead, or handed over by Detach.
+func TestPauseReadWhileBlocked(t *testing.T) {
+	got := make(chan string, 4)
+	opened := make(chan Conn, 2)
+	srv := startServer(t, &funcHandler{
+		open: func(c Conn) { opened <- c },
+		data: func(c Conn, b []byte) int {
+			got <- string(b)
+			return len(b)
+		},
+	})
+	expectNone := func(what string) {
+		t.Helper()
+		select {
+		case s := <-got:
+			t.Fatalf("OnData(%q) was called while reading is paused (%s)", s, what)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	c := dial(t, srv)
+	sc := <-opened
+	time.Sleep(50 * time.Millisecond) // the read loop is blocked in Read by now
+	sc.PauseRead()
+	c.Write([]byte("held"))
+	expectNone("resume")
+	sc.ResumeRead()
+	select {
+	case s := <-got:
+		if s != "held" {
+			t.Fatalf("got %q, want %q", s, "held")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the data held back was not delivered after ResumeRead")
+	}
+
+	c = dial(t, srv)
+	sc = <-opened
+	time.Sleep(50 * time.Millisecond)
+	sc.PauseRead()
+	c.Write([]byte("kept"))
+	expectNone("detach")
+	nc, err := sc.Detach()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	buf := make([]byte, 4)
+	nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(nc, buf); err != nil || string(buf) != "kept" {
+		t.Fatalf("Detach handed over %q, err=%v, want %q", buf, err, "kept")
+	}
+}

@@ -230,6 +230,9 @@ func TestHandshakeFailure(t *testing.T) {
 }
 
 func TestPanic(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the standard library implementation does not recover a panic in a callback (see fnet.ErrHandlerPanic)")
+	}
 	for _, in := range []string{"OnOpen", "OnData"} {
 		t.Run(in, func(t *testing.T) {
 			var panicked atomic.Bool // only the first connection panics

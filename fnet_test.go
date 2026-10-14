@@ -248,6 +248,9 @@ func TestWriteFromOtherGoroutines(t *testing.T) {
 // TestPauseRead verifies that OnData is not called while reading is paused, that writes still work as
 // usual, and that the peer blocks once it fills the kernel buffer; after resuming, the data arrives in full.
 func TestPauseRead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a Windows TCP send does not block while the peer does not read, so the peer cannot be blocked")
+	}
 	out := bytes.Repeat([]byte("0123456789abcdef"), units.MB) // 16MB, far beyond the kernel buffer; written out via the send buffer while reading is paused
 	in := make([]byte, 32*units.MB)
 	var received atomic.Int64
