@@ -82,24 +82,34 @@ func (b *Buffer) Discard(n int) { b.data = b.data[:copy(b.data, b.data[n:])] }
 // left over from rounding up to a power of two: when such a buffer grows again, an extra 1/4 of slack is kept, since
 // otherwise every append would reallocate and copy the whole block, making the total cost of successive appends grow
 // with the square of the size.
+//
+// Growing the buffer is left to grow, which keeps Append small enough to be inlined: it is called for every small piece
+// of a response.
 func (b *Buffer) Append(p []byte) {
 	if cap(b.data)-len(b.data) < len(p) {
-		size := len(b.data) + len(p)
-		if cap(b.data) > 1<<maxShift {
-			size += size / 4
-		}
-		nb := append(Get(size).data, b.data...)
-		b.Release()
-		b.data = nb
+		b.grow(len(p))
 	}
 	b.data = append(b.data, p...)
 }
 
-// AppendString is the same as Append. s is handed to Append zero-copy, and Append only reads it without modifying it, so
-// the string is never changed.
+// grow gives b room for n more bytes, see Append.
+func (b *Buffer) grow(n int) {
+	size := len(b.data) + n
+	if cap(b.data) > 1<<maxShift {
+		size += size / 4
+	}
+	nb := append(Get(size).data, b.data...)
+	b.Release()
+	b.data = nb
+}
+
+// AppendString is the same as Append, and inlined as well.
 //
 // No generic shared implementation: a generic instance called across packages has no escape information, so the compiler
 // conservatively assumes the argument escapes, forcing data on the caller's stack to be allocated on the heap.
 func (b *Buffer) AppendString(s string) {
-	b.Append(unsafe.Slice(unsafe.StringData(s), len(s)))
+	if cap(b.data)-len(b.data) < len(s) {
+		b.grow(len(s))
+	}
+	b.data = append(b.data, s...)
 }

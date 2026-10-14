@@ -1,7 +1,7 @@
 // http is an example HTTP server based on fhttp, whose Handler is fully compatible with the standard library. It shows
-// the common request types: a request body of up to fhttp.Options.MaxBufferedBodyBytes (1MB by default) is served on
-// fnet, a larger or chunked one (such as a big file upload) is streamed by net/http, with the same Handler. With -tls
-// it serves HTTPS.
+// the common request types: a request body of up to fhttp.Options.MaxBufferedBodyBytes (1MB by default), with
+// Content-Length or chunked, is served on fnet, a larger one (such as a big file upload) is streamed by net/http, with
+// the same Handler. With -tls it serves HTTPS.
 //
 //	cd examples && go run ./http -addr :8080
 //

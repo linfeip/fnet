@@ -24,6 +24,7 @@ package taskpool
 
 import (
 	"log/slog"
+	"math"
 	"math/bits"
 	"runtime"
 	"sync/atomic"
@@ -98,6 +99,11 @@ func (p *Pool) Submit(task func()) {
 func (p *Pool) SubmitTo(key int, task func()) {
 	p.shards[uint(key)%uint(len(p.shards))].submit(task)
 }
+
+// RandomKey returns a random key, with which SubmitTo (or an executor choosing its queue by the key modulo the number of
+// queues, such as fnet.Options.Executor) places a task in a random queue, the way Submit does. The key does not depend on
+// the number of shards, so it suits an executor of any size.
+func RandomKey() int { return int(cheaprandn(math.MaxInt32)) }
 
 // submit puts the task into this shard's queue and makes sure a worker comes for it; when the queue is full a
 // temporary goroutine runs the task and helps drain the queue.

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/bits"
 	"runtime"
 	"sync"
@@ -78,6 +79,22 @@ func TestSubmitToKeyShard(t *testing.T) {
 		if n := p.shards[i].liveWorkers.Load(); n != want {
 			t.Fatalf("shard %d started %d workers, want %d", i, n, want)
 		}
+	}
+}
+
+// TestRandomKey checks that the keys stay in range and, taken modulo the number of shards, reach every shard.
+func TestRandomKey(t *testing.T) {
+	const shards = 4
+	reached := make(map[int]bool)
+	for range 1000 {
+		key := RandomKey()
+		if key < 0 || key >= math.MaxInt32 {
+			t.Fatalf("key %d is out of range", key)
+		}
+		reached[key%shards] = true
+	}
+	if len(reached) != shards {
+		t.Fatalf("the keys reached %d of %d shards", len(reached), shards)
 	}
 }
 

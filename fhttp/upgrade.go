@@ -7,8 +7,6 @@ import (
 	"strings"
 
 	"github.com/linfeip/fnet"
-	"github.com/linfeip/fnet/internal/bytepool"
-	"github.com/linfeip/fnet/internal/units"
 )
 
 // errEarlyRequest means the client sent a follow-up request without waiting for the upgrade response.
@@ -64,13 +62,13 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 	// response, so these requests must no longer be executed as HTTP.
 	if len(c.queue) > 0 {
 		c.mu.Unlock()
-		c.writeError(http.StatusBadRequest)
+		w.writeError(http.StatusBadRequest)
 		return errEarlyRequest
 	}
 	c.protocol.Store(&p)
-	// No HTTP requests are handled from now on: release the request queue and the cached peer address (remoteAddr
-	// is accessed only by the worker, and we are the worker right now).
-	c.queue, c.remoteAddr = nil, ""
+	// No HTTP requests are handled from now on: release the request queue, the cached peer address and what
+	// parseRequest shares (accessed only by the worker, and we are the worker right now).
+	c.queue, c.remoteAddr, c.last = nil, "", nil
 	if c.partial {
 		// Data the client sent without waiting for the upgrade response is handed to the new protocol only when
 		// data next arrives; until then the request-header timeout applies.
@@ -78,21 +76,19 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 	}
 	c.mu.Unlock()
 
-	b := &w.buf
-	b.buffer = bytepool.Get(units.KB / 2)
-	b.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	b := &w.out
+	b.AppendString("HTTP/1.1 101 Switching Protocols\r\n")
 	accept := w.header.Get("Sec-WebSocket-Accept")
 	if len(w.header) == 3 && accept != "" &&
 		strings.EqualFold(w.header.Get("Upgrade"), "websocket") &&
 		strings.EqualFold(w.header.Get("Connection"), "Upgrade") {
-		b.WriteString("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
-		b.WriteString(accept)
-		b.WriteString("\r\n\r\n")
+		b.AppendString("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
+		b.AppendString(accept)
+		b.AppendString("\r\n\r\n")
 	} else {
-		w.header.Write(b)
-		b.WriteString("\r\n")
+		appendHeader(b, w.header)
+		b.AppendString("\r\n")
 	}
-	c.connection.Write(b.buffer.Bytes())
-	b.buffer.Release()
+	w.flush() // the responses before it and the 101 go out before the new protocol writes anything
 	return nil
 }

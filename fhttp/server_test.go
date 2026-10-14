@@ -13,10 +13,13 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
+	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -25,6 +28,7 @@ import (
 	"unsafe"
 
 	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/internal/bytepool"
 	"github.com/linfeip/fnet/internal/units"
 )
 
@@ -122,23 +126,17 @@ func TestClient(t *testing.T) {
 		t.Fatalf("connection was not reused: %s vs %s", addr1, addr2)
 	}
 
-	// A small body with Content-Length is buffered and served on fnet, keeping the connection alive; a chunked one
-	// (hiding the concrete type keeps the client from knowing the length) goes to net/http, which closes it.
-	for _, tt := range []struct {
-		body  io.Reader
-		close bool
-	}{
-		{strings.NewReader("ping"), false},
-		{struct{ io.Reader }{strings.NewReader("ping")}, true},
-	} {
-		resp, err := client.Post(base+"/echo", "text/plain", tt.body)
+	// A small body, with Content-Length or chunked (hiding the concrete type keeps the client from knowing the length),
+	// is buffered and served on fnet, keeping the connection alive.
+	for _, body := range []io.Reader{strings.NewReader("ping"), struct{ io.Reader }{strings.NewReader("ping")}} {
+		resp, err := client.Post(base+"/echo", "text/plain", body)
 		if err != nil {
 			t.Fatal(err)
 		}
-		body, err := io.ReadAll(resp.Body)
+		got, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if err != nil || resp.StatusCode != 200 || string(body) != "ping" || resp.Close != tt.close {
-			t.Fatalf("POST with a body: %d %q close=%v err=%v", resp.StatusCode, body, resp.Close, err)
+		if err != nil || resp.StatusCode != 200 || string(got) != "ping" || resp.Close {
+			t.Fatalf("POST with a body: %d %q close=%v err=%v", resp.StatusCode, got, resp.Close, err)
 		}
 	}
 
@@ -163,6 +161,38 @@ func TestClient(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if _, err := client.Get(base + "/panic"); err == nil {
 		t.Fatal("the connection should be closed after a Handler panic")
+	}
+}
+
+// runOnHandlerExecutor is the frame in which the HandlerExecutor of TestHandlerExecutor runs its tasks; the Handler
+// looks for it in its own stack.
+//
+//go:noinline
+func runOnHandlerExecutor(task func()) { task() }
+
+// TestHandlerExecutor checks that the Handlers run as tasks of Options.HandlerExecutor, with a key in the range
+// taskpool.RandomKey returns.
+func TestHandlerExecutor(t *testing.T) {
+	onExecutor := make(chan bool, 1)
+	keys := make(chan int, 16)
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stack := make([]byte, 16*units.KB)
+		onExecutor <- strings.Contains(string(stack[:runtime.Stack(stack, false)]), "runOnHandlerExecutor")
+		io.WriteString(w, "ok")
+	}), Options{HandlerExecutor: func(key int, task func()) {
+		keys <- key
+		go runOnHandlerExecutor(task)
+	}})
+	client := &http.Client{Transport: &http.Transport{}}
+	defer client.CloseIdleConnections()
+	if _, body := get(t, client, "http://"+s.Addr().String()+"/"); body != "ok" {
+		t.Fatalf("GET /: %q", body)
+	}
+	if !<-onExecutor {
+		t.Fatal("the Handler did not run as a task of Options.HandlerExecutor")
+	}
+	if key := <-keys; key < 0 || key >= math.MaxInt32 {
+		t.Fatalf("key %d is out of the range of taskpool.RandomKey", key)
 	}
 }
 
@@ -212,20 +242,33 @@ func TestPipelining(t *testing.T) {
 	}
 }
 
-// discardConn is a fnet.Conn that discards whatever is written to it; it only implements the methods used
-// while handling a request.
-type discardConn struct{ fnet.Conn }
-
-func (discardConn) Write(b []byte) (int, error) { return len(b), nil }
-func (discardConn) Writev(bs [][]byte) (int, error) {
-	n := 0
-	for _, b := range bs {
-		n += len(b)
-	}
-	return n, nil
+// recordConn is a fnet.Conn that records what is written to it; it only implements the methods used while handling
+// a request.
+type recordConn struct {
+	fnet.Conn
+	writes []string
 }
-func (discardConn) SetDeadline(time.Time) {}
-func (discardConn) RemoteAddr() net.Addr  { return &net.TCPAddr{} }
+
+func (c *recordConn) Write(b []byte) (int, error) {
+	c.writes = append(c.writes, string(b))
+	return len(b), nil
+}
+
+func (c *recordConn) Writev(bs [][]byte) (int, error) {
+	var b []byte
+	for _, s := range bs {
+		b = append(b, s...)
+	}
+	return c.Write(b)
+}
+
+func (*recordConn) SetDeadline(time.Time) {}
+func (*recordConn) RemoteAddr() net.Addr  { return &net.TCPAddr{} }
+
+// queueConn returns a conn writing to rc whose requests the test serves itself: busy, so onData starts no worker.
+func queueConn(rc *recordConn) *conn {
+	return &conn{srv: &Server{handler: testMux(), opts: Options{}.withDefaults()}, connection: rc, busy: true}
+}
 
 // TestConnSize checks that conn and the request queue item stay within their size classes: every connection holds a
 // conn, and its queue keeps a backing array (see maxRetainedQueueCapacity), so a few bytes more cost every idle
@@ -234,8 +277,8 @@ func TestConnSize(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) != 8 {
 		t.Skip("size checked for 64-bit platforms")
 	}
-	if size := unsafe.Sizeof(conn{}); size > 112 {
-		t.Fatalf("conn is %dB, over the 112B size class", size)
+	if size := unsafe.Sizeof(conn{}); size > 128 {
+		t.Fatalf("conn is %dB, over the 128B size class", size)
 	}
 	if size := unsafe.Sizeof(request{}); size > 32 {
 		t.Fatalf("request is %dB, over 32B", size)
@@ -246,22 +289,69 @@ func TestConnSize(t *testing.T) {
 // pipelining burst is released, while the capacity for a small number of requests is retained so that
 // each request does not have to allocate again.
 func TestQueueCapacity(t *testing.T) {
-	req := "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"
-	s := &Server{handler: testMux(), opts: Options{}.withDefaults()}
-	c := &conn{srv: s, connection: discardConn{}, busy: true} // busy: push starts no worker; the test calls serve
-	for range 64 {
-		c.push([]byte(req), 0)
-	}
+	const get = "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"
+	c := queueConn(&recordConn{})
+	c.onData([]byte(strings.Repeat(get, 4*maxRetainedQueueCapacity)))
 	c.serve()
 	if cap(c.queue) > maxRetainedQueueCapacity {
 		t.Fatalf("queue capacity after a burst %d, want no more than %d", cap(c.queue), maxRetainedQueueCapacity)
 	}
 
 	c.busy = true
-	c.push([]byte(req), 0)
+	c.onData([]byte(get))
 	c.serve()
 	if cap(c.queue) != 1 {
 		t.Fatalf("queue capacity after a single request %d, want to retain 1", cap(c.queue))
+	}
+}
+
+// TestReuseRequests checks that the requests fhttp parsed are released for reuse once their Handler has returned,
+// without anything of one request showing in the next. Whether the pool hands the same one out again is not checked:
+// under the race detector sync.Pool drops some of what it is given.
+func TestReuseRequests(t *testing.T) {
+	var seen []*http.Request
+	var views []string
+	c := queueConn(&recordConn{})
+	c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seen = append(seen, r)
+		views = append(views, fmt.Sprintf("%s %s %v %q", r.Method, r.URL, r.Header, body))
+	})
+	c.onData([]byte("POST /a?x=1 HTTP/1.1\r\nHost: h\r\nX-A: 1\r\nContent-Length: 2\r\n\r\nhi" +
+		"GET /b HTTP/1.1\r\nHost: h\r\n\r\n"))
+	c.serve()
+	want := []string{`POST /a?x=1 map[Content-Length:[2] X-A:[1]] "hi"`, `GET /b map[] ""`}
+	if !slices.Equal(views, want) {
+		t.Errorf("requests %q, want %q", views, want)
+	}
+	for i, r := range seen {
+		if r.Method != "" || len(r.Header) != 0 {
+			t.Errorf("request %d was not released: %q %v", i, r.Method, r.Header)
+		}
+	}
+}
+
+// TestBatchedResponses checks that the responses to queued requests go out in a single write, and that a large body
+// is written without being copied, after what was collected before it.
+func TestBatchedResponses(t *testing.T) {
+	const get = "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"
+	rc := &recordConn{}
+	c := queueConn(rc)
+	if n := c.onData([]byte(strings.Repeat(get, 16) + "GET /hel")); n != 16*len(get) {
+		t.Fatalf("consumed %d bytes, want %d", n, 16*len(get))
+	}
+	c.serve()
+	if len(rc.writes) != 1 || strings.Count(rc.writes[0], "hello world") != 16 {
+		t.Fatalf("got %d writes, want one with 16 responses: %q", len(rc.writes), rc.writes)
+	}
+
+	rc = &recordConn{}
+	c = queueConn(rc)
+	c.onData([]byte(get + "GET /big HTTP/1.1\r\nHost: a\r\n\r\n" + get))
+	c.serve()
+	if len(rc.writes) != 2 || !strings.HasPrefix(rc.writes[0], "HTTP/1.1 200 OK") || !strings.Contains(rc.writes[0], "hello world") ||
+		len(rc.writes[0]) < 4*units.MB || strings.Count(rc.writes[1], "hello world") != 1 {
+		t.Fatalf("got %d writes, want the first response together with /big, then the last response", len(rc.writes))
 	}
 }
 
@@ -304,6 +394,7 @@ func TestBadRequests(t *testing.T) {
 		// continuing Content-Length, and an empty line made of a bare LF ending the headers early.
 		{"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n 0\r\n\r\nx", 400},
 		{"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 3\n\nabc\r\n\r\nxyz", 400},
+		{"POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n x\r\n\r\n0\r\n\r\n", 400},
 		// Not buffered by fhttp, so net/http answers them, the same as the net/http server would.
 		{"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n", 501},
 		{"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n", 400},
@@ -561,49 +652,6 @@ func TestTimeouts(t *testing.T) {
 	})
 }
 
-func TestParseFastUpgradeRequest(t *testing.T) {
-	msg := []byte("GET /ws HTTP/1.1\r\nHost: 127.0.0.1:18080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
-	fast := parseFastUpgradeRequest(msg)
-	if fast == nil {
-		t.Fatal("expected non-nil fastUpgradeRequest")
-	}
-	defer releaseFastUpgradeRequest(fast)
-
-	req := &fast.request
-	if req.Method != "GET" || req.Proto != "HTTP/1.1" || req.ProtoMajor != 1 || req.ProtoMinor != 1 {
-		t.Fatalf("unexpected request line: %+v", req)
-	}
-	if req.Host != "127.0.0.1:18080" || req.URL.Path != "/ws" {
-		t.Fatalf("unexpected host or path: host=%q path=%q", req.Host, req.URL.Path)
-	}
-	if req.Header.Get("Upgrade") != "websocket" || req.Header.Get("Connection") != "Upgrade" ||
-		req.Header.Get("Sec-WebSocket-Version") != "13" || req.Header.Get("Sec-WebSocket-Key") != "dGhlIHNhbXBsZSBub25jZQ==" {
-		t.Fatalf("unexpected headers: %+v", req.Header)
-	}
-
-	// Missing Host
-	if fast2 := parseFastUpgradeRequest([]byte("GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")); fast2 != nil {
-		t.Fatal("expected nil for missing Host")
-	}
-
-	// Plain GET request
-	if fast3 := parseFastUpgradeRequest([]byte("GET /hello HTTP/1.1\r\nHost: a\r\n\r\n")); fast3 != nil {
-		t.Fatal("expected nil for plain GET")
-	}
-}
-
-func BenchmarkParseFastUpgradeRequest(b *testing.B) {
-	msg := []byte("GET /ws HTTP/1.1\r\nHost: 127.0.0.1:18080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		fast := parseFastUpgradeRequest(msg)
-		if fast == nil {
-			b.Fatal("nil")
-		}
-		releaseFastUpgradeRequest(fast)
-	}
-}
-
 // TestHTTPS serves over TLS, on fnet and, for a streamed body, on net/http after the handoff. The server config offers
 // h2, which fhttp must not negotiate.
 func TestHTTPS(t *testing.T) {
@@ -618,7 +666,7 @@ func TestHTTPS(t *testing.T) {
 	})
 	config := tlsServerConfig(t)
 	config.NextProtos = []string{"h2", "http/1.1"}
-	s := serve(t, mux, Options{TLSConfig: config})
+	s := serve(t, mux, Options{TLSConfig: config, MaxBufferedBodyBytes: 8})
 	if !slices.Equal(config.NextProtos, []string{"h2", "http/1.1"}) {
 		t.Fatalf("NewServer modified the caller's config: %q", config.NextProtos)
 	}
@@ -636,13 +684,202 @@ func TestHTTPS(t *testing.T) {
 		t.Fatalf("connection not kept alive: %s, %s", addr1, addr2)
 	}
 
-	// A chunked body is not buffered: net/http serves it on the connection detached from fnet.
-	resp, err := client.Post(base+"/tls", "text/plain", io.MultiReader(strings.NewReader("hello")))
+	// A body over MaxBufferedBodyBytes is not buffered: net/http serves it on the connection detached from fnet.
+	resp, err := client.Post(base+"/tls", "text/plain", strings.NewReader("hello world"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if b, _ := io.ReadAll(resp.Body); string(b) != "http/1.1 5" {
-		t.Fatalf("chunked POST /tls: %d %q", resp.StatusCode, b)
+	if b, _ := io.ReadAll(resp.Body); string(b) != "http/1.1 11" || !resp.Close {
+		t.Fatalf("POST /tls: %d %q close=%v", resp.StatusCode, b, resp.Close)
+	}
+}
+
+// TestDate checks that the Date field line is that of the current second.
+func TestDate(t *testing.T) {
+	var b bytepool.Buffer
+	appendDate(&b)
+	line := string(b.Bytes())
+	b.Release()
+	date, err := http.ParseTime(strings.TrimSuffix(strings.TrimPrefix(line, "Date: "), "\r\n"))
+	if err != nil || !strings.HasSuffix(line, "\r\n") || time.Since(date).Abs() > 2*time.Second {
+		t.Fatalf("Date field %q: %v", line, err)
+	}
+}
+
+// TestAppendHeader checks that the fields come out the way http.Header.Write writes them: sorted, without names that
+// are not tokens, and with no CR or LF that could inject a field.
+func TestAppendHeader(t *testing.T) {
+	h := http.Header{
+		"X-B": {"2", " two \t"}, "X-A": {"a\r\nX-Injected: 1", "\r\nb\n"}, "Bad Name": {"v"}, "X-Empty": {""},
+		"Content-Length": {"5"}, "Set-Cookie": {"a=1", "b=2"}, "X~`|^": {"tok"}, "Bad\"Quote": {"v"},
+	}
+	var want strings.Builder
+	h.Write(&want)
+	var got bytepool.Buffer
+	appendHeader(&got, h)
+	if string(got.Bytes()) != want.String() {
+		t.Errorf("got %q, want %q", got.Bytes(), want.String())
+	}
+	got.Release()
+}
+
+// parseCases are requests parseRequest has to read field for field like http.ReadRequest (fast), and requests it has
+// to leave to http.ReadRequest.
+var parseCases = struct{ fast, slow []string }{
+	fast: []string{
+		"GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+		"GET /baseline11?a=13&b=42 HTTP/1.1\r\nHost: localhost:8080\r\n\r\n",
+		"GET /a/b;c,d=e@f:g$h&i+j~k_l.m-n//o HTTP/1.0\r\n\r\n",
+		"GET /q? HTTP/1.1\r\nHost: a\r\n\r\n",
+		"GET /q??x?y HTTP/1.1\r\nHost: a\r\n\r\n",
+		"GET /q?a=%41#f\"<> HTTP/1.1\r\nHost: a\r\n\r\n",
+		"HEAD /x HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n",
+		"OPTIONS /x HTTP/1.1\r\nhost:\tb:80 \r\nCONNECTION: foo, close\r\n\r\n",
+		"DELETE /x HTTP/1.1\r\nHost: a\r\nempty:\r\nX-A: 1\r\nx-a: 2\r\nX-B:  sp  ace  \r\nx-lower-case: v\r\n" +
+			"Accept: text/html,application/xhtml+xml\r\nUser-Agent: Mozilla/5.0 (X11)\r\nCookie: a=b; c=d\r\n" +
+			"X-Many: 1\r\nX-Many: 2\r\nX-Many: 3\r\n\r\n",
+		"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello",
+		"PUT /echo HTTP/1.1\r\nHost: a\r\ncontent-length: 0\r\n\r\n",
+		"PATCH /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi",
+		"POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\nB\r\n world 0123\r\n0\r\n\r\n",
+		"POST /echo HTTP/1.1\r\nHost: a\r\ntransfer-encoding: Chunked\r\n\r\n0\r\n\r\n",
+		"GET /ws HTTP/1.1\r\nHost: 127.0.0.1:18080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+	},
+	slow: []string{
+		"GET /%41 HTTP/1.1\r\nHost: a\r\n\r\n",
+		"GET /a!b HTTP/1.1\r\nHost: a\r\n\r\n",
+		"GET http://a/b HTTP/1.1\r\nHost: a\r\n\r\n",
+		"OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n",
+		"CONNECT a:443 HTTP/1.1\r\nHost: a\r\n\r\n",
+		"BREW /pot HTTP/1.1\r\nHost: a\r\n\r\n",
+		"GET / HTTP/1.2\r\nHost: a\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: a\r\nPragma: no-cache\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: a\r\nX-Bad: \x80\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: a\r\nX : v\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: a\r\nX-Fold: a\r\n b\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: a\r\nX: a\rb\r\n\r\n",
+		"GET / HTTP/1.1\nHost: a\r\n\r\n",
+		"POST / HTTP/1.1\r\nHost: a\r\nTrailer: X\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+	},
+}
+
+// readMessage frames raw like a connection would and returns the message.
+func readMessage(t testing.TB, raw string) ([]byte, message) {
+	var f framer
+	opts := Options{}.withDefaults()
+	m, _, err := f.next([]byte(raw), &opts)
+	if err != nil || m.size != len(raw) {
+		t.Fatalf("%q: framed %+v, %v", raw, m, err)
+	}
+	return []byte(raw), m
+}
+
+// sameRequest reports how got differs from want, the request http.ReadRequest read; "" when it does not.
+func sameRequest(got, want *http.Request) string {
+	gotBody, _ := io.ReadAll(got.Body)
+	wantBody, _ := io.ReadAll(want.Body)
+	switch {
+	case got.Method != want.Method || got.RequestURI != want.RequestURI || got.Host != want.Host:
+		return fmt.Sprintf("request line or Host: %q %q %q", got.Method, got.RequestURI, got.Host)
+	case got.Proto != want.Proto || got.ProtoMajor != want.ProtoMajor || got.ProtoMinor != want.ProtoMinor:
+		return fmt.Sprintf("protocol: %q", got.Proto)
+	case !reflect.DeepEqual(*got.URL, *want.URL):
+		return fmt.Sprintf("URL: %#v, want %#v", *got.URL, *want.URL)
+	case !reflect.DeepEqual(got.Header, want.Header):
+		return fmt.Sprintf("Header: %q, want %q", got.Header, want.Header)
+	case got.Close != want.Close || got.ContentLength != want.ContentLength:
+		return fmt.Sprintf("Close=%v ContentLength=%d", got.Close, got.ContentLength)
+	case !slices.Equal(got.TransferEncoding, want.TransferEncoding) || got.Trailer != nil:
+		return fmt.Sprintf("TransferEncoding=%q Trailer=%q", got.TransferEncoding, got.Trailer)
+	case (got.Body == http.NoBody) != (want.Body == http.NoBody) || !bytes.Equal(gotBody, wantBody):
+		return fmt.Sprintf("body %q, want %q", gotBody, wantBody)
+	}
+	return ""
+}
+
+// TestParseRequest compares parseRequest with http.ReadRequest; the parsed requests are released after use, so that
+// later cases reuse them, as fhttp does once the Handler has returned.
+func TestParseRequest(t *testing.T) {
+	var last lastRequest // shared by all the requests, as by those of one connection
+	for _, raw := range parseCases.fast {
+		// The second time the request shares the target and the fields copied the first time.
+		for round := range 2 {
+			msg, m := readMessage(t, raw)
+			before := last
+			got := parseRequest(msg, m, &last)
+			want, err := http.ReadRequest(bufio.NewReader(strings.NewReader(raw)))
+			if got == nil || err != nil {
+				t.Fatalf("%q: parseRequest %v, http.ReadRequest %v", raw, got, err)
+			}
+			if diff := sameRequest(&got.request, want); diff != "" {
+				t.Errorf("%q round %d: %s", raw, round, diff)
+			}
+			if round == 1 && unsafe.StringData(last.target) != unsafe.StringData(before.target) {
+				t.Errorf("%q: the same target was copied again", raw)
+			}
+			if round == 1 && unsafe.StringData(last.fields) != unsafe.StringData(before.fields) {
+				t.Errorf("%q: the same fields were copied again", raw)
+			}
+			got.release()
+		}
+	}
+	for _, raw := range parseCases.slow {
+		if msg, m := readMessage(t, raw); parseRequest(msg, m, new(lastRequest)) != nil {
+			t.Errorf("%q: parseRequest should leave it to http.ReadRequest", raw)
+		}
+	}
+}
+
+// FuzzParseRequest checks that whatever parseRequest reads, http.ReadRequest reads the same way.
+func FuzzParseRequest(f *testing.F) {
+	for _, raw := range slices.Concat(parseCases.fast, parseCases.slow) {
+		f.Add(raw)
+	}
+	opts := Options{}.withDefaults()
+	f.Fuzz(func(t *testing.T, raw string) {
+		var fr framer
+		m, _, err := fr.next([]byte(raw), &opts)
+		if err != nil || m.size == 0 {
+			return
+		}
+		raw = raw[:m.size]
+		got := parseRequest([]byte(raw), m, new(lastRequest))
+		if got == nil {
+			return
+		}
+		want, err := http.ReadRequest(bufio.NewReader(strings.NewReader(raw)))
+		if err != nil {
+			t.Fatalf("%q: parseRequest read it, http.ReadRequest: %v", raw, err)
+		}
+		if diff := sameRequest(&got.request, want); diff != "" {
+			t.Fatalf("%q: %s", raw, diff)
+		}
+		got.release()
+	})
+}
+
+// BenchmarkParseRequest measures the requests of one connection, whose client sends the same header fields every
+// time: each is parsed, then released for reuse as fhttp does once the Handler has returned.
+func BenchmarkParseRequest(b *testing.B) {
+	for _, raw := range []string{
+		"GET /baseline11?a=13&b=42 HTTP/1.1\r\nHost: localhost:8080\r\n\r\n",
+		"GET /ws HTTP/1.1\r\nHost: 127.0.0.1:18080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+	} {
+		msg, m := readMessage(b, raw)
+		b.Run(strings.Fields(raw)[1], func(b *testing.B) {
+			b.ReportAllocs()
+			var last lastRequest
+			for range b.N {
+				p := parseRequest(msg, m, &last)
+				if p == nil {
+					b.Fatal("nil")
+				}
+				p.release()
+			}
+		})
 	}
 }

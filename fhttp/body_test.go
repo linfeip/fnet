@@ -67,8 +67,9 @@ func TestBufferedBody(t *testing.T) {
 		br := dialRaw(t, s, "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc"+
 			"POST /hello HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nGET /"+
 			"GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"+
+			"POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nch\r\n4\r\nunks\r\n0\r\n\r\n"+
 			"PUT /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nxyz")
-		for _, want := range []string{"abc", "hello world", "hello world", "xyz"} {
+		for _, want := range []string{"abc", "hello world", "hello world", "chunks", "xyz"} {
 			if resp, body := readResp(t, br); resp.StatusCode != 200 || body != want || resp.Close {
 				t.Fatalf("got %d %q close=%v, want %q", resp.StatusCode, body, resp.Close, want)
 			}

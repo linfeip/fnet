@@ -2,22 +2,31 @@
 //
 // The division of labor:
 //   - fnet's OnData callback (on a goroutine of the executor) only finds where each request message ends: the
-//     header terminator "\r\n\r\n", then the Content-Length bytes of a small body. It copies the whole message
-//     into the connection's request queue without parsing it;
-//   - a worker goroutine takes the message out, hands it to the standard library's http.ReadRequest for parsing
-//     (the request body is the standard library's own reader over the buffered bytes), then runs the http.Handler
-//     and writes the response back.
+//     header terminator "\r\n\r\n", then a small body, with Content-Length or in chunks. It copies the complete
+//     messages into the connection's request queue without parsing them;
+//   - a worker goroutine of Options.HandlerExecutor (taskpool.DefaultTaskPool by default; the Handlers may block, so
+//     they are not run in OnData's task, which returns at once) takes the messages out in order, parses each (a
+//     request in the plain forms of HTTP/1.x by fhttp itself, field for field the way the standard library's
+//     http.ReadRequest would, any other through http.ReadRequest), runs the http.Handler, and writes the responses
+//     out together whenever it finds the queue empty. The request body is read from memory.
 //
 // At most one worker processes a given connection at a time, so with pipelining the responses come in the same
-// order as the requests. A request, small body included, must be received in full within ReadHeaderTimeout, idle
+// order as the requests. A request, body included, must be received in full within ReadHeaderTimeout, idle
 // connections are closed after IdleTimeout, and the Handler's execution time is not limited (see Options).
 // The response body is buffered in full before being written out, so http.Flusher and http.Hijacker are not
 // supported. Protocol upgrades (such as WebSocket) are done through Upgrade.
 //
-// A request whose body is not buffered (larger than MaxBufferedBodyBytes, chunked, or framed in an unusual way) is
-// served by net/http instead: the connection is detached from fnet and handed to an internal http.Server running the
-// same Handler, which streams the body (a large file upload costs constant memory with Request.MultipartReader) and
-// closes the connection after that request.
+// The request handed to a Handler is pooled, which saves it its allocations: it is valid only within that ServeHTTP
+// call. A Handler, and anything it starts, must not keep the request (its header, URL and body included) past
+// ServeHTTP: neither in a field or a cache, nor in a goroutine that is still running when ServeHTTP returns, nor
+// through a wrapper that goes on running it after ServeHTTP returns, such as http.TimeoutHandler. The request object
+// and the buffers behind its body are reused by later requests, so using them afterwards reads another request's
+// data (a data race). The strings of a request, header values included, are copies and stay valid.
+//
+// A request whose body is not buffered (larger than MaxBufferedBodyBytes, or framed in an unusual way) is served by
+// net/http instead: the connection is detached from fnet and handed to an internal http.Server running the same
+// Handler, which streams the body (a large file upload costs constant memory with Request.MultipartReader) and closes
+// the connection after that request.
 package fhttp
 
 import (
@@ -28,9 +37,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,10 +54,15 @@ import (
 // treated as abuse and the connection is closed.
 const maxPipeline = 128
 
-// maxRetainedQueueCapacity is the maximum capacity retained once the request queue has been drained: the common
-// case of a few requests needs no reallocation every time, while the large capacity left behind by a pipelining
-// burst is released, so a large number of connections do not hold on to memory for long.
-const maxRetainedQueueCapacity = 4
+// maxLimit caps MaxHeaderBytes and MaxBufferedBodyBytes, far above anything buffered in practice, so that the offsets
+// within a buffered message fit an int32 (see framer).
+const maxLimit = 1 << 30
+
+// maxRetainedQueueCapacity is the maximum capacity retained once the request queue has been drained: a connection
+// pipelining a few requests at a time (16 is a common depth) needs no reallocation every time, a connection that sends
+// them one by one keeps only one item, and the large capacity left behind by a pipelining burst is released, so a
+// large number of connections do not hold on to memory for long.
+const maxRetainedQueueCapacity = 16
 
 // Options are the HTTP server parameters; the zero value is the default configuration.
 type Options struct {
@@ -58,8 +70,9 @@ type Options struct {
 	// http.DefaultMaxHeaderBytes (1MB).
 	MaxHeaderBytes int
 	// MaxBufferedBodyBytes is the largest request body that is received in full before the Handler runs; when <=0
-	// it is 1MB. Such a request costs no more than one without a body: it stays on fnet and its body is read from
-	// memory. A request with a larger body is served by net/http (see the package documentation).
+	// it is 1MB, and a chunked body counts with its framing. Such a request costs no more than one without a body: it
+	// stays on fnet and its body is read from memory. A request with a larger body is served by net/http (see the
+	// package documentation).
 	MaxBufferedBodyBytes int
 	// ReadHeaderTimeout is the maximum time from the first byte of a request until the request header, and a body
 	// of up to MaxBufferedBodyBytes, are received in full; data arriving in the meantime does not extend it. When 0
@@ -69,8 +82,18 @@ type Options struct {
 	// (including on a newly established connection); when 0 it is 120s, when <0 it is unlimited.
 	// The Handler's execution time is not limited.
 	IdleTimeout time.Duration
-	// Engine holds the parameters of the underlying fnet engine.
+	// Engine holds the parameters of the underlying fnet engine. Its Executor runs only the connections' own tasks
+	// (reading and splitting the requests), which never block; the Handlers run on HandlerExecutor.
 	Engine fnet.Options
+	// HandlerExecutor runs the Handlers: it is called when a connection has requests queued and no such task of it is
+	// running, with a task that processes the connection's queue and ends once the queue is empty. The key is random
+	// (taskpool.RandomKey), so the tasks of a connection are not tied to one queue. It may be called from any
+	// goroutine, must not block, must run the task asynchronously (not directly on the caller's stack) and must not
+	// drop it; a Handler panic is recovered by fhttp. Unlike the connections' tasks the Handlers may block, so it has
+	// to cope with tasks that block: one running them on a few goroutines would stall every connection behind a slow
+	// Handler. When nil it is the SubmitTo of taskpool.DefaultTaskPool. Unlike Engine.Executor it is used on every
+	// platform.
+	HandlerExecutor func(key int, task func())
 	// TLSConfig, when non-nil, has the server serve HTTPS (see package ftls), the handshake having to complete within
 	// ReadHeaderTimeout. fhttp speaks HTTP/1.1 only, so h2 is taken out of the protocols offered through ALPN.
 	TLSConfig *tls.Config
@@ -83,11 +106,15 @@ func (o Options) withDefaults() Options {
 	if o.MaxBufferedBodyBytes <= 0 {
 		o.MaxBufferedBodyBytes = units.MB
 	}
+	o.MaxHeaderBytes, o.MaxBufferedBodyBytes = min(o.MaxHeaderBytes, maxLimit), min(o.MaxBufferedBodyBytes, maxLimit)
 	if o.ReadHeaderTimeout == 0 {
 		o.ReadHeaderTimeout = 10 * time.Second
 	}
 	if o.IdleTimeout == 0 {
 		o.IdleTimeout = 120 * time.Second
+	}
+	if o.HandlerExecutor == nil {
+		o.HandlerExecutor = taskpool.DefaultTaskPool.SubmitTo
 	}
 	return o
 }
@@ -101,14 +128,16 @@ type Server struct {
 	handoffs *handoffListener // what streams accepts from
 }
 
-// NewServer creates an HTTP server on addr; when handler is nil, http.DefaultServeMux is used. To listen on
-// several addresses with the one server, see NewServerAddrs.
+// NewServer creates an HTTP server on addr; when handler is nil, http.DefaultServeMux is used. The Handler must not
+// keep the request past ServeHTTP: it is pooled and reused (see the package documentation). To listen on several
+// addresses with the one server, see NewServerAddrs.
 func NewServer(addr string, handler http.Handler, opts Options) (*Server, error) {
 	return NewServerAddrs([]string{addr}, handler, opts)
 }
 
 // NewServerAddrs creates an HTTP server on each of addrs; when handler is nil, http.DefaultServeMux is used. At
 // least one address is required, and all of them share the one underlying fnet engine (see fnet.NewServerAddrs).
+// The Handler must not keep the request past ServeHTTP: it is pooled and reused (see the package documentation).
 func NewServerAddrs(addrs []string, handler http.Handler, opts Options) (*Server, error) {
 	if handler == nil {
 		handler = http.DefaultServeMux
@@ -177,6 +206,7 @@ type engineHandler struct{ server *Server }
 
 func (h engineHandler) OnOpen(c fnet.Conn) {
 	hc := &conn{srv: h.server, connection: c}
+	hc.serveTask = hc.serve
 	c.SetContext(hc)
 	hc.setDeadline() // a new connection counts as idle; there is no concurrent access yet, so mu need not be held
 }
@@ -204,8 +234,10 @@ func (h engineHandler) OnClose(c fnet.Conn, err error) {
 // request is one item in the request queue: either a complete request message, or a status code to reply with
 // (100 Continue, or an error that closes the connection), or statusHandoff.
 type request struct {
-	msg    bytepool.Buffer
-	status int
+	msg     bytepool.Buffer
+	header  int32 // the length of the message's request line and headers (see maxLimit)
+	status  int16 // 0 for a message, otherwise the status code to reply with, or statusHandoff
+	chunked bool  // the message's body is chunked
 }
 
 // statusHandoff is the queue item that hands the connection to net/http, see conn.handoff.
@@ -215,7 +247,9 @@ const statusHandoff = -1
 type conn struct {
 	srv        *Server
 	connection fnet.Conn
-	remoteAddr string // produced on the first request, accessed only by the worker (workers of one connection run serially)
+	remoteAddr string       // produced on the first request, accessed only by the worker (workers of one connection run serially)
+	last       *lastRequest // what parseRequest shares with the next request, made on the first one; accessed only by the worker
+	serveTask  func()       // serve, bound once, so that handing it to a worker does not allocate each time
 
 	framer framer // accessed only by fnet's callbacks (callbacks of one connection run serially)
 	broken bool   // a protocol error has occurred, all subsequent data is discarded; accessed only by fnet's callbacks
@@ -226,14 +260,13 @@ type conn struct {
 	queue   []request
 	busy    bool // handed to a worker, which is responsible for processing the queue until it is empty
 	closed  bool
-	partial bool // the connection buffer holds an incomplete request header; written only by fnet's callbacks
+	partial bool // the connection buffer holds an incomplete request; written only by fnet's callbacks
 }
 
 // setDeadline sets the deadline according to the connection's state and requires the caller to hold mu: while a
-// request is being processed there is no limit; when there is an incomplete request header, ReadHeaderTimeout
-// applies starting now; otherwise the connection is idle and IdleTimeout applies. It is called only when the state
-// changes, so arriving data does not extend the deadline. After a protocol switch the deadline is managed by the
-// new protocol.
+// request is being processed there is no limit; when there is an incomplete request, ReadHeaderTimeout applies
+// starting now; otherwise the connection is idle and IdleTimeout applies. It is called only when the state changes, so
+// arriving data does not extend the deadline. After a protocol switch the deadline is managed by the new protocol.
 func (c *conn) setDeadline() {
 	if c.protocol.Load() != nil {
 		return
@@ -257,19 +290,8 @@ func deadlineAfter(timeout time.Duration) time.Time {
 	return time.Now().Add(timeout)
 }
 
-// setPartial records, inside fnet's callbacks, whether the connection buffer holds an incomplete request header,
-// and updates the deadline when that changes.
-func (c *conn) setPartial(partial bool) {
-	if partial == c.partial { // only fnet's callbacks write partial, so it can be read here without a lock
-		return
-	}
-	c.mu.Lock()
-	c.partial = partial
-	c.setDeadline()
-	c.mu.Unlock()
-}
-
-// onData splits out complete request messages and enqueues them, returning the number of consumed bytes.
+// onData splits out the complete request messages and enqueues them all at once, returning the number of consumed
+// bytes.
 func (c *conn) onData(data []byte) int {
 	if p := c.protocol.Load(); p != nil {
 		// The protocol takes over the context from here on, which a callback may set. Nothing of the HTTP state is
@@ -281,71 +303,66 @@ func (c *conn) onData(data []byte) int {
 		return len(data)
 	}
 	consumed := 0
+	c.mu.Lock()
+	queued := len(c.queue)
 	for consumed < len(data) {
-		n, expectContinue, err := c.framer.next(data[consumed:], &c.srv.opts)
+		m, expectContinue, err := c.framer.next(data[consumed:], &c.srv.opts)
 		if err == errStreamBody {
-			// The rest of the connection goes to net/http once the earlier requests are answered. Reading stops, so
-			// the request stays unconsumed for it.
+			// The rest of the connection goes to net/http once the earlier requests are answered. Reading stops, so the
+			// request stays unconsumed for it.
 			c.connection.PauseRead()
-			if !c.push(nil, statusHandoff) {
-				c.broken = true
-				return len(data)
-			}
-			return consumed
+			c.push(nil, message{}, statusHandoff)
+			break
 		}
 		if err != nil {
 			// framer only ever returns errHeaderTooLarge here. The error response also goes out through the queue,
 			// which guarantees it comes after the responses of earlier requests.
 			c.broken = true
-			c.push(nil, http.StatusRequestHeaderFieldsTooLarge)
-			return len(data)
+			c.push(nil, message{}, http.StatusRequestHeaderFieldsTooLarge)
+			consumed = len(data)
+			break
 		}
-		if n == 0 {
+		if m.size == 0 {
 			// The header is complete and the client waits for 100 Continue before sending the body. It goes through
 			// the queue as well, so it is not written in the middle of earlier responses.
 			if expectContinue {
-				if !c.push(nil, http.StatusContinue) {
-					c.broken = true
-					return len(data)
-				}
+				c.push(nil, message{}, http.StatusContinue)
 			}
 			break
 		}
-		if !c.push(data[consumed:consumed+n], 0) {
-			c.broken = true
-			return len(data)
-		}
-		consumed += n
+		c.push(data[consumed:consumed+m.size], m, 0)
+		consumed += m.size
 	}
-	c.setPartial(consumed < len(data))
+	// Too much is queued, or the protocol was switched while splitting: this data was sent by a client that did not wait
+	// for the upgrade response, so it must not be executed as HTTP.
+	overflow := len(c.queue) > maxPipeline || c.protocol.Load() != nil
+	submit := !overflow && len(c.queue) > queued && !c.busy
+	if overflow {
+		c.broken = true
+		consumed = len(data)
+	} else if submit {
+		c.busy = true
+	}
+	partial := consumed < len(data)
+	if submit || partial != c.partial {
+		c.partial = partial
+		c.setDeadline()
+	}
+	c.mu.Unlock()
+	if overflow {
+		c.connection.Close()
+	} else if submit {
+		c.srv.opts.HandlerExecutor(taskpool.RandomKey(), c.serveTask)
+	}
 	return consumed
 }
 
-// push puts a copy of the request message data (or, when data is nil, the error status code status) into the queue
-// and hands it to a worker when needed; it closes the connection and returns false when too much is queued or the
-// protocol has already been switched.
-func (c *conn) push(data []byte, status int) bool {
-	c.mu.Lock()
-	// The protocol was switched while splitting: this data was sent by a client that did not wait for the upgrade
-	// response, so it must not be executed as HTTP.
-	if len(c.queue) >= maxPipeline || c.protocol.Load() != nil {
-		c.mu.Unlock()
-		c.connection.Close()
-		return false
-	}
-	r := request{status: status}
-	r.msg.Append(data) // borrow the buffer only after the checks pass; serve returns it on dequeue, onClose when the queue is dropped
+// push puts a copy of the request message data framed as m (or, when data is nil, the status code status) into the
+// queue; the caller holds mu.
+func (c *conn) push(data []byte, m message, status int16) {
+	r := request{header: int32(m.header), status: status, chunked: m.chunked}
+	r.msg.Append(data) // serve returns the buffer on dequeue, onClose when the queue is dropped
 	c.queue = append(c.queue, r)
-	submit := !c.busy
-	c.busy = true
-	if submit {
-		c.setDeadline() // processing of a request begins: no limit
-	}
-	c.mu.Unlock()
-	if submit {
-		taskpool.DefaultTaskPool.Submit(c.serve)
-	}
-	return true
 }
 
 func (c *conn) onClose(err error) {
@@ -363,10 +380,21 @@ func (c *conn) onClose(err error) {
 }
 
 // serve processes the queued requests in order on a worker, until the queue is empty or the connection needs to be
-// closed.
+// closed. The responses are collected and written out together whenever the queue is found empty, so pipelined
+// requests are answered in one write.
 func (c *conn) serve() {
+	w := responsePool.Get().(*response)
+	w.conn = c
+	defer w.release()
 	for {
 		c.mu.Lock()
+		if !c.closed && len(c.queue) == 0 && w.out.Len() > 0 {
+			// Write out while still busy, so no other worker writes in between; then look again, as requests may have
+			// been queued meanwhile.
+			c.mu.Unlock()
+			w.flush()
+			continue
+		}
 		if c.closed || len(c.queue) == 0 {
 			c.busy = false
 			c.setDeadline()
@@ -382,9 +410,10 @@ func (c *conn) serve() {
 		}
 		c.mu.Unlock()
 
-		keepAlive := c.handle(r)
+		keepAlive := c.handle(w, r)
 		r.msg.Release() // the dequeued message is owned by serve, handle only borrows it
 		if !keepAlive {
+			w.flush()
 			c.connection.Close() // busy stays true: the connection is about to close, so no new processing is scheduled
 			return
 		}
@@ -403,276 +432,76 @@ var readerPool = sync.Pool{New: func() any {
 	return rd
 }}
 
+// unread returns the number of bytes of the message not read yet.
+func (rd *reader) unread() int { return rd.bufferedReader.Buffered() + rd.bytesReader.Len() }
+
+func (rd *reader) release() {
+	rd.bytesReader.Reset(nil)
+	readerPool.Put(rd)
+}
+
 // continueResponse is the interim response that asks the client to send the request body.
 var continueResponse = []byte("HTTP/1.1 100 Continue\r\n\r\n")
 
-// fastUpgradeRequest pools the http.Request, url.URL and Header structures for WebSocket upgrade requests,
-// avoiding the allocations of http.ReadRequest and its large MIMEHeader map.
-type fastUpgradeRequest struct {
-	request http.Request
-	url     url.URL
-	header  http.Header
-	slots   [12][1]string
-}
-
-var fastUpgradePool = sync.Pool{
-	New: func() any {
-		f := &fastUpgradeRequest{header: make(http.Header, 8)}
-		f.request.URL = &f.url
-		f.request.Header = f.header
-		return f
-	},
-}
-
-func releaseFastUpgradeRequest(f *fastUpgradeRequest) {
-	for key := range f.header {
-		delete(f.header, key)
-	}
-	f.url = url.URL{}
-	f.request = http.Request{Header: f.header, URL: &f.url}
-	fastUpgradePool.Put(f)
-}
-
-func parseFastUpgradeRequest(msg []byte) *fastUpgradeRequest {
-	end := bytes.Index(msg, headerTerminator)
-	if end < 0 || end+len(headerTerminator) != len(msg) {
-		return nil
-	}
-	firstLineEnd := bytes.Index(msg, []byte("\r\n"))
-	if firstLineEnd <= 0 || firstLineEnd+2 >= end {
-		return nil
-	}
-	firstLine := msg[:firstLineEnd]
-	if !bytes.HasPrefix(firstLine, []byte("GET ")) || !bytes.HasSuffix(firstLine, []byte(" HTTP/1.1")) {
-		return nil
-	}
-	uriBytes := firstLine[4 : len(firstLine)-9]
-	if len(uriBytes) == 0 || uriBytes[0] != '/' || bytes.ContainsAny(uriBytes, " #%") {
-		return nil
-	}
-	pathBytes := uriBytes
-	var rawQuery string
-	if i := bytes.IndexByte(uriBytes, '?'); i >= 0 {
-		pathBytes = uriBytes[:i]
-		rawQuery = string(uriBytes[i+1:])
-	}
-	path := string(pathBytes)
-
-	f := fastUpgradePool.Get().(*fastUpgradeRequest)
-	req := &f.request
-	req.Method = http.MethodGet
-	req.Proto = "HTTP/1.1"
-	req.ProtoMajor = 1
-	req.ProtoMinor = 1
-	if rawQuery == "" {
-		req.RequestURI = path
-	} else {
-		req.RequestURI = string(uriBytes)
-	}
-	f.url.Path = path
-	f.url.RawQuery = rawQuery
-	req.Body = http.NoBody
-	req.ContentLength = 0
-	req.Close = false
-
-	headers := msg[firstLineEnd+2 : end]
-	slotIndex := 0
-	hasUpgrade := false
-	hasConnection := false
-	hasVersion := false
-	var host string
-
-	for len(headers) > 0 {
-		lineEnd := bytes.Index(headers, []byte("\r\n"))
-		var field []byte
-		if lineEnd < 0 {
-			field, headers = headers, nil
-		} else {
-			field, headers = headers[:lineEnd], headers[lineEnd+2:]
-		}
-		if len(field) == 0 {
-			break
-		}
-		colon := bytes.IndexByte(field, ':')
-		if colon <= 0 || slotIndex >= len(f.slots) {
-			releaseFastUpgradeRequest(f)
-			return nil
-		}
-		name := field[:colon]
-		value := bytes.TrimSpace(field[colon+1:])
-
-		var canonicalKey, val string
-		switch {
-		case bytes.EqualFold(name, []byte("Host")):
-			if host != "" || len(value) == 0 || !validHostBytes(value) {
-				releaseFastUpgradeRequest(f)
-				return nil
-			}
-			host = string(value)
-			req.Host = host
-			continue
-		case bytes.EqualFold(name, []byte("Upgrade")):
-			canonicalKey = "Upgrade"
-			hasUpgrade = bytes.EqualFold(value, []byte("websocket"))
-			if hasUpgrade {
-				val = "websocket"
-			} else {
-				val = string(value)
-			}
-		case bytes.EqualFold(name, []byte("Connection")):
-			canonicalKey = "Connection"
-			hasConnection = bytesHasToken(value, []byte("upgrade"))
-			if bytes.EqualFold(value, []byte("Upgrade")) {
-				val = "Upgrade"
-			} else {
-				val = string(value)
-			}
-		case bytes.EqualFold(name, []byte("Sec-WebSocket-Version")):
-			canonicalKey = "Sec-Websocket-Version"
-			hasVersion = bytes.Equal(value, []byte("13"))
-			if hasVersion {
-				val = "13"
-			} else {
-				val = string(value)
-			}
-		case bytes.EqualFold(name, []byte("Sec-WebSocket-Key")):
-			if len(value) != 24 {
-				releaseFastUpgradeRequest(f)
-				return nil
-			}
-			canonicalKey = "Sec-Websocket-Key"
-			val = string(value)
-		case bytes.EqualFold(name, []byte("Sec-WebSocket-Protocol")):
-			canonicalKey = "Sec-Websocket-Protocol"
-			val = string(value)
-		case bytes.EqualFold(name, []byte("Sec-WebSocket-Extensions")):
-			canonicalKey = "Sec-Websocket-Extensions"
-			val = string(value)
-		case bytes.EqualFold(name, []byte("Origin")):
-			canonicalKey = "Origin"
-			val = string(value)
-		case bytes.EqualFold(name, []byte("User-Agent")):
-			canonicalKey = "User-Agent"
-			val = string(value)
-		case bytes.EqualFold(name, []byte("Cookie")):
-			canonicalKey = "Cookie"
-			val = string(value)
-		default:
-			releaseFastUpgradeRequest(f)
-			return nil
-		}
-
-		if _, exists := f.header[canonicalKey]; exists {
-			releaseFastUpgradeRequest(f)
-			return nil
-		}
-		f.slots[slotIndex][0] = val
-		f.header[canonicalKey] = f.slots[slotIndex][:1]
-		slotIndex++
-	}
-
-	if host == "" || !hasUpgrade || !hasConnection || !hasVersion || f.header.Get("Sec-Websocket-Key") == "" {
-		releaseFastUpgradeRequest(f)
-		return nil
-	}
-
-	return f
-}
-
-func bytesHasToken(value []byte, token []byte) bool {
-	for len(value) > 0 {
-		var part []byte
-		if i := bytes.IndexByte(value, ','); i >= 0 {
-			part, value = value[:i], value[i+1:]
-		} else {
-			part, value = value, nil
-		}
-		if bytes.EqualFold(bytes.TrimSpace(part), token) {
-			return true
-		}
-	}
-	return false
-}
-
-func validHostBytes(host []byte) bool {
-	for _, c := range host {
-		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
-		case strings.IndexByte("!$%&'()*+,-.:;=[]_~", c) >= 0:
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// handle parses and processes one request, and reports whether to keep the connection alive.
-func (c *conn) handle(r request) bool {
+// handle parses and processes one request, its response going into w's output, and reports whether to keep the
+// connection alive.
+func (c *conn) handle(w *response, r request) bool {
 	switch r.status {
 	case 0:
 	case http.StatusContinue:
-		c.connection.Write(continueResponse)
+		w.out.Append(continueResponse)
 		return true
 	case statusHandoff:
+		w.flush()
 		c.handoff()
 		return false // closing the detached connection does nothing
 	default:
-		c.writeError(r.status)
+		w.writeError(int(r.status))
 		return false
 	}
 
-	var (
-		req     *http.Request
-		cleanup func()
-	)
 	msg := r.msg.Bytes()
-	if fast := parseFastUpgradeRequest(msg); fast != nil {
-		req = &fast.request
-		cleanup = func() { releaseFastUpgradeRequest(fast) }
+	m := message{size: len(msg), header: int(r.header), chunked: r.chunked}
+	var req *http.Request
+	if c.last == nil {
+		c.last = new(lastRequest)
+	}
+	parsed := parseRequest(msg, m, c.last)
+	if parsed != nil {
+		req = &parsed.request
 	} else {
 		rd := readerPool.Get().(*reader)
+		defer rd.release()
 		rd.bytesReader.Reset(msg)
 		rd.bufferedReader.Reset(&rd.bytesReader)
-		defer func() {
-			rd.bytesReader.Reset(nil)
-			readerPool.Put(rd)
-		}()
-
 		var err error
-		req, err = http.ReadRequest(rd.bufferedReader)
-		if err != nil {
-			c.writeError(http.StatusBadRequest)
+		if req, err = http.ReadRequest(rd.bufferedReader); err != nil {
+			w.writeError(http.StatusBadRequest)
 			return false
 		}
 		// Same as the net/http server: only HTTP/1.x is supported, and it is rejected before Host is checked.
 		if req.ProtoMajor != 1 {
-			c.writeError(http.StatusHTTPVersionNotSupported)
+			w.writeError(http.StatusHTTPVersionNotSupported)
 			return false
 		}
-		// The message ends where framer said, so what the standard library takes for the body must be exactly the rest
-		// of it. Otherwise the two disagree on the framing: a field framer did not recognize (see bodyLength), or an empty
-		// line made of a bare LF, which the standard library accepts as a line break, ending the headers early. The
-		// remainder must not be silently discarded or executed (an upstream proxy may frame it differently, misaligning
-		// the responses), so it is handled as a bad request.
-		if int64(rd.bufferedReader.Buffered()+rd.bytesReader.Len()) != req.ContentLength {
-			c.writeError(http.StatusBadRequest)
-			return false
-		}
-		// Same as the net/http server: an HTTP/1.1 request must carry Host (multiple Hosts are already rejected by
-		// ReadRequest).
-		if req.Host == "" && req.ProtoAtLeast(1, 1) && req.Method != http.MethodConnect {
-			c.writeError(http.StatusBadRequest)
-			return false
-		}
-		// Same as the net/http server: reject an invalid Host. The standard library's ReadRequest does not validate it,
-		// while Handlers often use r.Host to build URLs or redirect addresses.
-		if !validHost(req.Host) {
-			c.writeError(http.StatusBadRequest)
+		// The message ends where framer said, so the standard library must have read the same header and must frame the
+		// body the same way: a chunked body (whose form framer checked) as chunked, any other as exactly the rest of the
+		// message. Otherwise the two disagree on the framing: a field framer did not recognize (see bodyLength), or an
+		// empty line made of a bare LF, which the standard library accepts as a line break, ending the headers early.
+		// The remainder must not be silently discarded or executed (an upstream proxy may frame it differently,
+		// misaligning the responses), so it is handled as a bad request.
+		body := m.size - m.header
+		if rd.unread() != body || m.chunked != (req.TransferEncoding != nil) || !m.chunked && int64(body) != req.ContentLength {
+			w.writeError(http.StatusBadRequest)
 			return false
 		}
 	}
-	if cleanup != nil {
-		defer cleanup()
+	// Same as the net/http server: an HTTP/1.1 request must carry Host (multiple Hosts are already rejected), and an
+	// invalid Host is rejected: neither parser validates it, while Handlers often use r.Host to build URLs or redirect
+	// addresses.
+	if req.Host == "" && req.ProtoAtLeast(1, 1) && req.Method != http.MethodConnect || !validHost(req.Host) {
+		w.writeError(http.StatusBadRequest)
+		return false
 	}
 	if c.remoteAddr == "" {
 		c.remoteAddr = c.connection.RemoteAddr().String()
@@ -683,23 +512,27 @@ func (c *conn) handle(r request) bool {
 		req.TLS = &state
 	}
 
-	w := newResponse(c, req)
-	defer w.release()
-	body := req.Body
+	w.start(req)
+	reqBody := req.Body
 	ok := c.serveHTTP(w, req)
-	// Same as the net/http server: close the body, so a Handler that kept it cannot read the pooled reader once it
-	// serves another request, and remove the files ParseMultipartForm stored on disk.
-	body.Close()
+	// Same as the net/http server: close the body, so a Handler that kept it cannot read the message buffer or the
+	// pooled reader once they are reused, and remove the files ParseMultipartForm stored on disk.
+	reqBody.Close()
 	if req.MultipartForm != nil {
 		req.MultipartForm.RemoveAll()
 	}
-	if !ok {
-		return false
+	keepAlive := false
+	switch {
+	case !ok:
+	case w.upgraded: // Upgrade already wrote the response: on success the connection goes to the new protocol, on failure it closes
+		keepAlive = c.protocol.Load() != nil
+	default:
+		keepAlive = w.finish()
 	}
-	if w.upgraded { // Upgrade already wrote the response: on success the connection goes to the new protocol, on failure it closes
-		return c.protocol.Load() != nil
+	if parsed != nil {
+		parsed.release() // the Handler has returned, see the package documentation
 	}
-	return w.finish()
+	return keepAlive
 }
 
 // serveHTTP runs the Handler; when the Handler panics it logs the panic (except for http.ErrAbortHandler) and
@@ -731,10 +564,4 @@ func validHost(host string) bool {
 		}
 	}
 	return true
-}
-
-func (c *conn) writeError(code int) {
-	text := strconv.Itoa(code) + " " + http.StatusText(code)
-	c.connection.Write([]byte("HTTP/1.1 " + text + "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n" +
-		"Content-Length: " + strconv.Itoa(len(text)) + "\r\n\r\n" + text))
 }

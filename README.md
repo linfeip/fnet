@@ -63,7 +63,7 @@ to the send buffer, which the connection task flushes when the socket is writabl
 - **Parallel accept**: with `Options.ReusePort`, on Linux every sub-reactor listens on the address with a socket of its own (`SO_REUSEPORT`) and keeps the connections it accepts, so accepts run in parallel and a connection stays with the worker that accepted it; otherwise, and always on macOS, one listener per address feeds the sub-reactors in round-robin order. On Linux keepalive and `TCP_NODELAY` (with `Options.NoDelay`) are set once on the listener, which the accepted sockets inherit.
 - **One task per connection**: reading, callbacks and closing run serially in the connection's task, so the callbacks of one connection never overlap and stay in order. There is no goroutine per connection and no inbound queue.
 - **Zero-copy reads, kernel backpressure**: data is handed to `OnData` straight from a borrowed buffer. A connection is not read again until its callback returns, so a slow handler is throttled by TCP flow control instead of piling up memory.
-- **HTTP**: the callback only looks for the end of each request (the header terminator `\r\n\r\n`, then a `Content-Length` body of up to `MaxBufferedBodyBytes`, 1MB by default); parsing and the body are left to `http.ReadRequest` (a plain WebSocket upgrade request takes a fast path that fills in the `http.Request` itself), and the Handler runs on a goroutine of `taskpool.DefaultTaskPool`, held only while the connection has pending requests. A larger or chunked body (say a big file upload) is streamed by `net/http` instead: the connection is detached from `fnet` (`Conn.Detach`) and handed to an internal `http.Server` running the same Handler, which closes it after that request.
+- **HTTP**: the callback only looks for the end of each request (the header terminator `\r\n\r\n`, then a body of up to `MaxBufferedBodyBytes`, 1MB by default, with `Content-Length` or chunked). A request in the plain forms of HTTP/1.x is parsed by `fhttp` itself, field for field the way `http.ReadRequest` would, any other by `http.ReadRequest`, and the Handler runs on a goroutine of the executor (`Options.Engine.Executor`, `taskpool.DefaultTaskPool` by default), held only while the connection has pending requests. The requests are reused once their Handler returns, which saves each one its allocations (see [Limitations](#limitations)). The responses to requests queued together (pipelining) go out in one write. A larger body (say a big file upload), or one framed in an unusual way, is streamed by `net/http` instead: the connection is detached from `fnet` (`Conn.Detach`) and handed to an internal `http.Server` running the same Handler, which closes it after that request.
 - **WebSocket**: frames are split and unmasked inside the connection's task and passed to `OnMessage` without a message queue; replies written while handling a batch of frames are coalesced into one write.
 - **TLS**: `ftls` implements no TLS of its own. The standard `crypto/tls` does the handshake and the encryption, over a `net.Conn` fed by the connection's callbacks. Its blocking handshake runs as a coroutine (`iter.Pull`) that `OnData` resumes with each piece of data, so no goroutine waits for the client; from then on `OnData` decrypts the records at hand and passes the plaintext on. An idle TLS connection holds no goroutine, and a streamed request body goes to `net/http` together with the TLS session.
 
@@ -99,7 +99,7 @@ log.Fatal(srv.Serve())
 
 ### HTTP
 
-Handlers are plain `net/http` ones. A shorter version of [examples/http](examples/http/main.go), which also covers PUT/PATCH/DELETE/OPTIONS, multipart uploads and file downloads:
+Handlers are plain `net/http` ones, but **the request handed to a Handler is a pooled object: it is valid only within that `ServeHTTP` call**. Do not keep it — or anything derived from it (`r.Header`, `r.URL`, `r.Body`) — after it returns, including in a goroutine the Handler starts: later requests on the same worker reuse the object and the buffers behind it, so using it then reads another request's data (a data race). Copy what must outlive the Handler; see [Limitations](#limitations). A shorter version of [examples/http](examples/http/main.go), which also covers PUT/PATCH/DELETE/OPTIONS, multipart uploads and file downloads:
 
 ```go
 package main
@@ -135,7 +135,7 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]any{"received": v})
 	})
 	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(w, r.Body) // a chunked or large body is streamed by net/http
+		io.Copy(w, r.Body) // a body over MaxBufferedBodyBytes is streamed by net/http
 	})
 
 	srv, err := fhttp.NewServer(":8080", mux, fhttp.Options{})
@@ -226,6 +226,7 @@ go test ./http -run XXX -bench GET   # GET benchmark: fhttp vs net/http vs fiber
 
 - The send buffer has no upper bound and there is no write timeout: a client that never reads makes it grow.
 - No HTTP/2: HTTPS is HTTP/1.1 only. Responses are fully buffered (no `http.Flusher` / `http.Hijacker`), except on connections handed to `net/http` for a streamed request body.
+- Requests are pooled: the `*http.Request` (header, URL and body included) is valid only within the Handler's `ServeHTTP`. Keeping it past that — in a field, a cache, or a goroutine still running when `ServeHTTP` returns — reads a later request's data (a data race), so `http.TimeoutHandler` cannot be used. Copy what must be kept; the request's strings, header values included, are copies and stay valid.
 - TLS is server side only. `ftls` relies on how `crypto/tls` treats a temporary read error (the connection stays usable, and so does a record cut short), which `go test ./ftls` checks: run it after upgrading Go. A custom `fnet.Options.Executor` must not lock its goroutines to OS threads.
 - WebSocket: no permessage-deflate; messages are always sent as a single frame.
 - Half-close is not supported: after EOF the connection is closed once the buffered data has been sent.

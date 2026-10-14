@@ -3,6 +3,7 @@ package fhttp
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,8 +14,21 @@ import (
 	"github.com/linfeip/fnet/internal/units"
 )
 
-// response implements http.ResponseWriter. The response body is buffered in full first, then written out all at
-// once with Content-Length after the Handler returns (Flusher/Hijacker are not supported).
+// maxCopiedBody is the largest response body copied next to its header into the connection's output; a larger one is
+// written right away with a single writev of the output and the body, so it is not copied.
+const maxCopiedBody = 4 * units.KB
+
+// initialOutput is the capacity the output starts with: a run of pipelined responses to small requests fits, so it
+// seldom has to grow.
+const initialOutput = 2 * units.KB
+
+// maxBufferedOutput is how much output is collected before it is written out without waiting for the queue to be
+// found empty (see conn.serve).
+const maxBufferedOutput = 64 * units.KB
+
+// response implements http.ResponseWriter. The response body is buffered in full first, then serialized with
+// Content-Length after the Handler returns (Flusher/Hijacker are not supported). A worker uses one response for the
+// requests it takes from a connection's queue in turn, and its output collects their responses (see conn.serve).
 type response struct {
 	conn        *conn
 	req         *http.Request
@@ -23,22 +37,39 @@ type response struct {
 	wroteHeader bool
 	upgraded    bool // Upgrade has been called, so finish no longer writes the response
 	body        bytepool.Buffer
-	buf         bufWriter // serializes the status line and headers
+	out         bytepool.Buffer // the responses serialized and not written out yet, see flush
 }
 
 var responsePool = sync.Pool{New: func() any { return &response{header: make(http.Header)} }}
 
-func newResponse(c *conn, req *http.Request) *response {
-	w := responsePool.Get().(*response)
-	w.conn, w.req = c, req
-	return w
+// start readies w for the response to req.
+func (w *response) start(req *http.Request) {
+	clear(w.header)
+	w.req, w.status, w.wroteHeader, w.upgraded = req, 0, false, false
+	w.body.Reset()
 }
 
 func (w *response) release() {
 	w.body.Release()
+	w.out.Release()
 	clear(w.header)
 	*w = response{header: w.header}
 	responsePool.Put(w)
+}
+
+// flush writes out the responses collected so far in one write.
+func (w *response) flush() {
+	if w.out.Len() > 0 {
+		w.conn.connection.Write(w.out.Bytes())
+	}
+	w.out.Release()
+}
+
+// writeError puts a response with code, which closes the connection, into the output.
+func (w *response) writeError(code int) {
+	text := strconv.Itoa(code) + " " + http.StatusText(code)
+	w.out.AppendString("HTTP/1.1 " + text + "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n" +
+		"Content-Length: " + strconv.Itoa(len(text)) + "\r\n\r\n" + text)
 }
 
 func (w *response) Header() http.Header { return w.header }
@@ -81,110 +112,172 @@ func (w *response) beforeWrite() error {
 	return nil
 }
 
-// Fields that, in each case, are not emitted from the Handler's headers but are decided by finish or must be
-// dropped.
-var (
-	excludeTE     = map[string]bool{"Transfer-Encoding": true}
-	excludeCLTE   = map[string]bool{"Content-Length": true, "Transfer-Encoding": true}
-	excludeCTCLTE = map[string]bool{"Content-Type": true, "Content-Length": true, "Transfer-Encoding": true}
-)
-
-// finish serializes and writes out the response after the Handler returns, and reports whether to keep the
+// finish serializes the response into the output after the Handler returns, and reports whether to keep the
 // connection alive.
 func (w *response) finish() (keepAlive bool) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	req, h := w.req, w.header
+	req := w.req
 	http11 := req.ProtoAtLeast(1, 1)
 	isHEAD := req.Method == http.MethodHead
 	bodyAllowed := bodyAllowedForStatus(w.status)
-	keepAlive = !req.Close && !hasToken(h["Connection"], "close")
-
-	b := &w.buf
-	b.buffer = bytepool.Get(units.KB / 2)
-	if http11 {
-		b.WriteString("HTTP/1.1 ")
-	} else {
-		b.WriteString("HTTP/1.0 ")
-	}
-	b.writeInt(w.status)
-	b.WriteString(" ")
-	if text := http.StatusText(w.status); text != "" {
-		b.WriteString(text)
-	} else {
-		b.WriteString("status code " + strconv.Itoa(w.status))
-	}
-	b.WriteString("\r\n")
-
-	var exclude map[string]bool
-	switch {
-	case w.status == http.StatusNotModified:
-		exclude = excludeCTCLTE
-	case !bodyAllowed:
-		exclude = excludeCLTE
-	case isHEAD: // HEAD keeps the Content-Length declared by the Handler
-		exclude = excludeTE
-		if _, ok := h["Content-Length"]; !ok && w.body.Len() > 0 {
-			b.writeContentLength(w.body.Len())
+	keepLength := isHEAD && bodyAllowed // HEAD keeps the Content-Length declared by the Handler
+	// One pass over the Handler's fields finds those finish decides on, and the names it writes out: Transfer-Encoding
+	// and Content-Length are decided here (the body is buffered in full, so its actual length is used), and a 304 has no
+	// Content-Type.
+	var stack [16]field
+	fields := stack[:0]
+	var hasLength, hasType, hasDate, hasConnection, encoded, closing bool
+	for name, values := range w.header {
+		switch name {
+		case "Transfer-Encoding":
+			continue
+		case "Content-Length":
+			if hasLength = true; !keepLength {
+				continue
+			}
+		case "Content-Type":
+			if hasType = true; w.status == http.StatusNotModified {
+				continue
+			}
+		case "Content-Encoding":
+			encoded = len(values) > 0 && values[0] != ""
+		case "Date":
+			hasDate = true
+		case "Connection":
+			hasConnection, closing = true, hasToken(values, "close")
 		}
-	default: // the response body is fully buffered, so always use its actual length
-		exclude = excludeCLTE
-		b.writeContentLength(w.body.Len())
+		if validName(name) {
+			fields = append(fields, field{name, values})
+		}
 	}
-	if _, ok := h["Content-Type"]; !ok && bodyAllowed && w.body.Len() > 0 && h.Get("Content-Encoding") == "" {
-		b.WriteString("Content-Type: ")
-		b.WriteString(http.DetectContentType(w.body.Bytes()))
-		b.WriteString("\r\n")
+	keepAlive = !req.Close && !closing
+
+	b := &w.out
+	if cap(b.Bytes()) == 0 {
+		*b = bytepool.Get(initialOutput)
 	}
-	if _, ok := h["Date"]; !ok {
-		b.WriteString("Date: ")
-		appendDate(&b.buffer)
-		b.WriteString("\r\n")
+	if http11 && w.status == http.StatusOK {
+		b.AppendString("HTTP/1.1 200 OK\r\n") // the usual status line, in one piece
+	} else {
+		appendStatusLine(b, http11, w.status)
 	}
-	if _, ok := h["Connection"]; !ok {
+	if bodyAllowed && (!isHEAD || !hasLength && w.body.Len() > 0) {
+		appendContentLength(b, w.body.Len())
+	}
+	if !hasType && bodyAllowed && w.body.Len() > 0 && !encoded {
+		b.AppendString("Content-Type: ")
+		b.AppendString(http.DetectContentType(w.body.Bytes()))
+		b.AppendString("\r\n")
+	}
+	if !hasDate {
+		appendDate(b)
+	}
+	if !hasConnection {
 		if !keepAlive {
-			b.WriteString("Connection: close\r\n")
+			b.AppendString("Connection: close\r\n")
 		} else if !http11 {
-			b.WriteString("Connection: keep-alive\r\n")
+			b.AppendString("Connection: keep-alive\r\n")
 		}
 	}
-	h.WriteSubset(b, exclude)
-	b.WriteString("\r\n")
+	appendFields(b, fields)
+	b.AppendString("\r\n")
 
 	body := w.body.Bytes()
 	if isHEAD || !bodyAllowed {
 		body = nil
 	}
-	// The headers and the response body are written with a single writev, so the body needs no copy.
-	w.conn.connection.Writev([][]byte{b.buffer.Bytes(), body})
-	b.buffer.Release()
+	if len(body) > maxCopiedBody { // written right away after the output so far, without being copied
+		w.conn.connection.Writev([][]byte{b.Bytes(), body})
+		b.Release()
+	} else {
+		b.Append(body)
+	}
+	if b.Len() >= maxBufferedOutput {
+		w.flush()
+	}
 	return keepAlive
 }
 
-// bufWriter appends to a byte slice and implements io.Writer and io.StringWriter for use by Header.WriteSubset.
-type bufWriter struct{ buffer bytepool.Buffer }
-
-func (w *bufWriter) Write(p []byte) (int, error) {
-	w.buffer.Append(p)
-	return len(p), nil
+// field is a name of a header with its values, see appendFields.
+type field struct {
+	name   string
+	values []string
 }
 
-func (w *bufWriter) WriteString(s string) (int, error) {
-	w.buffer.AppendString(s)
-	return len(s), nil
+// appendHeader appends the fields of h the way http.Header.Write writes them, see appendFields.
+func appendHeader(b *bytepool.Buffer, h http.Header) {
+	var stack [16]field
+	fields := stack[:0]
+	for name, values := range h {
+		if validName(name) {
+			fields = append(fields, field{name, values})
+		}
+	}
+	appendFields(b, fields)
 }
 
-func (w *bufWriter) writeContentLength(n int) {
-	w.WriteString("Content-Length: ")
-	w.writeInt(n)
-	w.WriteString("\r\n")
+// appendFields appends fields, whose names are tokens, the way http.Header.WriteSubset writes them: sorted by name, and
+// with the CR and LF of a value turned into spaces (after trimming the surrounding whitespace), so that a Handler cannot
+// inject fields.
+func appendFields(b *bytepool.Buffer, fields []field) {
+	if len(fields) > 1 {
+		slices.SortFunc(fields, func(a, b field) int { return strings.Compare(a.name, b.name) })
+	}
+	for _, f := range fields {
+		for _, v := range f.values {
+			b.AppendString(f.name)
+			b.AppendString(": ")
+			for v != "" && isFieldSpace(v[0]) {
+				v = v[1:]
+			}
+			for v != "" && isFieldSpace(v[len(v)-1]) {
+				v = v[:len(v)-1]
+			}
+			for i := 0; i < len(v); i++ {
+				if v[i] == '\r' || v[i] == '\n' {
+					b.AppendString(v[:i])
+					b.AppendString(" ")
+					v, i = v[i+1:], -1
+				}
+			}
+			b.AppendString(v)
+			b.AppendString("\r\n")
+		}
+	}
 }
 
-// writeInt writes the decimal representation of n.
-func (w *bufWriter) writeInt(n int) {
+// isFieldSpace reports whether c is one of the bytes http.Header.Write trims off a value.
+func isFieldSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\r' || c == '\n' }
+
+// appendStatusLine appends the status line of a response with code status to a request of HTTP/1.1, or else 1.0.
+func appendStatusLine(b *bytepool.Buffer, http11 bool, status int) {
+	if http11 {
+		b.AppendString("HTTP/1.1 ")
+	} else {
+		b.AppendString("HTTP/1.0 ")
+	}
+	appendInt(b, status)
+	b.AppendString(" ")
+	if text := http.StatusText(status); text != "" {
+		b.AppendString(text)
+	} else {
+		b.AppendString("status code " + strconv.Itoa(status))
+	}
+	b.AppendString("\r\n")
+}
+
+func appendContentLength(b *bytepool.Buffer, n int) {
+	b.AppendString("Content-Length: ")
+	appendInt(b, n)
+	b.AppendString("\r\n")
+}
+
+// appendInt appends the decimal representation of n.
+func appendInt(b *bytepool.Buffer, n int) {
 	var digits [20]byte
-	w.Write(strconv.AppendInt(digits[:0], int64(n), 10))
+	b.Append(strconv.AppendInt(digits[:0], int64(n), 10))
 }
 
 func bodyAllowedForStatus(status int) bool {
@@ -205,20 +298,32 @@ func hasToken(values []string, token string) bool {
 	return false
 }
 
-// The Date header is formatted only once per second.
-type dateValue struct {
-	unixSeconds int64
-	text        []byte
+// The Date field line, "Date: ...\r\n", is formatted at the start of every second by a goroutine started with the first
+// response (see keepDate), so that a response only appends it.
+var (
+	dateField atomic.Pointer[[]byte]
+	dateOnce  sync.Once
+)
+
+// appendDate appends the Date field line of the current second.
+func appendDate(b *bytepool.Buffer) {
+	dateOnce.Do(keepDate)
+	b.Append(*dateField.Load())
 }
 
-var dateCache atomic.Pointer[dateValue]
-
-func appendDate(b *bytepool.Buffer) {
-	now := time.Now()
-	d := dateCache.Load()
-	if d == nil || d.unixSeconds != now.Unix() {
-		d = &dateValue{unixSeconds: now.Unix(), text: now.UTC().AppendFormat(nil, http.TimeFormat)}
-		dateCache.Store(d)
+// keepDate formats the Date field line now, then has it formatted again at the start of every second.
+func keepDate() {
+	refresh := func() time.Time {
+		now := time.Now()
+		field := append(now.UTC().AppendFormat([]byte("Date: "), http.TimeFormat), "\r\n"...)
+		dateField.Store(&field)
+		return now
 	}
-	b.Append(d.text)
+	now := refresh()
+	go func() {
+		for {
+			time.Sleep(time.Second - time.Duration(now.Nanosecond()))
+			now = refresh()
+		}
+	}()
 }

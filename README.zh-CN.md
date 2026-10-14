@@ -62,7 +62,7 @@ Conn.Write 没有积压时直接写 socket，其余进发送缓冲，可写时�
 - **并行 accept**：开启 `Options.ReusePort` 时，Linux 上每个子 Reactor 用自己的 socket 监听同一地址（`SO_REUSEPORT`），自己 accept 到的连接由自己处理，accept 并行进行，连接留在接受它的 worker 上；否则（macOS 上总是如此）每个地址一个 listener，按轮询分给各子 Reactor。Linux 上 keepalive 和 `TCP_NODELAY`（开启 `Options.NoDelay` 时）只在 listener 上设置一次，accept 出来的 socket 直接继承。
 - **一连接一任务**：读取、回调、关闭都在连接的任务里串行完成，同一连接的回调不会重叠且保序。没有每连接一个 goroutine，也没有入站队列。
 - **零拷贝读取，内核背压**：数据直接从借用的缓冲交给 `OnData`。回调返回之前不会再读取该连接，处理慢时由 TCP 流量控制限速，而不是在内存里堆积。
-- **HTTP**：回调里只找每个请求的结束位置（头部结束符 `\r\n\r\n`，以及不超过 `MaxBufferedBodyBytes`（默认 1MB）的 `Content-Length` 请求体），解析和请求体交给 `http.ReadRequest`（普通的 WebSocket 升级请求走快速路径，由 fhttp 自己填好 `http.Request`）；Handler 运行在 `taskpool.DefaultTaskPool` 的 goroutine 上，只在连接有待处理请求时占用。更大的或 chunked 的请求体（例如大文件上传）改由 `net/http` 流式处理：连接从 `fnet` 摘下（`Conn.Detach`），交给运行同一个 Handler 的内部 `http.Server`，处理完这个请求后关闭连接。
+- **HTTP**：回调里只找每个请求的结束位置（头部结束符 `\r\n\r\n`，以及不超过 `MaxBufferedBodyBytes`（默认 1MB）、带 `Content-Length` 或 chunked 的请求体）。HTTP/1.x 常规形式的请求由 `fhttp` 自己解析，逐字段与 `http.ReadRequest` 的结果一致，其余交给 `http.ReadRequest`；Handler 运行在 executor（`Options.HandlerExecutor`，默认是 `taskpool.DefaultTaskPool`）的 goroutine 上，只在连接有待处理请求时占用。请求在 Handler 返回后被复用，每个请求省掉分配（见[当前限制](#当前限制)）。一起排队的多个请求（pipelining）的响应合并成一次写出。更大的或分帧方式特殊的请求体（例如大文件上传）改由 `net/http` 流式处理：连接从 `fnet` 摘下（`Conn.Detach`），交给运行同一个 Handler 的内部 `http.Server`，处理完这个请求后关闭连接。
 - **WebSocket**：帧在连接的任务里切分、解掩码，直接回调 `OnMessage`，没有消息队列；处理同一批帧期间写出的回复会合并成一次写。
 - **TLS**：`ftls` 自己不实现 TLS 协议，握手和加解密都由标准库 `crypto/tls` 完成，它底下的 `net.Conn` 由连接的回调供给数据。阻塞式的握手放在协程（`iter.Pull`）里运行，`OnData` 每收到一段数据就恢复它一次，所以没有 goroutine 在等客户端；握手完成后，`OnData` 直接解密手头的 record，把明文交给业务。空闲的 TLS 连接不占 goroutine；流式请求体交给 `net/http` 时，TLS 会话一并移交。
 
@@ -98,7 +98,7 @@ log.Fatal(srv.Serve())
 
 ### HTTP
 
-Handler 就是普通的 `net/http` Handler。下面是 [examples/http](examples/http/main.go) 的精简版，完整示例还包含 PUT/PATCH/DELETE/OPTIONS、multipart 上传和文件下载：
+Handler 就是普通的 `net/http` Handler，但**交给 Handler 的请求是池化对象：只在本次 `ServeHTTP` 调用期间有效**。返回后不能继续持有它，也不要持有由它派生的东西（`r.Header`、`r.URL`、`r.Body`）——放进字段、缓存，或交给 Handler 里启动的 goroutine 都不行：同一 worker 上的后续请求会复用这个对象和它背后的缓冲，之后再用读到的是别的请求的数据（数据竞争）。需要跨 Handler 存活的请自行拷贝，详见[当前限制](#当前限制)。下面是 [examples/http](examples/http/main.go) 的精简版，完整示例还包含 PUT/PATCH/DELETE/OPTIONS、multipart 上传和文件下载：
 
 ```go
 package main
@@ -134,7 +134,7 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]any{"received": v})
 	})
 	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(w, r.Body) // a chunked or large body is streamed by net/http
+		io.Copy(w, r.Body) // a body over MaxBufferedBodyBytes is streamed by net/http
 	})
 
 	srv, err := fhttp.NewServer(":8080", mux, fhttp.Options{})
@@ -225,6 +225,7 @@ go test ./http -run XXX -bench GET   # GET 压测：fhttp、net/http、fiber对�
 
 - 发送缓冲没有上限，也没有写超时：只发请求却从不读取的客户端会让它持续增长。
 - 不支持 HTTP/2：HTTPS 只有 HTTP/1.1。响应体完整缓存在内存中（不支持 `http.Flusher` / `http.Hijacker`），为流式请求体交给 `net/http` 的连接除外。
+- 请求是池化对象：`*http.Request`（含 header、URL 和请求体）只在 Handler 的 `ServeHTTP` 调用期间有效。返回后继续持有——放进字段、缓存，或交给那时仍在运行的 goroutine——读到的是后续请求的数据（数据竞争），因此不能使用 `http.TimeoutHandler`。需要留存的内容请自行拷贝；请求里的字符串（包括 header 值）都是拷贝，可以放心保存。
 - TLS 只支持服务端。`ftls` 依赖 `crypto/tls` 对临时性读错误的处理方式：连接继续可用，读到一半的 record 也保留，这一点由 `go test ./ftls` 检查，升级 Go 后请先跑一遍。自定义的 `fnet.Options.Executor` 不能把它的 goroutine 锁定到系统线程上（`LockOSThread`）。
 - WebSocket：不支持 permessage-deflate，发送的消息总是单帧。
 - 不支持半关闭：读到 EOF 后，发完已缓冲的数据就关闭连接。

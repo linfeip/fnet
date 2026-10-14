@@ -13,14 +13,14 @@ import (
 // split out, the error it ran into, and whether a 100 Continue was asked for.
 func frameAll(in string, step int) ([]string, error, bool) {
 	var f framer
-	opts := Options{MaxHeaderBytes: units.KB, MaxBufferedBodyBytes: 16}
+	opts := Options{MaxHeaderBytes: units.KB, MaxBufferedBodyBytes: 32}
 	var msgs []string
 	var buf []byte
 	expectContinue := false
 	for i := 0; i < len(in); i += step {
 		buf = append(buf, in[i:min(i+step, len(in))]...)
 		for {
-			n, expect, err := f.next(buf, &opts)
+			m, expect, err := f.next(buf, &opts)
 			if err != nil {
 				return msgs, err, expectContinue
 			}
@@ -30,11 +30,11 @@ func frameAll(in string, step int) ([]string, error, bool) {
 				}
 				expectContinue = true
 			}
-			if n == 0 {
+			if m.size == 0 {
 				break
 			}
-			msgs = append(msgs, string(buf[:n]))
-			buf = buf[n:]
+			msgs = append(msgs, string(buf[:m.size]))
+			buf = buf[m.size:]
 		}
 	}
 	return msgs, nil, expectContinue
@@ -42,8 +42,9 @@ func frameAll(in string, step int) ([]string, error, bool) {
 
 func TestFramer(t *testing.T) {
 	const (
-		get  = "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
-		post = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello"
+		get     = "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+		post    = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello"
+		chunked = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
 	)
 	tests := []struct {
 		name string
@@ -62,8 +63,27 @@ func TestFramer(t *testing.T) {
 		{"space before the colon", "POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\n", []string{"POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\n"}, nil},
 		{"Expect: 100-continue", "POST / HTTP/1.1\r\nExpect: 100-Continue\r\nContent-Length: 1\r\n\r\nx", []string{"POST / HTTP/1.1\r\nExpect: 100-Continue\r\nContent-Length: 1\r\n\r\nx"}, nil},
 		// Earlier messages are split out before the one that goes to net/http.
-		{"body too large", get + "POST / HTTP/1.1\r\nContent-Length: 17\r\n\r\n", []string{get}, errStreamBody},
-		{"chunked", "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", nil, errStreamBody},
+		{"body too large", get + "POST / HTTP/1.1\r\nContent-Length: 33\r\n\r\n", []string{get}, errStreamBody},
+		// A chunked body counts with its framing.
+		{"chunked", chunked + "5\r\nhello\r\nB\r\n world 0123\r\n0\r\n\r\n" + get,
+			[]string{chunked + "5\r\nhello\r\nB\r\n world 0123\r\n0\r\n\r\n", get}, nil},
+		{"chunked empty body", chunked + "0\r\n\r\n", []string{chunked + "0\r\n\r\n"}, nil},
+		{"chunked field case-insensitive", "POST / HTTP/1.1\r\ntransfer-encoding:  Chunked\r\n\r\n0\r\n\r\n",
+			[]string{"POST / HTTP/1.1\r\ntransfer-encoding:  Chunked\r\n\r\n0\r\n\r\n"}, nil},
+		{"chunked not complete", chunked + "5\r\nhello\r\n0\r\n", nil, nil},
+		// Earlier messages are split out before the one that goes to net/http, which judges the body itself.
+		{"chunked too large", get + chunked + "21\r\n", []string{get}, errStreamBody},
+		{"chunked too large in total", chunked + "10\r\n0123456789abcdef\r\n10\r\n0123456789abcdef\r\n", nil, errStreamBody},
+		{"chunk extension", chunked + "5;a=b\r\nhello\r\n0\r\n\r\n", nil, errStreamBody},
+		{"chunk size with spaces", chunked + "5 \r\nhello\r\n0\r\n\r\n", nil, errStreamBody},
+		{"chunk without CRLF", chunked + "5\r\nhelloX\r\n0\r\n\r\n", nil, errStreamBody},
+		{"bare LF after chunk size", chunked + "5\nhello\r\n0\r\n\r\n", nil, errStreamBody},
+		{"trailer fields", chunked + "0\r\nX: y\r\n\r\n", nil, errStreamBody},
+		{"chunk size too long", chunked + "000000005\r\nhello\r\n0\r\n\r\n", nil, errStreamBody},
+		{"chunked and Content-Length", "POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n", nil, errStreamBody},
+		{"chunked twice", "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n", nil, errStreamBody},
+		{"other transfer coding", "POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", nil, errStreamBody},
+		{"chunked on HTTP/1.0", "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", nil, errStreamBody},
 		{"invalid Content-Length", "POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n", nil, errStreamBody},
 		{"empty Content-Length", "POST / HTTP/1.1\r\nContent-Length: \r\n\r\n", nil, errStreamBody},
 		{"duplicate Content-Length", "POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx", nil, errStreamBody},
@@ -84,7 +104,10 @@ func TestFramer(t *testing.T) {
 // TestFramerExpectContinue checks that 100 Continue is asked for only while the body has not arrived, and never for
 // HTTP/1.0 or a request without a body.
 func TestFramerExpectContinue(t *testing.T) {
-	const header = "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 1\r\n\r\n"
+	const (
+		header        = "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 1\r\n\r\n"
+		chunkedHeader = "POST / HTTP/1.1\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n"
+	)
 	tests := []struct {
 		name string
 		in   string
@@ -96,6 +119,8 @@ func TestFramerExpectContinue(t *testing.T) {
 		{"body arrives with the header", header + "x", len(header) + 1, false},
 		{"HTTP/1.0", strings.Replace(header, "HTTP/1.1", "HTTP/1.0", 1), len(header), false},
 		{"no request body", "GET / HTTP/1.1\r\nExpect: 100-continue\r\n\r\n", 100, false},
+		{"chunked body not arrived", chunkedHeader, len(chunkedHeader), true},
+		{"chunked body arrives with the header", chunkedHeader + "0\r\n\r\n", 100, false},
 	}
 	for _, tt := range tests {
 		if _, _, got := frameAll(tt.in, tt.step); got != tt.want {
@@ -136,8 +161,8 @@ func BenchmarkFramer(b *testing.B) {
 	var f framer
 	b.SetBytes(int64(len(req)))
 	for range b.N {
-		if n, _, _ := f.next(req, &opts); n != len(req) {
-			b.Fatal(n)
+		if m, _, _ := f.next(req, &opts); m.size != len(req) {
+			b.Fatal(m)
 		}
 	}
 }
