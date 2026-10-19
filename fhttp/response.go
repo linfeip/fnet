@@ -2,6 +2,7 @@ package fhttp
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"slices"
 	"strconv"
@@ -27,8 +28,9 @@ const initialOutput = 2 * units.KB
 const maxBufferedOutput = 64 * units.KB
 
 // response implements http.ResponseWriter. The response body is buffered in full first, then serialized with
-// Content-Length after the Handler returns (Flusher/Hijacker are not supported). A worker uses one response for the
-// requests it takes from a connection's queue in turn, and its output collects their responses (see conn.serve).
+// Content-Length after the Handler returns (Flusher/Hijacker are not supported). A Write after the connection closes
+// returns net.ErrClosed. A worker uses one response for the requests it takes from a connection's queue in turn, and
+// its output collects their responses (see conn.serve).
 type response struct {
 	conn        *conn
 	req         *http.Request
@@ -36,6 +38,7 @@ type response struct {
 	status      int
 	wroteHeader bool
 	upgraded    bool // Upgrade has been called, so finish no longer writes the response
+	writeErr    error
 	body        bytepool.Buffer
 	out         bytepool.Buffer // the responses serialized and not written out yet, see flush
 }
@@ -45,7 +48,7 @@ var responsePool = sync.Pool{New: func() any { return &response{header: make(htt
 // start readies w for the response to req.
 func (w *response) start(req *http.Request) {
 	clear(w.header)
-	w.req, w.status, w.wroteHeader, w.upgraded = req, 0, false, false
+	w.req, w.status, w.wroteHeader, w.upgraded, w.writeErr = req, 0, false, false, nil
 	w.body.Reset()
 }
 
@@ -58,18 +61,26 @@ func (w *response) release() {
 }
 
 // flush writes out the responses collected so far in one write.
-func (w *response) flush() {
+func (w *response) flush() error {
+	var err error
 	if w.out.Len() > 0 {
-		w.conn.connection.Write(w.out.Bytes())
+		_, err = w.conn.connection.Write(w.out.Bytes()) // net.ErrClosed once the connection is closing
 	}
 	w.out.Release()
+	if err != nil && w.writeErr == nil {
+		w.writeErr = err
+	}
+	return err
 }
 
-// writeError puts a response with code, which closes the connection, into the output.
+// writeError puts a response with code, which closes the connection, into the output. It has a Date as well, which RFC
+// 9110 6.6.1 requires in a 4xx response (the net/http server leaves it out of its own).
 func (w *response) writeError(code int) {
 	text := strconv.Itoa(code) + " " + http.StatusText(code)
 	w.out.AppendString("HTTP/1.1 " + text + "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n" +
-		"Content-Length: " + strconv.Itoa(len(text)) + "\r\n\r\n" + text)
+		"Content-Length: " + strconv.Itoa(len(text)) + "\r\n")
+	appendDate(&w.out)
+	w.out.AppendString("\r\n" + text)
 }
 
 func (w *response) Header() http.Header { return w.header }
@@ -103,6 +114,13 @@ func (w *response) WriteString(s string) (int, error) {
 // beforeWrite fills in the default 200 status code before the response body is written; it returns
 // http.ErrBodyNotAllowed when the status code does not allow a body.
 func (w *response) beforeWrite() error {
+	if w.writeErr != nil {
+		return w.writeErr
+	}
+	if w.conn.closed.Load() {
+		w.writeErr = net.ErrClosed
+		return w.writeErr
+	}
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
@@ -115,14 +133,23 @@ func (w *response) beforeWrite() error {
 // finish serializes the response into the output after the Handler returns, and reports whether to keep the
 // connection alive.
 func (w *response) finish() (keepAlive bool) {
+	if w.writeErr != nil {
+		return false
+	}
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
 	req := w.req
 	http11 := req.ProtoAtLeast(1, 1)
 	isHEAD := req.Method == http.MethodHead
-	bodyAllowed := bodyAllowedForStatus(w.status)
-	keepLength := isHEAD && bodyAllowed // HEAD keeps the Content-Length declared by the Handler
+	// A 2xx response to CONNECT turns the connection into a tunnel right after its header (RFC 9110 9.3.6), which fhttp
+	// does not provide: the response has no content and no Content-Length (8.6), and the connection closes after it.
+	tunnel := req.Method == http.MethodConnect && w.status/100 == 2
+	bodyAllowed := bodyAllowedForStatus(w.status) && !tunnel
+	if w.status == http.StatusResetContent {
+		w.body.Reset() // a 205 has no content (RFC 9110 15.3.6), so it goes out with Content-Length: 0
+	}
+	keepLength := isHEAD && bodyAllowed && w.status != http.StatusResetContent // HEAD keeps the Content-Length declared by the Handler
 	// One pass over the Handler's fields finds those finish decides on, and the names it writes out: Transfer-Encoding
 	// and Content-Length are decided here (the body is buffered in full, so its actual length is used), and a 304 has no
 	// Content-Type.
@@ -146,24 +173,27 @@ func (w *response) finish() (keepAlive bool) {
 		case "Date":
 			hasDate = true
 		case "Connection":
-			hasConnection, closing = true, hasToken(values, "close")
+			if closing = hasToken(values, "close"); (req.Close || tunnel) && !closing {
+				continue // the request or the tunnel closes the connection, so "Connection: close" goes out in its place
+			}
+			hasConnection = true
 		}
 		if validName(name) {
 			fields = append(fields, field{name, values})
 		}
 	}
-	keepAlive = !req.Close && !closing
+	keepAlive = !req.Close && !closing && !tunnel
 
 	b := &w.out
 	if cap(b.Bytes()) == 0 {
 		*b = bytepool.Get(initialOutput)
 	}
-	if http11 && w.status == http.StatusOK {
+	if w.status == http.StatusOK {
 		b.AppendString("HTTP/1.1 200 OK\r\n") // the usual status line, in one piece
 	} else {
-		appendStatusLine(b, http11, w.status)
+		appendStatusLine(b, w.status)
 	}
-	if bodyAllowed && (!isHEAD || !hasLength && w.body.Len() > 0) {
+	if bodyAllowed && (!keepLength || !hasLength && w.body.Len() > 0) {
 		appendContentLength(b, w.body.Len())
 	}
 	if !hasType && bodyAllowed && w.body.Len() > 0 && !encoded {
@@ -189,7 +219,9 @@ func (w *response) finish() (keepAlive bool) {
 		body = nil
 	}
 	if len(body) > maxCopiedBody { // written right away after the output so far, without being copied
-		w.conn.connection.Writev([][]byte{b.Bytes(), body})
+		if _, err := w.conn.connection.Writev([][]byte{b.Bytes(), body}); err != nil {
+			w.writeErr = err
+		}
 		b.Release()
 	} else {
 		b.Append(body)
@@ -197,7 +229,7 @@ func (w *response) finish() (keepAlive bool) {
 	if b.Len() >= maxBufferedOutput {
 		w.flush()
 	}
-	return keepAlive
+	return keepAlive && w.writeErr == nil
 }
 
 // field is a name of a header with its values, see appendFields.
@@ -251,13 +283,10 @@ func appendFields(b *bytepool.Buffer, fields []field) {
 // isFieldSpace reports whether c is one of the bytes http.Header.Write trims off a value.
 func isFieldSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\r' || c == '\n' }
 
-// appendStatusLine appends the status line of a response with code status to a request of HTTP/1.1, or else 1.0.
-func appendStatusLine(b *bytepool.Buffer, http11 bool, status int) {
-	if http11 {
-		b.AppendString("HTTP/1.1 ")
-	} else {
-		b.AppendString("HTTP/1.0 ")
-	}
+// appendStatusLine appends the status line of a response with code status. It is HTTP/1.1 for an HTTP/1.0 request as
+// well, the highest version fhttp conforms to (RFC 9110 6.2), where the net/http server answers with HTTP/1.0.
+func appendStatusLine(b *bytepool.Buffer, status int) {
+	b.AppendString("HTTP/1.1 ")
 	appendInt(b, status)
 	b.AppendString(" ")
 	if text := http.StatusText(status); text != "" {

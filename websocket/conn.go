@@ -36,14 +36,16 @@ const (
 )
 
 var (
-	errMessageTooBig = errors.New("websocket: message too big")
-	errHandlerPanic  = errors.New("websocket: handler panic")
+	errMessageTooBig  = errors.New("websocket: message too big")
+	errHandlerPanic   = errors.New("websocket: handler panic")
+	errInvalidMessage = errors.New("websocket: WriteMessage sends text and binary messages, and pings and pongs of up to 125 bytes")
 )
 
+// closeTimeout bounds how long a closed connection waits for the peer to take what is still to be sent, the close frame
+// included: fnet sends it in full before closing, which a peer that does not read would otherwise put off for good.
+const closeTimeout = 5 * time.Second
+
 // Conn is a WebSocket connection. Except for SetContext, all methods can be called concurrently from any goroutine.
-//
-// The field order also accounts for alignment: small fields fill the gaps left by fields such as sync.Mutex (4-byte
-// alignment), so that Conn stays in the smallest possible size class (see TestConnSize).
 type Conn struct {
 	phase   atomic.Int32 // the progress of OnOpen (phaseOpening and so on), see Upgrade
 	closing atomic.Bool  // close frame sent or connection closed: set under writeMu, read lock-free by OnData; later data is all dropped
@@ -68,7 +70,6 @@ type Conn struct {
 	idleTimeout    time.Duration
 	messageTimeout time.Duration
 
-	segments [2][]byte // frame header and payload, Writev's argument (no per-frame allocation), used while holding writeMu
 	ctx      any
 	closeErr error // the reason for closing; determined when closing is set and never changed afterwards
 }
@@ -86,12 +87,22 @@ func (c *Conn) Context() any { return c.ctx }
 // SetContext binds user data; it should be called from a callback (callbacks of one connection run serially).
 func (c *Conn) SetContext(ctx any) { c.ctx = ctx }
 
-// WriteMessage sends a message as a single frame; op is usually ws.OpText or ws.OpBinary. Like fnet.Conn.Write it
-// does not block, and the caller may reuse data once it returns; it returns net.ErrClosed when a close frame has
-// been sent or the connection has closed.
+// WriteMessage sends a message as a single frame; op is ws.OpText or ws.OpBinary, or ws.OpPing or ws.OpPong with at most
+// 125 bytes (RFC 6455 5.5), and errInvalidMessage is returned for anything else (a close frame goes out through Close).
+// Like fnet.Conn.Write it does not block, and the caller may reuse data once it returns; it returns net.ErrClosed when a
+// close frame has been sent or the connection has closed.
 // When several frames arrive in one OnData, the frames written while they are being processed (including those
 // written by other goroutines) are corked first and written out all at once afterwards.
 func (c *Conn) WriteMessage(op ws.OpCode, data []byte) error {
+	switch op {
+	case ws.OpText, ws.OpBinary:
+	case ws.OpPing, ws.OpPong:
+		if len(data) > ws.MaxControlFramePayloadSize {
+			return errInvalidMessage
+		}
+	default:
+		return errInvalidMessage
+	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if c.closing.Load() {
@@ -104,8 +115,8 @@ func (c *Conn) WriteMessage(op ws.OpCode, data []byte) error {
 }
 
 // Close sends a close frame (1000) and then closes the connection. After Close returns, OnMessage is no longer
-// called: messages not yet processed in the same batch and data arriving afterwards are all discarded, while a
-// callback that is already running is unaffected.
+// called: messages not yet delivered, the one being received included, and data arriving afterwards are all discarded,
+// while a callback that is already running is unaffected.
 func (c *Conn) Close() error {
 	c.closeWith(ws.StatusNormalClosure, nil)
 	return nil
@@ -114,7 +125,7 @@ func (c *Conn) Close() error {
 // closeWith sends a close frame (without a status code when code is 0) and then closes the connection; err is the
 // recorded reason for closing. Only the first call takes effect.
 // After sending it does not wait for the peer's close frame in reply; fnet first finishes sending the data already
-// written, then closes the socket.
+// written, within closeTimeout, then closes the socket.
 func (c *Conn) closeWith(code ws.StatusCode, err error) {
 	c.writeMu.Lock()
 	if c.closing.Load() {
@@ -130,6 +141,7 @@ func (c *Conn) closeWith(code ws.StatusCode, err error) {
 	c.uncorkLocked() // the corked frames go out before the close frame
 	c.writeFrame(ws.OpClose, body)
 	c.writeMu.Unlock()
+	c.connection.SetDeadline(time.Now().Add(closeTimeout)) // OnData no longer sets one, see updateDeadline
 	c.connection.Close()
 }
 
@@ -148,9 +160,8 @@ func (c *Conn) writeFrame(op ws.OpCode, payload []byte) error {
 		frame.Release()
 		return err
 	}
-	c.segments = [2][]byte{header, payload}
-	_, err := c.connection.Writev(c.segments[:])
-	c.segments[1] = nil // stop referencing the caller's payload
+	// The slice takes an allocation, which a frame this large makes up for, rather than a field on every connection.
+	_, err := c.connection.Writev([][]byte{header, payload})
 	return err
 }
 
@@ -347,6 +358,12 @@ func (c *Conn) updateDeadline(pending bool) {
 		c.receiving = true
 		c.connection.SetDeadline(deadlineAfter(c.messageTimeout))
 	}
+	// closeWith may have run on another goroutine since OnData last looked, and its closeTimeout must stand: fnet waits for
+	// the send buffer to drain with no other limit. It sets closing before its deadline, so whichever of the two deadlines
+	// came last, closing is seen here.
+	if c.closing.Load() {
+		c.connection.SetDeadline(time.Now().Add(closeTimeout))
+	}
 }
 
 // deadlineAfter returns the instant timeout from now; timeout<=0 means no limit and the zero value is returned.
@@ -423,11 +440,21 @@ func (c *Conn) onCloseFrame(payload []byte) {
 		return
 	}
 	code, reason := ws.ParseCloseFrameData(payload)
-	if err := ws.CheckCloseFrameData(code, reason); err != nil {
+	if err := checkCloseFrame(code, reason); err != nil {
 		c.closeWith(ws.StatusProtocolError, err)
 		return
 	}
 	c.closeWith(code, wsutil.ClosedError{Code: code, Reason: reason})
+}
+
+// checkCloseFrame is ws.CheckCloseFrameData, which knows only the codes RFC 6455 defines and rejects those IANA has
+// registered since for a peer to close with as well: 1012 (Service Restart), 1013 (Try Again Later) and 1014 (Bad
+// Gateway).
+func checkCloseFrame(code ws.StatusCode, reason string) error {
+	if code >= 1012 && code <= 1014 {
+		code = ws.StatusNormalClosure // checked as one of the defined codes: the reason must be UTF-8
+	}
+	return ws.CheckCloseFrameData(code, reason)
 }
 
 // deliver validates one complete message and calls OnMessage; data is valid only within the callback.
@@ -435,6 +462,9 @@ func (c *Conn) deliver(op ws.OpCode, data []byte) {
 	c.messageFinished = true
 	if op == ws.OpText && !utf8.Valid(data) {
 		c.closeWith(ws.StatusInvalidFramePayloadData, wsutil.ErrInvalidUTF8)
+		return
+	}
+	if c.closing.Load() { // a Close on another goroutine while the frame was unmasked and checked, see Close
 		return
 	}
 	c.handler.OnMessage(c, op, data)

@@ -35,7 +35,7 @@ type fdPage [fdPageSize]atomic.Pointer[conn]
 //  3. Each word is written in a way that cannot lose an update:
 //     - a page pointer goes from nil to a page exactly once, by compare-and-swap (see store);
 //     - a slot has one writer at a time, because an fd belongs to one live connection at a time: a connection removes
-//     itself from the table before it closes its fd (see conn.close), and only after the close can the kernel hand
+//     itself from the table before it closes its fd (see conn.closeFd), and only after the close can the kernel hand
 //     the same fd to a new connection, which then stores into the slot. So a slot goes nil -> conn A -> nil -> conn B
 //     in strict sequence, and remove's compare-and-swap is only a second line of defence.
 //

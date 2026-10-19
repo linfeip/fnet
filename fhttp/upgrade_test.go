@@ -26,6 +26,61 @@ func (p *echoProtocol) OnData(data []byte) int {
 
 func (p *echoProtocol) OnClose(err error) { p.closed <- err }
 
+// pausedProtocol pauses reading as it takes over the connection, and reports the data it receives.
+type pausedProtocol struct {
+	connection fnet.Conn
+	received   chan string
+}
+
+func (p *pausedProtocol) OnData(data []byte) int {
+	p.received <- string(data)
+	return len(data)
+}
+
+func (p *pausedProtocol) OnClose(error) {}
+
+// TestUpgradeAfterFullQueue upgrades a connection whose reading fhttp paused for a full queue (see maxQueuedBytes): that
+// pause ends with HTTP, and the one the new protocol makes as it takes over holds until the protocol resumes reading.
+func TestUpgradeAfterFullQueue(t *testing.T) {
+	protocols := make(chan *pausedProtocol, 1)
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Upgrade", "paused")
+		Upgrade(w, func(c fnet.Conn) Protocol {
+			c.PauseRead()
+			p := &pausedProtocol{connection: c, received: make(chan string, 1)}
+			protocols <- p
+			return p
+		})
+	}), Options{})
+	c, err := net.Dial("tcp", s.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	io.WriteString(c, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 65536\r\n\r\n"+strings.Repeat("x", maxQueuedBytes))
+	if resp, err := http.ReadResponse(bufio.NewReader(c), nil); err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade: %v %v", resp, err)
+	}
+	p := <-protocols
+	io.WriteString(c, "data")
+	select {
+	case got := <-p.received:
+		t.Fatalf("the protocol paused reading, yet received %q", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+	p.connection.ResumeRead()
+	select {
+	case got := <-p.received:
+		if got != "data" {
+			t.Fatalf("received %q after ResumeRead, want %q", got, "data")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("nothing received after ResumeRead")
+	}
+}
+
 // wrappedWriter simulates a middleware wrapping the ResponseWriter.
 type wrappedWriter struct{ http.ResponseWriter }
 
@@ -46,6 +101,41 @@ func upgradeServer(t *testing.T) (s *Server, closed chan error, helloCalls *atom
 		io.WriteString(w, "hello world")
 	})
 	return serve(t, mux, Options{}), closed, helloCalls
+}
+
+// TestUpgradeEndsContext checks that the context of the upgrade request ends with its Handler, as on net/http, also once
+// the new protocol has taken the connection over: fhttp's onClose, which would cancel it otherwise, is the protocol's
+// from then on.
+func TestUpgradeEndsContext(t *testing.T) {
+	done := make(chan (<-chan struct{}), 1)
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		done <- r.Context().Done()
+		w.Header().Set("Upgrade", "echo")
+		Upgrade(w, func(c fnet.Conn) Protocol { return &echoProtocol{connection: c, closed: make(chan error, 1)} })
+	}), Options{})
+	br := dialRaw(t, s, "GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+	if resp, _ := readResp(t, br); resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade response %d", resp.StatusCode)
+	}
+	select {
+	case <-<-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the upgrade request's context did not end with its Handler")
+	}
+}
+
+// TestUpgradeHeaderInjection checks that a Sec-WebSocket-Accept value with a CR or LF in it cannot add fields to the 101.
+func TestUpgradeHeaderInjection(t *testing.T) {
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Upgrade", "websocket")
+		w.Header().Set("Connection", "Upgrade")
+		w.Header().Set("Sec-WebSocket-Accept", "x\r\nX-Injected: 1")
+		Upgrade(w, func(c fnet.Conn) Protocol { return &echoProtocol{connection: c, closed: make(chan error, 1)} })
+	}), Options{})
+	br := dialRaw(t, s, "GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+	if resp, _ := readResp(t, br); resp.StatusCode != http.StatusSwitchingProtocols || resp.Header.Get("X-Injected") != "" {
+		t.Fatalf("upgrade response %d %v", resp.StatusCode, resp.Header)
+	}
 }
 
 // TestUpgradeReleasesHTTPState verifies that HTTP requests are no longer handled after an upgrade: the
@@ -115,6 +205,19 @@ func TestUpgrade(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("%s: OnClose was not called", path)
 		}
+	}
+}
+
+// TestUpgradeHTTP10 checks that an HTTP/1.0 request is not upgraded (RFC 9110 7.8, 15.2): Upgrade returns
+// http.ErrNotSupported and leaves w to the Handler.
+func TestUpgradeHTTP10(t *testing.T) {
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := Upgrade(w, func(c fnet.Conn) Protocol { return &echoProtocol{connection: c} })
+		io.WriteString(w, err.Error())
+	}), Options{})
+	br := dialRaw(t, s, "GET / HTTP/1.0\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n")
+	if resp, body := readResp(t, br); resp.StatusCode != http.StatusOK || body != http.ErrNotSupported.Error() {
+		t.Fatalf("got %d %q, want 200 %q", resp.StatusCode, body, http.ErrNotSupported.Error())
 	}
 }
 

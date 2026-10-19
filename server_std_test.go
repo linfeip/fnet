@@ -155,3 +155,67 @@ func TestPauseReadWhileBlocked(t *testing.T) {
 		t.Fatalf("Detach handed over %q, err=%v, want %q", buf, err, "kept")
 	}
 }
+
+// TestCloseDuringSetDeadline closes connections while another goroutine keeps setting their deadline, as websocket does
+// from OnData: a SetDeadline that checked the connection open before Close must not put off the wakeup Close gives the
+// read loop, which would hold OnClose back until the idle client sends something.
+func TestCloseDuringSetDeadline(t *testing.T) {
+	const conns = 200
+	opened := make(chan Conn, conns)
+	srv := startServer(t, &funcHandler{
+		open:  func(c Conn) { c.SetContext(make(chan struct{})); opened <- c },
+		close: func(c Conn, _ error) { close(c.Context().(chan struct{})) },
+	})
+	var pending []chan struct{}
+	for range conns {
+		dial(t, srv)
+		c := <-opened
+		closed := c.Context().(chan struct{})
+		pending = append(pending, closed)
+		go func() {
+			for {
+				select {
+				case <-closed:
+					return
+				default:
+					c.SetDeadline(time.Time{})
+				}
+			}
+		}()
+		go c.Close()
+	}
+	timeout := time.After(5 * time.Second)
+	for i, closed := range pending {
+		select {
+		case <-closed:
+		case <-timeout:
+			t.Fatalf("connection %d: no OnClose after Close", i)
+		}
+	}
+}
+
+// TestHandlerPanic checks that a panicking callback closes its connection with ErrHandlerPanic, logging the panic as the
+// executor does on Linux/macOS, instead of ending the process, and leaves the other connections alone.
+func TestHandlerPanic(t *testing.T) {
+	defer slog.SetDefault(slog.Default())
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reasons := make(chan error, 1)
+	srv := startServer(t, &funcHandler{
+		data: func(c Conn, b []byte) int {
+			if string(b) == "panic" {
+				panic("boom")
+			}
+			return echo(c, b)
+		},
+		close: func(c Conn, err error) { reasons <- err },
+	})
+	bad, good := dial(t, srv), dial(t, srv)
+	bad.Write([]byte("panic"))
+	if err := <-reasons; err != ErrHandlerPanic {
+		t.Fatalf("OnClose(%v), want ErrHandlerPanic", err)
+	}
+	good.Write([]byte("ok"))
+	if _, err := io.ReadFull(good, make([]byte, 2)); err != nil {
+		t.Fatalf("other connection: %v", err)
+	}
+}

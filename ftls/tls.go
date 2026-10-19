@@ -39,7 +39,8 @@ func (wouldBlockError) Temporary() bool { return true }
 
 // Handler wraps an fnet.Handler with TLS. The wrapped handler's callbacks get a *Conn and keep the guarantees of
 // fnet.Handler; OnOpen comes once the handshake has succeeded, and a connection whose handshake fails never reaches the
-// handler.
+// handler. Every close of an open connection sends close_notify first, as RFC 9112 9.8 requires of a server: Conn.Close
+// sends it, and so does OnClosing when the engine closes the connection on its own.
 type Handler struct {
 	handler          fnet.Handler
 	config           *tls.Config
@@ -78,6 +79,47 @@ func (h *Handler) OnData(c fnet.Conn, data []byte) int {
 	return len(data)
 }
 
+// OnClosing sends close_notify before the engine closes the connection on its own, once the handler has had its
+// OnClosing, if it is an fnet.ClosingHandler. As with crypto/tls, no alert goes out before the handshake has succeeded.
+func (h *Handler) OnClosing(c fnet.Conn, err error) {
+	tc := c.Context().(*Conn)
+	if tc.resume != nil {
+		return
+	}
+	if ch, ok := tc.handler.(fnet.ClosingHandler); ok {
+		ch.OnClosing(tc, err)
+	}
+	tc.closing.Store(true)
+	tc.tlsConn.CloseWrite() // sends close_notify, once: a no-op if the handler has called Close
+}
+
+// OnWritable passes the engine's OnWritable on to the handler, if it is an fnet.WritableHandler: what waits in the send
+// buffer is ciphertext, which Conn.Writable reports on as it is.
+func (h *Handler) OnWritable(c fnet.Conn) {
+	tc := c.Context().(*Conn)
+	if tc.resume != nil {
+		return
+	}
+	if wh, ok := tc.handler.(fnet.WritableHandler); ok {
+		wh.OnWritable(tc)
+	}
+}
+
+// OnResume passes on the plaintext held (see Conn.PauseRead), then calls the handler's OnResume, if it is an
+// fnet.ResumeHandler.
+func (h *Handler) OnResume(c fnet.Conn) {
+	tc := c.Context().(*Conn)
+	if tc.resume != nil {
+		return
+	}
+	if tc.plaintext.Len() > 0 && !tc.readPaused.Load() {
+		tc.deliver(nil, 0)
+	}
+	if rh, ok := tc.handler.(fnet.ResumeHandler); ok {
+		rh.OnResume(tc)
+	}
+}
+
 // OnClose reports the close to the handler, or ends the handshake of a connection the handler never saw.
 func (h *Handler) OnClose(c fnet.Conn, err error) {
 	tc := c.Context().(*Conn)
@@ -107,7 +149,7 @@ type Conn struct {
 	closeErr   error                   // the TLS error that closed the connection, see drain
 	netConn    net.Conn                // set by Detach: TLS reads and writes it from then on
 	readPaused atomic.Bool
-	closing    atomic.Bool // Close was called: the close reason stays nil, as on the engine
+	closing    atomic.Bool // Close or OnClosing was called: the engine's close reason stands, and writes fail with net.ErrClosed
 	detached   atomic.Bool
 }
 
@@ -125,7 +167,11 @@ func (c *Conn) Write(b []byte) (int, error) {
 	if c.detached.Load() {
 		return 0, net.ErrClosed
 	}
-	return c.tlsConn.Write(b)
+	n, err := c.tlsConn.Write(b)
+	if err != nil && c.closing.Load() {
+		err = net.ErrClosed // in place of crypto/tls's own error once close_notify has gone out, see Handler.OnClosing
+	}
+	return n, err
 }
 
 // Writev joins bs and encrypts them in a single write: no other write comes in between, and small segments do not take a
@@ -156,11 +202,16 @@ func (c *Conn) Close() error {
 	return nil
 }
 
-// PauseRead pauses reading like fnet.Conn.PauseRead. Plaintext decrypted meanwhile is kept, and passed on together with
-// the data that arrives after ResumeRead.
+// PauseRead pauses reading like fnet.Conn.PauseRead. The plaintext held, decrypted meanwhile or left unconsumed by the
+// handler, is passed on again as soon as ResumeRead resumes reading (see Handler.OnResume).
+//
+// The engine's reading is paused first: plaintext is held only once it is, so the engine calls OnResume after ResumeRead.
+// The other way round, a pause from another goroutine could leave plaintext held while the engine goes on reading, and
+// on other platforms than Linux/macOS, whose read loop calls OnResume only between reads, a peer awaiting an answer to it
+// would never get one.
 func (c *Conn) PauseRead() {
-	c.readPaused.Store(true)
 	c.Conn.PauseRead()
+	c.readPaused.Store(true)
 }
 
 // ResumeRead resumes reading, see PauseRead.
@@ -245,7 +296,7 @@ func (c *Conn) drain() {
 }
 
 // deliver passes the plaintext on to the handler, unless reading is paused; data holds the new plaintext after room for
-// the pending bytes the handler left unconsumed (see drain).
+// the pending bytes the handler left unconsumed (see drain), and is nil when only those are passed on again.
 func (c *Conn) deliver(data []byte, pending int) {
 	switch {
 	case pending > 0:

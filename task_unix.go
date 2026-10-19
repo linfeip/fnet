@@ -4,8 +4,11 @@ package fnet
 
 import (
 	"io"
+	"os"
+	"time"
 
 	"github.com/linfeip/fnet/internal/bytepool"
+	"github.com/linfeip/fnet/internal/units"
 	"github.com/linfeip/fnet/poll"
 
 	"golang.org/x/sys/unix"
@@ -14,11 +17,14 @@ import (
 // Values of the connection state word conn.state: the low bits are the pending events, and scheduledBit
 // means a task is already queued or running.
 const (
-	evRead  = uint32(poll.EventRead)  // readable (a closed peer and errors count as well)
-	evWrite = uint32(poll.EventWrite) // writable
-	evHup   = uint32(poll.EventHup)   // the peer has closed or an error occurred, see conn.peerClosed
-	evOpen  = evHup << 1              // new connection, the OnOpen callback is pending
-	evClose = evOpen << 1             // a close has been requested, see requestClose
+	evRead     = uint32(poll.EventRead)  // readable (a closed peer and errors count as well)
+	evWrite    = uint32(poll.EventWrite) // writable
+	evHup      = uint32(poll.EventHup)   // the peer has closed or an error occurred, see conn.peerClosed
+	evOpen     = evHup << 1              // new connection, the OnOpen callback is pending
+	evClose    = evOpen << 1             // a close has been requested, see requestClose
+	evExpired  = evClose << 1            // the deadline has expired, see loop.checkDeadlines
+	evShutdown = evExpired << 1          // the server is closing the connection, see Server.Serve
+	evResume   = evShutdown << 1         // reading has resumed, see conn.ResumeRead
 
 	scheduledBit = 1 << 31
 )
@@ -40,7 +46,7 @@ func (c *conn) notify(ev uint32) bool {
 
 // schedule submits the connection's task to the Executor (taskpool.DefaultTaskPool.SubmitTo by default), keyed by the
 // connection's loop-affine key. The caller must hold the task, see markEvents.
-func (c *conn) schedule() { c.loop.srv.opts.Executor(c.loop.taskKey(c.fd), c.task) }
+func (c *conn) schedule() { c.loop.srv.opts.Executor(c.TaskKey(), c.task) }
 
 // markEvents merges events and takes the right to submit the connection's single task; a caller it returns true for
 // must submit it, never drop it.
@@ -60,23 +66,31 @@ func (c *conn) run() {
 	defer func() {
 		if !done {
 			c.close(ErrHandlerPanic) // scheduledBit stays set, so there will be no further task
+			if c.lingering() {       // OnClose itself panicked, the linger having begun
+				c.endLinger()
+			}
 		}
 	}()
 	c.handle(ev)
 	done = true
-	// A closed connection keeps scheduledBit set, so there is no further task.
-	if !c.closed && !c.state.CompareAndSwap(scheduledBit, 0) {
+	// A closed connection keeps scheduledBit set, so there is no further task, unless it lingers.
+	if (!c.closed || c.lingering()) && !c.state.CompareAndSwap(scheduledBit, 0) {
 		c.schedule()
 	}
 }
 
 // handle processes one round of events: setting up a new connection (its socket options, then the OnOpen callback),
-// flushing the send buffer, reading, and finally a check for whether the connection has to be closed. A close request
-// (including one made from a callback in this round) is handled in the next round: data the peer has already sent but
-// that has not been read yet is read away first, so that the socket holds no unread data at close time, which would make
-// the peer receive an RST instead of a FIN.
+// flushing the send buffer (and OnWritable once it is back down), OnResume once reading resumes, reading, requesting the
+// close of a connection whose deadline expired or whose server is closing (see onClosing), and finally a check for
+// whether the connection has to be closed.
+// A close request (including one made from a callback in this round) is handled in the next round: data the peer has
+// already sent but that has not been read yet is read away first, so that the socket holds no unread data at close
+// time, which would make the peer receive an RST instead of a FIN.
 func (c *conn) handle(ev uint32) {
-	if c.closed { // events left over after the connection was closed
+	if c.closed { // events left over after the connection was closed, or for its linger
+		if c.lingering() {
+			c.linger(ev)
+		}
 		return
 	}
 	if ev&evOpen != 0 {
@@ -92,15 +106,38 @@ func (c *conn) handle(ev uint32) {
 	}
 	// The poller reports a writable socket along with every event, so evWrite is nearly always set: only a backlog
 	// needs the lock and a write.
-	drained := false
+	drained, writable := false, false
 	if ev&evWrite != 0 && c.backlogged.Load() {
-		drained = c.flush()
+		drained, writable = c.flush()
+	}
+	if writable { // the backlog is back down to maxBacklog: reading resumes, and a WritableHandler hears of it
+		ev |= evRead
+		if h, ok := c.loop.srv.handler.(WritableHandler); ok {
+			h.OnWritable(c)
+		}
 	}
 	if ev&evHup != 0 {
 		c.peerClosed = true
 	}
-	if ev&evRead != 0 && !c.readPaused.Load() {
+	if ev&evResume != 0 && !c.readPaused.Load() {
+		if h, ok := c.loop.srv.handler.(ResumeHandler); ok {
+			h.OnResume(c) // what it kept goes before what the socket holds
+		}
+	}
+	// While the backlog is over maxBacklog the read is skipped; the flush that brings it back down reads again.
+	if ev&evRead != 0 && !c.readPaused.Load() && c.Writable() {
 		c.read()
+	}
+	var err error
+	switch {
+	case ev&evShutdown != 0:
+		err = ErrServerClosed
+	case ev&evExpired != 0 && c.expiredBy(time.Now().UnixNano()):
+		err = os.ErrDeadlineExceeded
+	}
+	if err != nil {
+		c.onClosing(err)
+		c.requestClose(err)
 	}
 	if drained || ev&evClose != 0 { // the send buffer drained, or a close has been requested
 		c.closeIfRequested()
@@ -132,9 +169,13 @@ func (c *conn) read() {
 	if n <= 0 {
 		switch err {
 		case unix.EAGAIN: // already drained, wait for the next edge-triggered event
+			// The peer has not closed after all: the evHup was left over from a previous connection with this fd (see
+			// loop.handleEvent), and would otherwise cost every read from now on another round.
+			c.peerClosed = false
 		case unix.EINTR: // interrupted by a signal: this edge-triggered event was used up without reading data, read again
 			c.notify(evRead)
 		case nil: // EOF: the peer closed its write direction
+			c.onClosing(io.EOF)
 			c.requestCloseOnEOF()
 		default:
 			c.requestClose(err)
@@ -166,37 +207,53 @@ func (c *conn) read() {
 	}
 }
 
+// maxBacklog is how much data may wait in a connection's send buffer before the connection stops being read: what it
+// sends in reply to what it reads then waits for the peer to take what it was sent, so a peer that does not read cannot
+// make the server hold more than about this much plus the replies to one read (the same default high-water mark as
+// Netty's). Reading resumes once the backlog is back down to maxBacklog, which only flush brings about.
+const maxBacklog = 64 * units.KB
+
+// backlog returns the number of bytes waiting in the send buffer.
+func (c *conn) backlog() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.out.Len() - c.outPos
+}
+
 // flush sends the backed-up data on a writable event, writing only once per event: when it cannot write everything the
-// kernel send buffer is full, and another writable event will come. It reports whether the send buffer drained.
-func (c *conn) flush() bool {
+// kernel send buffer is full, and another writable event will come. It reports whether the send buffer drained, and
+// whether the backlog came back down to maxBacklog from over it (see Writable).
+func (c *conn) flush() (drained, writable bool) {
 	c.mu.Lock()
 	if c.out.Len() == 0 {
 		c.mu.Unlock()
-		return false
+		return false, false
 	}
+	backlog := c.out.Len() - c.outPos
 	n, err := sysWrite(c.fd, c.out.Bytes()[c.outPos:])
 	switch err {
 	case nil, unix.EAGAIN:
 	case unix.EINTR: // interrupted by a signal: this edge-triggered event was used up without writing data, write again
 		c.mu.Unlock()
 		c.notify(evWrite)
-		return false
+		return false, false
 	default:
 		c.mu.Unlock()
 		c.requestClose(err)
-		return false
+		return false, false
 	}
 	if n > 0 {
 		c.outPos += n
+		writable = backlog > maxBacklog && backlog-n <= maxBacklog
 	}
-	drained := c.outPos == c.out.Len()
+	drained = c.outPos == c.out.Len()
 	if drained { // the send buffer has drained: return the buffer to the pool
 		c.out.Release()
 		c.outPos = 0
 		c.backlogged.Store(false)
 	}
 	c.mu.Unlock()
-	return drained
+	return drained, writable
 }
 
 // requestClose requests that the connection be closed; it may be called from any goroutine, and the close itself is
@@ -227,6 +284,29 @@ func (c *conn) requestCloseOnEOF() {
 	c.notify(evClose)
 }
 
+// expiredBy reports whether the deadline, or the end of the linger (see beginLinger), has passed by now. The task checks
+// it again on evExpired: loop.checkDeadlines found it so, but it may have been put off since, even by the callback of
+// this very round.
+func (c *conn) expiredBy(now int64) bool {
+	d := c.deadline.Load()
+	return d != 0 && max(d, -d) <= now
+}
+
+// onClosing invokes the OnClosing callback of a ClosingHandler before the engine requests the close of the connection on
+// its own, err being the reason, unless a close has been requested already.
+func (c *conn) onClosing(err error) {
+	h, ok := c.loop.srv.handler.(ClosingHandler)
+	if !ok {
+		return
+	}
+	c.mu.Lock()
+	closing := c.closing
+	c.mu.Unlock()
+	if !closing {
+		h.OnClosing(c, err)
+	}
+}
+
 // closeIfRequested closes the connection when a close has been requested and either an immediate close was asked for or
 // the send buffer has already been sent.
 func (c *conn) closeIfRequested() {
@@ -239,22 +319,93 @@ func (c *conn) closeIfRequested() {
 }
 
 // close closes the connection and invokes OnClose with err as the close reason; it may only be called from the
-// connection's task.
+// connection's task. The fd of a local close (err nil) stays open for a while, see beginLinger.
 func (c *conn) close(err error) {
 	if c.closed {
 		return
 	}
-	defer c.loop.srv.openConnsWg.Done()
-	connsByFd.remove(c) // before the fd is closed: a closed fd may immediately be reused by a new connection
-	c.discardInbound()
 	c.mu.Lock()
-	c.closed = true
-	unix.Close(c.fd)
+	c.closed = true // before the fd is closed: whoever sees closed=false while holding mu may use the fd
 	c.out.Release()
 	c.backlogged.Store(false)
 	c.mu.Unlock()
 	c.in.Release()
+	if err == nil {
+		c.beginLinger()
+	} else {
+		defer c.loop.srv.openConnsWg.Done()
+		c.discardInbound()
+		c.closeFd()
+	}
 	c.loop.srv.handler.OnClose(c, err)
+}
+
+// lingerTimeout is how long a connection closed locally keeps reading what the peer still sends, see beginLinger. The
+// deadlines are checked once per second, so its fd is closed within two seconds.
+const lingerTimeout = time.Second
+
+// beginLinger closes the connection in stages (RFC 9112 9.6): while the peer may still be sending, closing the socket
+// makes the kernel answer what arrives with an RST, which can make the peer drop what it has received but not read yet,
+// such as the last response. So only the write direction is shut down, a FIN following the data, and the task goes on
+// reading away what arrives (see linger), until the peer closes too, a read fails, the server closes or lingerTimeout
+// has passed; the fd is closed then, and the server counts the connection as open until that happens.
+//
+// Meanwhile the deadline holds the end of the linger, negated: that marks the connection as lingering, which SetDeadline
+// then leaves alone, and loop.checkDeadlines still finds it.
+func (c *conn) beginLinger() {
+	unix.Shutdown(c.fd, unix.SHUT_WR)
+	c.deadline.Store(-time.Now().Add(lingerTimeout).UnixNano())
+	// What has arrived already raises no new event: it is read here once, and linger goes on in another round only when
+	// there was something, the EOF included. Usually there is nothing yet, and the peer's FIN brings the next event.
+	if _, err := c.discardInbound(); err != unix.EAGAIN {
+		c.notify(evRead)
+	}
+}
+
+// lingering reports whether the connection is closed but its fd is still open, see beginLinger.
+func (c *conn) lingering() bool { return c.deadline.Load() < 0 }
+
+// linger handles the events of a lingering connection: it reads away what arrives, a read per round as in read, and
+// closes the fd once the peer has closed, a read has failed, the linger has timed out or the server is closing.
+func (c *conn) linger(ev uint32) {
+	if ev&evShutdown != 0 || ev&evExpired != 0 && c.expiredBy(time.Now().UnixNano()) {
+		c.endLinger()
+		return
+	}
+	if ev&evHup != 0 {
+		c.peerClosed = true
+	}
+	if ev&evRead == 0 {
+		return
+	}
+	n, err := c.discardInbound()
+	if n > 0 {
+		if n == c.loop.srv.opts.ReadBufferSize || c.peerClosed {
+			c.notify(evRead) // there may be more, or the EOF after the data, see read
+		}
+		return
+	}
+	switch err {
+	case unix.EAGAIN:
+		c.peerClosed = false // a stale evHup, as in read
+	case unix.EINTR:
+		c.notify(evRead)
+	default: // EOF, or the read failed
+		c.endLinger()
+	}
+}
+
+// endLinger closes the fd of a lingering connection.
+func (c *conn) endLinger() {
+	c.deadline.Store(0) // no longer lingering: no task runs after this one (see run)
+	c.closeFd()
+	c.loop.srv.openConnsWg.Done()
+}
+
+// closeFd takes the connection out of the table and closes its fd.
+func (c *conn) closeFd() {
+	connsByFd.remove(c) // before the fd is closed: a closed fd may immediately be reused by a new connection
+	unix.Close(c.fd)
 }
 
 // abandon closes a connection that could not be watched, before OnOpen; it may only be called from the connection's
@@ -267,12 +418,12 @@ func (c *conn) abandon() {
 	c.loop.srv.openConnsWg.Done()
 }
 
-// discardInbound reads away data that has arrived but has not been read yet: closing while the socket holds unread data
-// sends an RST, which may make the peer discard the data it has already sent (such as a close frame).
-// It reads only once, since it must not keep reading while the peer keeps sending.
-func (c *conn) discardInbound() {
+// discardInbound reads away data that has arrived but has not been read yet, and returns the result of the read: closing
+// while the socket holds unread data sends an RST, which may make the peer discard the data it has already sent (such as
+// a close frame). It reads only once, since it must not keep reading while the peer keeps sending.
+func (c *conn) discardInbound() (int, error) {
 	size := c.loop.srv.opts.ReadBufferSize
 	buf := bytepool.Get(size)
 	defer buf.Release()
-	sysRead(c.fd, buf.Bytes()[:size])
+	return sysRead(c.fd, buf.Bytes()[:size])
 }

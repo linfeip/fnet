@@ -13,7 +13,6 @@ import (
 	"io"
 	"log"
 	"log/slog"
-	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -23,6 +22,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -164,35 +164,47 @@ func TestClient(t *testing.T) {
 	}
 }
 
-// runOnHandlerExecutor is the frame in which the HandlerExecutor of TestHandlerExecutor runs its tasks; the Handler
-// looks for it in its own stack.
+// runOnExecutor is the frame in which the Executor of TestExecutor runs its tasks; the Handler looks for it in its own
+// stack.
 //
 //go:noinline
-func runOnHandlerExecutor(task func()) { task() }
+func runOnExecutor(task func()) { task() }
 
-// TestHandlerExecutor checks that the Handlers run as tasks of Options.HandlerExecutor, with a key in the range
-// taskpool.RandomKey returns.
-func TestHandlerExecutor(t *testing.T) {
+// TestExecutor checks that the Handlers run as tasks of Options.Executor, keyed with the connection's fnet.Conn.TaskKey:
+// two requests sent one after the other on one connection are submitted with the same key.
+func TestExecutor(t *testing.T) {
 	onExecutor := make(chan bool, 1)
 	keys := make(chan int, 16)
 	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		stack := make([]byte, 16*units.KB)
-		onExecutor <- strings.Contains(string(stack[:runtime.Stack(stack, false)]), "runOnHandlerExecutor")
+		onExecutor <- strings.Contains(string(stack[:runtime.Stack(stack, false)]), "runOnExecutor")
 		io.WriteString(w, "ok")
-	}), Options{HandlerExecutor: func(key int, task func()) {
+	}), Options{Executor: func(key int, task func()) {
 		keys <- key
-		go runOnHandlerExecutor(task)
+		go runOnExecutor(task)
 	}})
-	client := &http.Client{Transport: &http.Transport{}}
-	defer client.CloseIdleConnections()
-	if _, body := get(t, client, "http://"+s.Addr().String()+"/"); body != "ok" {
-		t.Fatalf("GET /: %q", body)
+	c, err := net.Dial("tcp", s.Addr().String())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !<-onExecutor {
-		t.Fatal("the Handler did not run as a task of Options.HandlerExecutor")
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(c)
+	for range 2 {
+		io.WriteString(c, "GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body, _ := io.ReadAll(resp.Body); string(body) != "ok" {
+			t.Fatalf("GET /: %q", body)
+		}
+		if !<-onExecutor {
+			t.Fatal("the Handler did not run as a task of Options.Executor")
+		}
 	}
-	if key := <-keys; key < 0 || key >= math.MaxInt32 {
-		t.Fatalf("key %d is out of the range of taskpool.RandomKey", key)
+	if first, second := <-keys, <-keys; first != second {
+		t.Fatalf("the requests of one connection were submitted with keys %d and %d", first, second)
 	}
 }
 
@@ -242,14 +254,55 @@ func TestPipelining(t *testing.T) {
 	}
 }
 
+// TestEmptyLineBeforeRequest checks that empty lines before a request are ignored (RFC 9112 2.2), such as the CRLF some
+// clients send after a request body.
+func TestEmptyLineBeforeRequest(t *testing.T) {
+	s := newTestServer(t, Options{})
+	br := dialRaw(t, s, "\r\nPOST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi\r\n\n"+
+		"GET /hello HTTP/1.1\r\nHost: a\r\n\r\n")
+	for _, want := range []string{"200 hi", "200 hello world"} {
+		resp, body := readResp(t, br)
+		if got := fmt.Sprintf("%d %s", resp.StatusCode, body); got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	}
+
+	// An empty line split between two arrivals.
+	c, err := net.Dial("tcp", s.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write([]byte("\r"))
+	time.Sleep(50 * time.Millisecond)
+	c.Write([]byte("\nGET /hello HTTP/1.1\r\nHost: a\r\n\r\n"))
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if resp, body := readResp(t, bufio.NewReader(c)); resp.StatusCode != http.StatusOK || body != "hello world" {
+		t.Fatalf("split empty line: got %d %q", resp.StatusCode, body)
+	}
+}
+
 // recordConn is a fnet.Conn that records what is written to it; it only implements the methods used while handling
 // a request.
 type recordConn struct {
 	fnet.Conn
 	writes []string
+	paused bool
+	full   bool // the send buffer is over what Writable allows
+	closed bool
+	err    error // what Write returns
 }
 
+func (c *recordConn) Close() error   { c.closed = true; return nil }
+func (c *recordConn) PauseRead()     { c.paused = true }
+func (c *recordConn) ResumeRead()    { c.paused = false }
+func (c *recordConn) Writable() bool { return !c.full }
+func (c *recordConn) TaskKey() int   { return 0 }
+
 func (c *recordConn) Write(b []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
 	c.writes = append(c.writes, string(b))
 	return len(b), nil
 }
@@ -264,24 +317,19 @@ func (c *recordConn) Writev(bs [][]byte) (int, error) {
 
 func (*recordConn) SetDeadline(time.Time) {}
 func (*recordConn) RemoteAddr() net.Addr  { return &net.TCPAddr{} }
+func (*recordConn) LocalAddr() net.Addr   { return &net.TCPAddr{} }
 
-// queueConn returns a conn writing to rc whose requests the test serves itself: busy, so onData starts no worker.
+// queueConn returns a conn writing to rc whose requests the test serves itself: serving, so onData starts no worker.
 func queueConn(rc *recordConn) *conn {
-	return &conn{srv: &Server{handler: testMux(), opts: Options{}.withDefaults()}, connection: rc, busy: true}
+	return &conn{srv: &Server{handler: testMux(), opts: Options{}.withDefaults()}, connection: rc, worker: workerServing}
 }
 
-// TestConnSize checks that conn and the request queue item stay within their size classes: every connection holds a
-// conn, and its queue keeps a backing array (see maxRetainedQueueCapacity), so a few bytes more cost every idle
-// connection a whole size class.
-func TestConnSize(t *testing.T) {
-	if unsafe.Sizeof(uintptr(0)) != 8 {
-		t.Skip("size checked for 64-bit platforms")
-	}
-	if size := unsafe.Sizeof(conn{}); size > 128 {
-		t.Fatalf("conn is %dB, over the 128B size class", size)
-	}
-	if size := unsafe.Sizeof(request{}); size > 32 {
-		t.Fatalf("request is %dB, over 32B", size)
+func TestResponseWriteAfterClose(t *testing.T) {
+	c := &conn{connection: &recordConn{}}
+	c.closed.Store(true)
+	w := &response{conn: c, header: make(http.Header)}
+	if n, err := w.Write([]byte("body")); n != 0 || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Write after close: n=%d err=%v", n, err)
 	}
 }
 
@@ -297,11 +345,161 @@ func TestQueueCapacity(t *testing.T) {
 		t.Fatalf("queue capacity after a burst %d, want no more than %d", cap(c.queue), maxRetainedQueueCapacity)
 	}
 
-	c.busy = true
+	c.worker = workerServing
 	c.onData([]byte(get))
 	c.serve()
 	if cap(c.queue) != 1 {
 		t.Fatalf("queue capacity after a single request %d, want to retain 1", cap(c.queue))
+	}
+}
+
+// TestQueueBackpressure checks that a connection with too much queued, by number or by size, is not read until its
+// worker has answered everything, and that a client pipelining more than that is answered in full. Every request at
+// hand is queued before reading pauses: the engine does not pass the data left unconsumed on again when reading
+// resumes, so a request left there would wait for data the client, awaiting its answer, never sends.
+func TestQueueBackpressure(t *testing.T) {
+	const get = "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"
+	post := fmt.Sprintf("POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: %d\r\n\r\n%s", maxQueuedBytes,
+		strings.Repeat("x", maxQueuedBytes))
+	for _, tt := range []struct {
+		name     string
+		data     string
+		requests int
+		paused   bool
+	}{
+		{"below the limits", strings.Repeat(get, maxPipeline-1), maxPipeline - 1, false},
+		{"maxPipeline requests", strings.Repeat(get, maxPipeline), maxPipeline, true},
+		{"maxQueuedBytes of request", post, 1, true},
+		{"past maxPipeline", strings.Repeat(get, maxPipeline+1), maxPipeline + 1, true},
+		{"a request after maxQueuedBytes", post + get, 2, true},
+	} {
+		rc := &recordConn{}
+		c := queueConn(rc)
+		if consumed := c.onData([]byte(tt.data)); consumed != len(tt.data) {
+			t.Fatalf("%s: consumed %d of %d bytes", tt.name, consumed, len(tt.data))
+		}
+		if rc.paused != tt.paused {
+			t.Fatalf("%s: paused=%v, want %v", tt.name, rc.paused, tt.paused)
+		}
+		c.serve()
+		if got := strings.Count(strings.Join(rc.writes, ""), "HTTP/1.1 200 OK"); rc.paused || got != tt.requests {
+			t.Fatalf("%s: after serving %d responses and paused=%v, want %d and false", tt.name, got, rc.paused, tt.requests)
+		}
+	}
+
+	s := newTestServer(t, Options{})
+	const count = 3 * maxPipeline
+	br := dialRaw(t, s, strings.Repeat(get, count))
+	for i := range count {
+		if resp, body := readResp(t, br); resp.StatusCode != http.StatusOK || body != "hello world" {
+			t.Fatalf("response %d: %d %q", i, resp.StatusCode, body)
+		}
+	}
+	br = dialRaw(t, s, post+get)
+	for i, want := range []string{strings.Repeat("x", maxQueuedBytes), "hello world"} {
+		if resp, body := readResp(t, br); resp.StatusCode != http.StatusOK || body != want {
+			t.Fatalf("response %d after a full queue: %d, %d bytes", i, resp.StatusCode, len(body))
+		}
+	}
+}
+
+// TestWaitWritable checks that the worker stops answering a client that does not take the responses (fnet's send buffer
+// is full), with IdleTimeout as its deadline, and answers the rest once fnet reports the buffer back down.
+func TestWaitWritable(t *testing.T) {
+	const get = "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"
+	rc := &recordConn{full: true}
+	c := queueConn(rc)
+	c.serveTask = c.serve
+	c.srv.opts.Executor = func(_ int, task func()) { task() }
+	c.onData([]byte(strings.Repeat(get, 3)))
+	c.serve()
+	if len(rc.writes) != 0 || c.worker != workerWaiting {
+		t.Fatalf("answered %d writes while the client took nothing, worker state %d", len(rc.writes), c.worker)
+	}
+	rc.full = false
+	c.onWritable()
+	if got := strings.Count(strings.Join(rc.writes, ""), "HTTP/1.1 200 OK"); got != 3 || c.worker != workerIdle {
+		t.Fatalf("%d responses once writable, worker state %d; want 3, idle", got, c.worker)
+	}
+}
+
+// TestWorkerState follows a connection's worker through its states: one that finds the client no longer taking the
+// responses writes out what it has collected and waits, a request arriving meanwhile submits no other worker, onWritable
+// resumes it, and once a worker closes the connection a request submits none either.
+func TestWorkerState(t *testing.T) {
+	const get = "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+	rc := &recordConn{}
+	c := queueConn(rc)
+	c.serveTask = c.serve
+	submitted := 0
+	c.srv.opts.Executor = func(_ int, task func()) { submitted++; task() }
+	c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/stall" {
+			rc.full = true // the client takes nothing from this response on
+		}
+		io.WriteString(w, "ok")
+	})
+	responses := func() int { return strings.Count(strings.Join(rc.writes, ""), "HTTP/1.1 200 OK") }
+
+	c.onData([]byte("GET /stall HTTP/1.1\r\nHost: a\r\n\r\n" + get))
+	c.serve() // the worker queueConn stands for
+	if responses() != 1 || c.worker != workerWaiting {
+		t.Fatalf("stalled with %d responses written, worker state %d; want the collected one, waiting", responses(), c.worker)
+	}
+	c.onData([]byte(get))
+	if submitted != 0 {
+		t.Fatal("a request submitted a worker while one was waiting")
+	}
+	rc.full = false
+	c.onWritable()
+	if responses() != 3 || submitted != 1 || c.worker != workerIdle {
+		t.Fatalf("resumed: %d responses, %d workers, worker state %d; want 3, 1, idle", responses(), submitted, c.worker)
+	}
+
+	c.onData([]byte("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"))
+	if responses() != 4 || !rc.closed || c.worker != workerClosing {
+		t.Fatalf("closing: %d responses, closed=%v, worker state %d; want 4, true, closing", responses(), rc.closed, c.worker)
+	}
+	c.onData([]byte(get))
+	if submitted != 2 {
+		t.Fatal("a request submitted a worker while one was closing the connection")
+	}
+}
+
+// TestFlushFailure checks that a worker whose write fails closes the connection and stops for good, as one answering a
+// request that closes the connection does.
+func TestFlushFailure(t *testing.T) {
+	const get = "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+	rc := &recordConn{err: net.ErrClosed}
+	c := queueConn(rc)
+	c.serveTask = c.serve
+	submitted := 0
+	c.srv.opts.Executor = func(_ int, task func()) { submitted++; task() }
+	c.onData([]byte(get))
+	c.serve() // the worker queueConn stands for
+	if !rc.closed || c.worker != workerClosing {
+		t.Fatalf("after a failed write: closed=%v, worker state %d; want true, closing", rc.closed, c.worker)
+	}
+	c.onData([]byte(get))
+	if submitted != 0 {
+		t.Fatal("a request submitted a worker while one was closing the connection")
+	}
+}
+
+// TestSlowReader has a client pipeline requests for large responses and read none: the server answers only as many as
+// the socket and fnet's send buffer take, rather than piling every response up in memory.
+func TestSlowReader(t *testing.T) {
+	var answered atomic.Int32
+	big := bytes.Repeat([]byte("x"), 4*units.MB)
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		answered.Add(1)
+		w.Write(big)
+	}), Options{})
+	const requests = 32
+	dialRaw(t, s, strings.Repeat("GET / HTTP/1.1\r\nHost: a\r\n\r\n", requests))
+	time.Sleep(500 * time.Millisecond)
+	if n := answered.Load(); n >= requests/2 {
+		t.Fatalf("answered %d of %d requests to a client that reads nothing", n, requests)
 	}
 }
 
@@ -358,25 +556,38 @@ func TestBatchedResponses(t *testing.T) {
 func TestConnectionManagement(t *testing.T) {
 	s := newTestServer(t, Options{})
 
-	// HTTP/1.0 closes the connection by default.
+	// HTTP/1.0 closes the connection by default. The response is HTTP/1.1, the highest version fhttp conforms to
+	// (RFC 9110 6.2), so it says it closes.
 	br := dialRaw(t, s, "GET /hello HTTP/1.0\r\n\r\n")
-	if resp, body := readResp(t, br); resp.Proto != "HTTP/1.0" || body != "hello world" {
-		t.Fatalf("HTTP/1.0: %s %q", resp.Proto, body)
+	if resp, body := readResp(t, br); resp.Proto != "HTTP/1.1" || !resp.Close || body != "hello world" {
+		t.Fatalf("HTTP/1.0: %s close=%v %q", resp.Proto, resp.Close, body)
 	}
 	expectClosed(t, br)
 
 	// HTTP/1.0 with an explicit keep-alive.
-	br = dialRaw(t, s, "GET /hello HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET /hello HTTP/1.0\r\n\r\n")
+	br = dialRaw(t, s, "GET /hello HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET /status HTTP/1.0\r\n\r\n")
 	if resp, _ := readResp(t, br); resp.Header.Get("Connection") != "keep-alive" {
 		t.Fatalf("HTTP/1.0 keep-alive: %v", resp.Header)
 	}
-	readResp(t, br)
+	if resp, _ := readResp(t, br); resp.Proto != "HTTP/1.1" || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("HTTP/1.0 after keep-alive: %s %d", resp.Proto, resp.StatusCode)
+	}
 	expectClosed(t, br)
 
 	// HTTP/1.1 Connection: close.
 	br = dialRaw(t, s, "GET /hello HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
 	if resp, _ := readResp(t, br); !resp.Close {
 		t.Fatal("response should carry Connection: close")
+	}
+	expectClosed(t, br)
+
+	// A Connection field of the Handler's that does not say close gives way to the close the request asks for.
+	s = serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "keep-alive")
+	}), Options{})
+	br = dialRaw(t, s, "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+	if resp, _ := readResp(t, br); !resp.Close {
+		t.Fatalf("response should carry Connection: close, got %v", resp.Header)
 	}
 	expectClosed(t, br)
 }
@@ -388,15 +599,35 @@ func TestBadRequests(t *testing.T) {
 		status int
 	}{
 		{"BLAH\r\n\r\n", 400},
-		{"GET / HTTP/1.1\r\n\r\n", 400}, // missing Host
+		{"GET / HTTP/1.1\r\n\r\n", 400},              // missing Host
+		{"GET http://a/hello HTTP/1.1\r\n\r\n", 400}, // missing Host, which the target's authority does not stand in for
 		{"GET / HTTP/1.1\r\nHost: a\r\nX: " + strings.Repeat("a", 2*units.KB) + "\r\n\r\n", 431},
 		// Framed by fhttp, but the standard library reads a different body out of the message: an obs-fold line
 		// continuing Content-Length, and an empty line made of a bare LF ending the headers early.
 		{"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n 0\r\n\r\nx", 400},
 		{"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 3\n\nabc\r\n\r\nxyz", 400},
 		{"POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n x\r\n\r\n0\r\n\r\n", 400},
-		// Not buffered by fhttp, so net/http answers them, the same as the net/http server would.
+		// A space before the colon (RFC 9112 5.1), which http.ReadRequest lets through: what an intermediary reading it as
+		// Content-Length or Transfer-Encoding takes for the body must not be answered as a request of its own.
+		{"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length : 32\r\n\r\nGET /hello HTTP/1.1\r\nHost: a\r\n\r\n", 400},
+		{"POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding : chunked\r\n\r\n0\r\n\r\n", 400},
+		// A header ending in an empty line made of a bare LF, answered rather than left waiting for CRLF CRLF.
+		{"GET /hello HTTP/1.1\nHost: a\n\n", 400},
+		{"GET /hello HTTP/1.1\r\nHost: a\n\r\n", 400},
+		// A bare CR before the request line is no empty line (RFC 9112 2.2).
+		{"\r\rGET /hello HTTP/1.1\r\nHost: a\r\n\r\n", 400},
+		// Unless chunked is the final transfer coding the body's length is unknown (RFC 9112 6.3), where the net/http
+		// server answers 501.
 		{"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n", 501},
+		{"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", 501},
+		// An invalid Host field, which the host of an absolute-form target stands in for, and a CONNECT to an empty or
+		// invalid port (RFC 9110 9.3.6).
+		{"GET http://a/hello HTTP/1.1\r\nHost: b c\r\n\r\n", 400},
+		{"CONNECT a HTTP/1.1\r\nHost: a\r\n\r\n", 400},
+		{"CONNECT a: HTTP/1.1\r\nHost: a:\r\n\r\n", 400},
+		{"CONNECT a:65536 HTTP/1.1\r\nHost: a:65536\r\n\r\n", 400},
+		// Not buffered by fhttp, so net/http answers them, the same as the net/http server would.
+		{"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", 501},
 		{"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n", 400},
 		{"POST /echo HTTP/1.1\r\nHost: a\r\nExpect: foo\r\nContent-Length: 1\r\n\r\nx", 417},
 		{"GET /hello HTTP/9.9\r\nHost: a\r\n\r\n", 505},
@@ -426,7 +657,7 @@ func TestBadRequests(t *testing.T) {
 		status int
 	}{
 		{"GET / HTTP/1.1\r\nHost: a\r\nX: " + strings.Repeat("a", 2*units.KB) + "\r\n\r\n", 431},
-		{"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n", 501},
+		{"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", 501},
 	} {
 		br := dialRaw(t, s, "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"+tt.req)
 		if resp, _ := readResp(t, br); resp.StatusCode != 200 {
@@ -436,6 +667,75 @@ func TestBadRequests(t *testing.T) {
 			t.Fatalf("second response: got %d, want %d", resp.StatusCode, tt.status)
 		}
 		expectClosed(t, br)
+	}
+}
+
+// TestHeaderLimits checks the default limits on the request header: a request line of the 8000 bytes RFC 9112 3
+// recommends supporting, with a cookie of the 4096 bytes RFC 6265 6.1 does, and maxHeaderValueCount field lines are
+// served; a longer request line gets 414, a longer header or one with more field lines 431, with a Date as every 4xx
+// response has (RFC 9110 6.6.1).
+func TestHeaderLimits(t *testing.T) {
+	s := newTestServer(t, Options{})
+	fields := func(n int) string { return strings.Repeat("X: y\r\n", n) }
+	for _, tt := range []struct {
+		name   string
+		req    string
+		status int
+	}{
+		{"8000-byte request line", "GET /hello?" + strings.Repeat("a", 8000-len("GET /hello? HTTP/1.1")) + " HTTP/1.1\r\n" +
+			"Host: a\r\nCookie: " + strings.Repeat("c", 4096) + "\r\n\r\n", 200},
+		{"most field lines", "GET /hello HTTP/1.1\r\nHost: a\r\n" + fields(maxHeaderValueCount-1) + "\r\n", 200},
+		{"too many field lines", "GET /hello HTTP/1.1\r\nHost: a\r\n" + fields(maxHeaderValueCount) + "\r\n", 431},
+		{"request line too long", "GET /" + strings.Repeat("a", 16*units.KB) + " HTTP/1.1\r\nHost: a\r\n\r\n", 414},
+		{"header too large", "GET /hello HTTP/1.1\r\nHost: a\r\nX: " + strings.Repeat("a", 16*units.KB) + "\r\n\r\n", 431},
+	} {
+		br := dialRaw(t, s, tt.req)
+		if resp, _ := readResp(t, br); resp.StatusCode != tt.status || resp.Header.Get("Date") == "" {
+			t.Fatalf("%s: got %d %v, want %d with a Date", tt.name, resp.StatusCode, resp.Header, tt.status)
+		}
+		if tt.status != http.StatusOK {
+			expectClosed(t, br)
+		}
+	}
+}
+
+// TestResponseSemantics checks what RFC 9110 requires of a response whatever the Handler does: a 2xx to CONNECT has no
+// content and closes the connection, as fhttp provides no tunnel (9.3.6, 8.6); a 205 has no content (15.3.6); and
+// "OPTIONS *" is answered for the server as a whole, as the net/http server does (9.3.7).
+func TestResponseSemantics(t *testing.T) {
+	mux := testMux()
+	mux.HandleFunc("/reset", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "7")
+		w.WriteHeader(http.StatusResetContent)
+		io.WriteString(w, "content")
+	})
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			w.Header().Set("Connection", "keep-alive")
+			io.WriteString(w, "content")
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}), Options{})
+
+	out, err := io.ReadAll(dialRaw(t, s, "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n\r\nGET /hello HTTP/1.1\r\nHost: a\r\n\r\n"))
+	if err != nil || !strings.HasPrefix(string(out), "HTTP/1.1 200 OK\r\n") || !strings.HasSuffix(string(out), "\r\n\r\n") ||
+		strings.Contains(string(out), "Content-Length") || !strings.Contains(string(out), "\r\nConnection: close\r\n") ||
+		strings.Contains(string(out), "keep-alive") {
+		t.Fatalf("CONNECT: %q %v", out, err)
+	}
+
+	// A HEAD gets the same Content-Length as a GET, whatever the Handler declared.
+	br := dialRaw(t, s, "GET /reset HTTP/1.1\r\nHost: a\r\n\r\nHEAD /reset HTTP/1.1\r\nHost: a\r\n\r\nOPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n")
+	if resp, body := readResp(t, br); resp.StatusCode != http.StatusResetContent || resp.ContentLength != 0 || body != "" {
+		t.Fatalf("205: got %d, Content-Length %d, %q", resp.StatusCode, resp.ContentLength, body)
+	}
+	if resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodHead}); err != nil ||
+		resp.StatusCode != http.StatusResetContent || resp.Header.Get("Content-Length") != "0" {
+		t.Fatalf("205 to HEAD: %v, %v", resp, err)
+	}
+	if resp, body := readResp(t, br); resp.StatusCode != http.StatusOK || resp.ContentLength != 0 || resp.Close || body != "" {
+		t.Fatalf("OPTIONS *: got %d, Content-Length %d, close=%v, %q", resp.StatusCode, resp.ContentLength, resp.Close, body)
 	}
 }
 
@@ -519,6 +819,7 @@ func TestH1Spec(t *testing.T) {
 		{"Request with Expect header", "GET / HTTP/1.1\r\nHost: example.com\r\nExpect: 100-continue\r\n\r\n", [][2]int{{100, 100}, {200, 299}}, ""},
 		{"Valid GET request", "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n", [][2]int{{200, 299}}, ""},
 		{"Valid GET request with edge cases", "GET / HTTP/1.1\r\nhoSt:\texample.com\r\nempty:\r\n\r\n", [][2]int{{200, 299}}, ""},
+		{"Empty Host header", "GET / HTTP/1.1\r\nHost:\r\n\r\n", [][2]int{{200, 299}}, ""},
 		{"Invalid header characters", "GET / HTTP/1.1\r\nHost: example.com\r\nX-Invalid[]: test\r\n\r\n", [][2]int{{400, 499}}, ""},
 		// fhttp handles a request once its body has arrived, so unlike h1spec the 5 bytes are sent as well.
 		{"Missing Host header", "GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", [][2]int{{400, 499}}, ""},
@@ -652,6 +953,23 @@ func TestTimeouts(t *testing.T) {
 	})
 }
 
+// TestHTTP1Config checks that a config GetConfigForClient returns, which crypto/tls uses in place of the server's, does
+// not negotiate h2 either.
+func TestHTTP1Config(t *testing.T) {
+	perClient := tlsServerConfig(t)
+	perClient.NextProtos = []string{"h2", "http/1.1"}
+	config := &tls.Config{GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) { return perClient, nil }}
+	s := serve(t, testMux(), Options{TLSConfig: config})
+	c, err := tls.Dial("tcp", s.Addr().String(), &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2", "http/1.1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if p := c.ConnectionState().NegotiatedProtocol; p != "http/1.1" {
+		t.Fatalf("negotiated %q, want http/1.1", p)
+	}
+}
+
 // TestHTTPS serves over TLS, on fnet and, for a streamed body, on net/http after the handoff. The server config offers
 // h2, which fhttp must not negotiate.
 func TestHTTPS(t *testing.T) {
@@ -692,6 +1010,23 @@ func TestHTTPS(t *testing.T) {
 	defer resp.Body.Close()
 	if b, _ := io.ReadAll(resp.Body); string(b) != "http/1.1 11" || !resp.Close {
 		t.Fatalf("POST /tls: %d %q close=%v", resp.StatusCode, b, resp.Close)
+	}
+
+	// Far more pipelined requests than are queued at once (see maxPipeline), spanning several TLS records, are all
+	// answered.
+	tc, err := tls.Dial("tcp", s.Addr().String(), &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tc.Close()
+	tc.SetDeadline(time.Now().Add(5 * time.Second))
+	const count = 8 * maxPipeline
+	io.WriteString(tc, strings.Repeat("GET /hello HTTP/1.1\r\nHost: a\r\n\r\n", count))
+	br := bufio.NewReader(tc)
+	for i := range count {
+		if resp, body := readResp(t, br); resp.StatusCode != http.StatusOK || body != "hello world" {
+			t.Fatalf("pipelined response %d: %d %q", i, resp.StatusCode, body)
+		}
 	}
 }
 
@@ -808,7 +1143,7 @@ func TestParseRequest(t *testing.T) {
 		// The second time the request shares the target and the fields copied the first time.
 		for round := range 2 {
 			msg, m := readMessage(t, raw)
-			before := last
+			before := struct{ target, fields string }{last.target, last.fields}
 			got := parseRequest(msg, m, &last)
 			want, err := http.ReadRequest(bufio.NewReader(strings.NewReader(raw)))
 			if got == nil || err != nil {

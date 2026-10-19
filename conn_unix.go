@@ -4,6 +4,7 @@ package fnet
 
 import (
 	"bytes"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -21,11 +22,10 @@ import (
 //
 // Concurrency model: reading, the callbacks and closing are all done serially in the connection's task (see
 // notify and run), and the inbound buffer in is accessed only by the task; the send buffer and the close state
-// are guarded by mu, because Write/Close may come from any goroutine. Closing the fd is done inside mu as
-// well, which guarantees that whenever closed=false is seen while holding the lock the fd is valid, so no
+// are guarded by mu, because Write/Close may come from any goroutine. closed is set inside mu before the fd is
+// closed, which guarantees that whenever closed=false is seen while holding the lock the fd is valid, so no
 // write goes to the wrong object after the fd has been reused by a new connection.
 type conn struct {
-	// Small fields are packed together, so that conn can stay in the 176B size class (see TestConnSize).
 	state      atomic.Uint32 // pending events and scheduledBit, see notify
 	readPaused atomic.Bool   // reading has been paused
 	backlogged atomic.Bool   // out holds data; written while holding mu, read lock-free by the task (see handle)
@@ -41,7 +41,7 @@ type conn struct {
 
 	mu       sync.Mutex
 	out      bytepool.Buffer // send buffer, the data to send is out.Bytes()[outPos:]; empty when nothing is backed up
-	deadline atomic.Int64    // close deadline (UnixNano), 0 means no deadline; written by any goroutine, checked by the event loop
+	deadline atomic.Int64    // close deadline (UnixNano), 0 means no deadline, negative while lingering (see beginLinger); written by any goroutine, checked by the event loop
 
 	outPos   int
 	closeErr error          // close reason: nil means an explicit close, io.EOF means the peer closed its write direction; both drain the send buffer before closing
@@ -51,6 +51,7 @@ type conn struct {
 func (c *conn) RemoteAddr() net.Addr { return addrPortToTCPAddr(c.remote) }
 func (c *conn) Context() any         { return c.ctx }
 func (c *conn) SetContext(ctx any)   { c.ctx = ctx }
+func (c *conn) TaskKey() int         { return c.loop.taskKey(c.fd) }
 
 func (c *conn) LocalAddr() net.Addr {
 	c.mu.Lock()
@@ -160,6 +161,9 @@ func (c *conn) compactOut(size int) {
 	}
 }
 
+// Writable reports whether the send buffer holds no more than maxBacklog, see flush.
+func (c *conn) Writable() bool { return !c.backlogged.Load() || c.backlog() <= maxBacklog }
+
 // maxIovecs is the maximum number of data segments a single writev submits, i.e. IOV_MAX (1024 on both Linux
 // and macOS); beyond that the kernel returns EINVAL.
 const maxIovecs = 1024
@@ -172,10 +176,10 @@ func (c *conn) Close() error {
 func (c *conn) PauseRead() { c.readPaused.Store(true) }
 
 // ResumeRead resumes reading. Edge-triggered notification does not notify again for data that arrived while
-// paused, so the task is explicitly notified to read once.
+// paused, so the task is explicitly notified to read once, and to call ResumeHandler.OnResume.
 func (c *conn) ResumeRead() {
 	c.readPaused.Store(false)
-	c.notify(evRead)
+	c.notify(evRead | evResume)
 }
 
 // Detach first takes over the connection's task: once state goes from 0 (no task queued or running) to scheduledBit,
@@ -183,7 +187,7 @@ func (c *conn) ResumeRead() {
 func (c *conn) Detach() (net.Conn, error) {
 	for !c.state.CompareAndSwap(0, scheduledBit) {
 		c.mu.Lock()
-		closed := c.closed // a closed connection keeps scheduledBit set for good (see run)
+		closed := c.closed // a closed connection keeps scheduledBit set for good (see run), unless it lingers, and then closing is set
 		c.mu.Unlock()
 		if closed {
 			return nil, net.ErrClosed
@@ -219,7 +223,13 @@ func (c *conn) Detach() (net.Conn, error) {
 		return nil, err
 	}
 	if len(out) > 0 {
-		if _, err := nc.Write(out); err != nil {
+		// This write blocks, and the peer may not be reading: the connection's deadline bounds it, see SetDeadline.
+		if d := c.deadline.Load(); d > 0 {
+			nc.SetWriteDeadline(time.Unix(0, d))
+		}
+		_, err := nc.Write(out)
+		nc.SetWriteDeadline(time.Time{})
+		if err != nil {
 			nc.Close()
 			return nil, err
 		}
@@ -228,13 +238,24 @@ func (c *conn) Detach() (net.Conn, error) {
 }
 
 // SetDeadline only records the deadline, which the event loop checks once per second (see
-// loop.checkDeadlines).
+// loop.checkDeadlines). It leaves the deadline of a lingering connection alone, see beginLinger.
 func (c *conn) SetDeadline(t time.Time) {
 	var d int64
-	if !t.IsZero() {
-		d = t.UnixNano()
+	switch {
+	case t.IsZero():
+	case t.Unix() >= math.MaxInt64/int64(time.Second): // past 2262, beyond UnixNano: as good as never
+		d = math.MaxInt64
+	case t.Unix() < 0: // before 1970, and before 1678 beyond UnixNano: expired, and must not pass for a linger's
+		d = 1
+	default:
+		d = max(t.UnixNano(), 1)
 	}
-	c.deadline.Store(d)
+	for {
+		old := c.deadline.Load()
+		if old < 0 || c.deadline.CompareAndSwap(old, d) {
+			return
+		}
+	}
 }
 
 // sockaddrToAddrPort converts a TCP socket address; it returns the zero value for unsupported address types.

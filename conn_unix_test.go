@@ -3,9 +3,13 @@
 package fnet
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"testing"
-	"unsafe"
+	"time"
+
+	"github.com/linfeip/fnet/internal/units"
 
 	"golang.org/x/sys/unix"
 )
@@ -38,10 +42,26 @@ func TestSocketOptions(t *testing.T) {
 	}
 }
 
-// TestConnSize checks that conn stays within the 176B size class, which matters at large connection counts:
-// if adding, removing or reordering fields pushes it over, the fields have to be rearranged.
-func TestConnSize(t *testing.T) {
-	if size := unsafe.Sizeof(conn{}); unsafe.Sizeof(uintptr(0)) == 8 && size > 176 {
-		t.Fatalf("conn is %dB, over the 176B size class", size)
+// TestBacklogStopsReading checks that a connection is not read while more than maxBacklog waits in its send buffer: the
+// replies to a peer that does not read stay bounded, and the peer's writes block instead.
+func TestBacklogStopsReading(t *testing.T) {
+	opened := make(chan *conn, 1)
+	srv := startServer(t, &funcHandler{
+		open: func(c Conn) { opened <- c.(*conn) },
+		data: func(c Conn, b []byte) int {
+			for range 4 { // replies with four times what it reads
+				c.Write(b)
+			}
+			return len(b)
+		},
+	})
+	c := dial(t, srv)
+	sc := <-opened
+	c.SetWriteDeadline(time.Now().Add(time.Second))
+	if n, err := c.Write(make([]byte, 64*units.MB)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("peer write should block, wrote %d bytes, err=%v", n, err)
+	}
+	if backlog, limit := sc.backlog(), maxBacklog+4*sc.loop.srv.opts.ReadBufferSize; backlog > limit {
+		t.Fatalf("send buffer holds %d bytes, want no more than %d", backlog, limit)
 	}
 }

@@ -36,7 +36,8 @@ var (
 	// server is shut down.
 	ErrServerClosed = errors.New("fnet: server closed")
 	// ErrHandlerPanic is the OnClose reason when a callback panics: the connection is closed and the panic
-	// keeps propagating upwards, to be recovered by the executor. Linux/macOS only.
+	// keeps propagating upwards, to be recovered by the executor (on other platforms than Linux/macOS, it is recovered
+	// and logged right away).
 	ErrHandlerPanic = errors.New("fnet: handler panic")
 )
 
@@ -63,9 +64,39 @@ type Handler interface {
 	//
 	// Half-close is not supported: after EOF is read (the peer closed its write direction) the engine first
 	// sends out the data in the send buffer and then closes the connection, and writes after that return
-	// net.ErrClosed. A reply written synchronously in OnData is unaffected, but a reply written by another
-	// goroutine only after the EOF is discarded.
+	// net.ErrClosed. A reply written synchronously in OnData (or OnClosing, see ClosingHandler) is unaffected, but a
+	// reply written by another goroutine only after the EOF is discarded.
 	OnClose(c Conn, err error)
+}
+
+// ClosingHandler is a Handler with something to send before a connection goes away without having been closed through
+// Conn.Close, such as TLS's close_notify (see package ftls). The engine calls OnClosing when it closes such a connection
+// on its own: the peer closed it (err is io.EOF), its deadline expired (os.ErrDeadlineExceeded) or, on Linux/macOS, the
+// server is closing (ErrServerClosed). It is not called after Close, nor when the connection failed.
+//
+// OnClosing runs like the other callbacks, before OnClose, and the connection can still be written in it. After an
+// expired deadline, or when the server is closing, the connection is closed once it returns, without waiting for the
+// send buffer to drain, so what it writes goes out only as far as the socket takes it at once; on other platforms,
+// where writes block, they fail after a second.
+type ClosingHandler interface {
+	Handler
+	OnClosing(c Conn, err error)
+}
+
+// ResumeHandler is a Handler that keeps inbound data of its own while reading is paused, such as the plaintext package
+// ftls has decrypted: the engine calls OnResume once reading resumes after Conn.ResumeRead, like the other callbacks, so
+// that it can pass that data on without waiting for more to arrive, which a peer awaiting an answer never sends.
+type ResumeHandler interface {
+	Handler
+	OnResume(c Conn)
+}
+
+// WritableHandler is a Handler that holds back what it writes while Conn.Writable reports false, such as package fhttp,
+// which stops answering a client that does not take the answers: the engine calls OnWritable, like the other callbacks,
+// once the send buffer is back down to what Writable allows. Linux/macOS only: elsewhere Write blocks instead.
+type WritableHandler interface {
+	Handler
+	OnWritable(c Conn)
 }
 
 // Conn represents a TCP connection. Except for SetContext, all methods may be called concurrently from any
@@ -83,16 +114,30 @@ type Conn interface {
 	SetContext(ctx any)
 	// Write sends data. On Linux/macOS it never blocks: the data is written directly to the socket as far as
 	// possible, and the part that does not fit is copied into the connection's send buffer, from where the
-	// connection's task keeps sending once the socket becomes writable.
+	// connection's task keeps sending once the socket becomes writable. While more than 64KB waits there, the
+	// connection is not read (OnData is not called), so a peer that does not read what it is sent is slowed down by
+	// TCP flow control; what is written regardless of reading still adds up. A peer that writes more than the socket
+	// buffers hold before it starts reading deadlocks against a connection that echoes it, as against a blocking server.
 	// The caller may reuse b once it returns; it returns net.ErrClosed when the connection is already closed.
 	Write(b []byte) (n int, err error)
 	// Writev sends the several segments in bs in order, with the same semantics as Write, and no other write
 	// is interleaved between the segments. The data is handed to the kernel in a single writev, which saves
 	// the caller the copy of joining the segments into one block. bs is not modified.
 	Writev(bs [][]byte) (n int, err error)
+	// Writable reports whether no more than 64KB waits in the send buffer, the point past which the connection is not
+	// read (see Write): one that writes regardless of reading checks it before writing more, and waits for
+	// WritableHandler.OnWritable while it reports false. It always reports true on other platforms than Linux/macOS,
+	// where Write blocks.
+	Writable() bool
 	// Close closes the connection. Data in the send buffer that has not been sent yet is sent out in full
 	// before closing, even if an EOF from the peer is read in the meantime; on an error or an expired deadline
 	// it closes immediately. Writes after the call return net.ErrClosed.
+	//
+	// The socket is then closed in stages (RFC 9112 9.6), unless the peer has closed already: first only its write
+	// direction, so that a FIN follows the data, and what the peer still sends is read and discarded until it closes
+	// too, for at most about two seconds (one on other platforms). Closing a socket that is still receiving makes the kernel
+	// answer with an RST, which can make the peer drop what it has received but not read yet, such as the last
+	// response. OnClose does not wait for this.
 	Close() error
 	// PauseRead pauses reading (read backpressure): no more data is read from the socket and OnData is no
 	// longer called, until ResumeRead.
@@ -106,19 +151,20 @@ type Conn interface {
 	// Repeated calls have no additional effect, and a call after the connection is closed has no effect.
 	PauseRead()
 	// ResumeRead resumes reading. Data that was handed to OnData before the pause but left unconsumed is only
-	// passed to the callback again, joined with new data, once new data arrives.
+	// passed to the callback again, joined with new data, once new data arrives; a ResumeHandler is called right away.
 	ResumeRead()
 	// SetDeadline sets the connection's close deadline: when it expires the connection is closed immediately
-	// (without waiting for the send buffer to drain) and the err of OnClose is os.ErrDeadlineExceeded;
-	// the zero value cancels the deadline. Receiving data does not extend it automatically; whether to extend
-	// it is up to the caller.
+	// (without waiting for the send buffer to drain, after ClosingHandler.OnClosing) and the err of OnClose is
+	// os.ErrDeadlineExceeded; the zero value cancels the deadline. Receiving data does not extend it automatically;
+	// whether to extend it is up to the caller. It has no effect once the connection is closed.
 	// On Linux/macOS the deadline is checked once per second, so the actual close time may be up to about one
 	// second later than t.
 	SetDeadline(t time.Time)
 	// Detach takes the connection out of the engine and returns it as a standard library net.Conn, so that the
 	// rest of it can be served with blocking reads and writes (fhttp hands such connections to net/http). Read on
 	// the net.Conn first returns the data OnData left unconsumed, and the data still in the send buffer is
-	// written out before Detach returns. From then on the engine is done with the connection: no callback is
+	// written out before Detach returns, within the deadline when one is set (Detach fails once it expires). From then
+	// on the engine is done with the connection, the deadline included: no callback is
 	// invoked again (OnClose included), this Conn behaves as a closed one, and closing the net.Conn is up to the
 	// caller.
 	//
@@ -126,6 +172,12 @@ type Conn interface {
 	// the net.Conn. Detach waits for a running callback of the connection to return, so it must not be called
 	// from a callback. It returns net.ErrClosed when the connection is closed or a close has been requested.
 	Detach() (net.Conn, error)
+	// TaskKey returns the key the connection's tasks are handed to Options.Executor with, the same for the whole life
+	// of the connection. Work a callback hands to the same executor under this key lands on the connection's own
+	// queue, where the goroutine that ran the callback usually takes it next, on the same CPU, with the connection's
+	// data still in its caches (fhttp runs its Handlers this way). On other platforms than Linux/macOS, which have no
+	// Executor, it is a random key fixed when the connection is accepted.
+	TaskKey() int
 }
 
 // detachedConn is a connection taken out of the engine by Conn.Detach. Read first returns the data OnData left
@@ -160,15 +212,16 @@ type Options struct {
 	NumLoops int
 	// ReadBufferSize is the buffer size of a single read; 16KB when <=0. A connection's task borrows from the
 	// buffer pool only while reading and returns the buffer once the callback returns, so idle connections
-	// hold none, and the number of buffers held at the same time never exceeds the number of tasks currently
-	// in a callback. Linux/macOS only.
+	// hold none (only what OnData left unconsumed is kept, in a buffer of its size), and the number of read buffers held at
+	// the same time never exceeds the number of tasks currently in a callback. Linux/macOS only.
 	ReadBufferSize int
 	// Executor runs a connection's tasks (reading, invoking the Handler callbacks, draining the send buffer,
 	// closing): it is called once when a connection has events, a connection has at most one task at a time,
-	// and it is called again when more events arrive while one is being processed. key is a connection key,
-	// the same for all of its tasks, so an executor may use it to keep a connection's tasks on one queue.
+	// and it is called again when more events arrive while one is being processed. key is a connection key
+	// (Conn.TaskKey), the same for all of its tasks, so an executor may use it to keep a connection's tasks on one queue.
 	// Executor may be called from any goroutine (the event loops' workers, the executor's own goroutines, the
-	// application goroutines calling Write and Close) and must not block; the task must run asynchronously
+	// application goroutines calling Write, Close, ResumeRead and Detach, the deadline check, Server.Close) and must not
+	// block; the task must run asynchronously
 	// (it must not run directly on the caller's stack) and must not be dropped.
 	// When a callback panics the connection is closed with ErrHandlerPanic and the task panics, so Executor
 	// must recover, otherwise the process exits.

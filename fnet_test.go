@@ -329,6 +329,80 @@ func TestCloseReasons(t *testing.T) {
 	}
 }
 
+// closingHandler is a funcHandler that is a ClosingHandler as well.
+type closingHandler struct {
+	funcHandler
+	closing func(c Conn, err error)
+}
+
+func (h *closingHandler) OnClosing(c Conn, err error) { h.closing(c, err) }
+
+// TestClosingHandler checks that OnClosing comes before every close the engine makes on its own, with the close reason,
+// and that what it writes reaches the peer before the close; a connection the handler closes itself gets none.
+func TestClosingHandler(t *testing.T) {
+	type call struct {
+		callback string
+		err      error
+	}
+	cases := []struct {
+		closedBy string
+		reason   error // nil: no OnClosing
+	}{
+		{"peer", io.EOF},
+		{"deadline", os.ErrDeadlineExceeded},
+		{"server", ErrServerClosed},
+		{"handler", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.closedBy, func(t *testing.T) {
+			if tc.closedBy == "server" && runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+				t.Skip("the standard library implementation closes at once when the server closes")
+			}
+			opened := make(chan struct{}, 1)
+			calls := make(chan call, 2)
+			srv := startServer(t, &closingHandler{
+				funcHandler: funcHandler{
+					open: func(c Conn) {
+						switch tc.closedBy {
+						case "deadline":
+							c.SetDeadline(time.Now().Add(50 * time.Millisecond))
+						case "handler":
+							c.Close()
+						}
+						opened <- struct{}{}
+					},
+					close: func(c Conn, err error) { calls <- call{"OnClose", err} },
+				},
+				closing: func(c Conn, err error) {
+					c.Write([]byte("bye"))
+					calls <- call{"OnClosing", err}
+				},
+			})
+			c := dial(t, srv)
+			<-opened
+			switch tc.closedBy {
+			case "peer":
+				c.(*net.TCPConn).CloseWrite()
+			case "server":
+				srv.Close()
+			}
+			want, wantCalls := "", []call{{"OnClose", tc.reason}}
+			if tc.reason != nil {
+				want, wantCalls = "bye", append([]call{{"OnClosing", tc.reason}}, wantCalls...)
+			}
+			c.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if got, err := io.ReadAll(c); err != nil || string(got) != want {
+				t.Fatalf("received %q, err=%v, want %q and EOF", got, err, want)
+			}
+			for _, w := range wantCalls {
+				if got := <-calls; got != w {
+					t.Fatalf("got %s(%v), want %s(%v)", got.callback, got.err, w.callback, w.err)
+				}
+			}
+		})
+	}
+}
+
 // TestAddrs verifies RemoteAddr returns the peer address both in OnOpen and in OnClose where the
 // connection is already closed, and that LocalAddr returns the local side's address.
 func TestAddrs(t *testing.T) {
@@ -948,5 +1022,166 @@ func TestDetachClosed(t *testing.T) {
 	<-closed
 	if _, err := sc.Detach(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Detach after close: %v", err)
+	}
+}
+
+// TestDetachAfterPeerClose checks that Detach returns net.ErrClosed for a connection the engine closed on its own (the
+// peer closed it), rather than wait for a read loop that has ended.
+func TestDetachAfterPeerClose(t *testing.T) {
+	opened := make(chan Conn, 1)
+	closed := make(chan struct{})
+	srv := startServer(t, &funcHandler{
+		open:  func(c Conn) { opened <- c },
+		close: func(c Conn, err error) { close(closed) },
+	})
+	dial(t, srv).Close()
+	sc := <-opened
+	<-closed
+	detached := make(chan error, 1)
+	go func() {
+		_, err := sc.Detach()
+		detached <- err
+	}()
+	select {
+	case err := <-detached:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Detach after the peer closed: %v, want net.ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Detach after the peer closed did not return")
+	}
+}
+
+// TestNoDataWhilePausedAfterClose checks that data which arrives while reading is paused is not passed to OnData once
+// the connection is closed.
+func TestNoDataWhilePausedAfterClose(t *testing.T) {
+	opened := make(chan Conn, 1)
+	closed := make(chan struct{})
+	var received atomic.Int32
+	srv := startServer(t, &funcHandler{
+		open:  func(c Conn) { opened <- c },
+		data:  func(c Conn, b []byte) int { received.Add(1); return len(b) },
+		close: func(c Conn, err error) { close(closed) },
+	})
+	client := dial(t, srv)
+	sc := <-opened
+	sc.PauseRead()
+	client.Write([]byte("while paused"))
+	time.Sleep(100 * time.Millisecond)
+	sc.Close()
+	<-closed
+	if n := received.Load(); n != 0 {
+		t.Fatalf("OnData called %d times on a paused connection", n)
+	}
+}
+
+// TestDeadlineWhileWriting checks that the deadline closes a connection whose callback writes far more than a peer that
+// does not read takes: on Linux/macOS the writes are buffered, on other platforms they block until the deadline.
+func TestDeadlineWhileWriting(t *testing.T) {
+	reasons := make(chan error, 1)
+	srv := startServer(t, &funcHandler{
+		data: func(c Conn, b []byte) int {
+			c.SetDeadline(time.Now().Add(200 * time.Millisecond))
+			chunk := make([]byte, units.MB)
+			for range 64 {
+				if _, err := c.Write(chunk); err != nil {
+					break
+				}
+			}
+			return len(b)
+		},
+		close: func(c Conn, err error) { reasons <- err },
+	})
+	dial(t, srv).Write([]byte("go"))
+	select {
+	case err := <-reasons:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("OnClose(%v), want os.ErrDeadlineExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the deadline did not close the connection")
+	}
+}
+
+// TestListenersClosedWhileClosing checks that a client connecting while the server waits for its connections to close
+// is refused, rather than left in the listen queue until the server has gone.
+func TestListenersClosedWhileClosing(t *testing.T) {
+	inCallback, release := make(chan struct{}), make(chan struct{})
+	srv, err := NewServer("127.0.0.1:0", &funcHandler{
+		data: func(c Conn, b []byte) int {
+			close(inCallback)
+			<-release // Close waits for this callback
+			return len(b)
+		},
+	}, Options{NumLoops: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	dial(t, srv).Write([]byte("x"))
+	<-inCallback
+	closed := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(closed)
+	}()
+	defer func() {
+		close(release)
+		<-closed
+	}()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		c, err := net.DialTimeout("tcp", srv.Addr().String(), time.Second)
+		if err != nil {
+			return // refused
+		}
+		c.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("still accepting connections while closing")
+		}
+	}
+}
+
+// TestLingeringClose has the peer go on sending while the server answers and closes: closing the socket with that data
+// unread would answer it with an RST, so the server lingers instead, and the peer reads the answer and then EOF rather
+// than ECONNRESET. OnClose does not wait for the linger.
+func TestLingeringClose(t *testing.T) {
+	reasons := make(chan error, 1)
+	srv := startServer(t, &funcHandler{
+		data: func(c Conn, b []byte) int {
+			c.Write([]byte("answer")) // fails once closed, when more data comes in the round that closes
+			c.Close()
+			return len(b)
+		},
+		close: func(c Conn, err error) { reasons <- err },
+	})
+	c := dial(t, srv)
+	go c.Write(make([]byte, 4*units.MB)) // far more than the server reads before it closes
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if got, err := io.ReadAll(c); err != nil || string(got) != "answer" {
+		t.Fatalf("received %q, err=%v, want the answer and EOF", got, err)
+	}
+	select {
+	case err := <-reasons:
+		if err != nil {
+			t.Fatalf("OnClose(%v), want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnClose was not called")
+	}
+}
+
+// TestCloseEndsLinger checks that a lingering socket does not hold up Server.Close.
+func TestCloseEndsLinger(t *testing.T) {
+	closed := make(chan struct{}, 1)
+	srv := startServer(t, &funcHandler{
+		open:  func(c Conn) { c.Close() },
+		close: func(Conn, error) { closed <- struct{}{} },
+	})
+	dial(t, srv)
+	<-closed
+	start := time.Now()
+	srv.Close()
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Close took %v, waiting for the linger", elapsed)
 	}
 }

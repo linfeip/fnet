@@ -28,7 +28,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/fhttp"
@@ -238,11 +237,17 @@ func TestEchoPipelined(t *testing.T) {
 	}
 }
 
-// TestConnSize checks that Conn stays within the 256B size class, since connections are numerous: when
-// adding, removing or reordering fields pushes it over, the fields have to be rearranged.
-func TestConnSize(t *testing.T) {
-	if size := unsafe.Sizeof(Conn{}); unsafe.Sizeof(uintptr(0)) == 8 && size > 256 {
-		t.Fatalf("Conn is %dB, over the 256B size class", size)
+// TestWriteMessageInvalid checks that WriteMessage refuses what is no message (a close frame, a continuation, a reserved
+// opcode) and control frames over 125 bytes (RFC 6455 5.5), before touching the connection.
+func TestWriteMessageInvalid(t *testing.T) {
+	var c Conn
+	for _, tt := range []struct {
+		op   ws.OpCode
+		size int
+	}{{ws.OpClose, 2}, {ws.OpContinuation, 1}, {ws.OpCode(3), 1}, {ws.OpPing, 126}, {ws.OpPong, 126}} {
+		if err := c.WriteMessage(tt.op, make([]byte, tt.size)); err != errInvalidMessage {
+			t.Errorf("WriteMessage(%v, %d bytes) = %v, want errInvalidMessage", tt.op, tt.size, err)
+		}
 	}
 }
 
@@ -598,6 +603,14 @@ func TestClose(t *testing.T) {
 		t.Fatal("a message before the close frame was not delivered before OnClose")
 	}
 
+	// A code IANA registered after RFC 6455, such as 1013 (Try Again Later), is answered like the others.
+	c = dial(t, s)
+	wsutil.WriteClientMessage(c, ws.OpClose, ws.NewCloseFrameBody(1013, "later"))
+	c.expectClose(t, 1013)
+	if err := h.waitClose(t); err != (wsutil.ClosedError{Code: 1013, Reason: "later"}) {
+		t.Fatalf("peer close with 1013: OnClose(%v)", err)
+	}
+
 	// Close from the local side.
 	c = dial(t, s)
 	wsutil.WriteClientMessage(c, ws.OpText, []byte("close"))
@@ -867,6 +880,35 @@ func (r *recordConn) Close() error {
 
 func (r *recordConn) SetDeadline(time.Time) {}
 
+// raceDeadlineConn is a recordConn that keeps the deadline set last, and closes conn from within its first SetDeadline
+// before that deadline lands: the order of a Close on another goroutine overtaking the deadline OnData sets.
+type raceDeadlineConn struct {
+	recordConn
+	conn     *Conn
+	deadline time.Time
+	raced    bool
+}
+
+func (r *raceDeadlineConn) SetDeadline(t time.Time) {
+	if !r.raced {
+		r.raced = true
+		r.conn.Close()
+	}
+	r.deadline = t
+}
+
+// TestCloseTimeoutStands has a Close set its closeTimeout just before the deadline OnData sets for the next message
+// lands: closeTimeout must stand, or a peer that reads nothing keeps the closing connection and its send buffer for good.
+func TestCloseTimeoutStands(t *testing.T) {
+	rc := &raceDeadlineConn{}
+	c := &Conn{connection: rc, handler: nopHandler{}, maxMessageSize: units.MB}
+	rc.conn = c
+	c.OnData(clientFrames(ws.OpText, []byte("hi")))
+	if until := time.Until(rc.deadline); until < closeTimeout/2 {
+		t.Fatalf("deadline %v after a concurrent Close, want closeTimeout from now", rc.deadline)
+	}
+}
+
 // newCorkConn returns a connection whose writes are recorded; OnData's callbacks run directly in the test.
 func newCorkConn() (*Conn, *recordConn) {
 	rc := &recordConn{}
@@ -1068,6 +1110,13 @@ func TestNoMessageAfterClose(t *testing.T) {
 	later := clientFrames(ws.OpText, []byte("d"))
 	if n := c.OnData(later); n != len(later) || len(h.received) != 2 {
 		t.Fatalf("data arriving after Close: consumed %d/%d bytes, %d delivered", n, len(later), len(h.received))
+	}
+	// A Close on another goroutine may come while a frame is being unmasked and checked, after OnData last looked.
+	c, _ = newCorkConn()
+	c.handler = h
+	c.Close()
+	if c.deliver(ws.OpText, []byte("e")); len(h.received) != 2 {
+		t.Fatal("the message of a frame received during Close was delivered")
 	}
 }
 

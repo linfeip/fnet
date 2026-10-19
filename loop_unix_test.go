@@ -124,9 +124,9 @@ func TestCollectConnsDropsClosed(t *testing.T) {
 	if got := loopFds(l); !slices.Equal(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
-	l.mu.Lock()
+	l.collectMu.Lock()
 	n := len(l.conns)
-	l.mu.Unlock()
+	l.collectMu.Unlock()
 	if n != 2 {
 		t.Fatalf("the list holds %d connections, want the closed one dropped and 2 left", n)
 	}

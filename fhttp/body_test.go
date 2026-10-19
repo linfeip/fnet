@@ -3,6 +3,7 @@ package fhttp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -301,5 +303,138 @@ func TestHandoffClose(t *testing.T) {
 	}
 	if _, err := br.ReadByte(); err == nil {
 		t.Fatal("want the connection to be closed")
+	}
+}
+
+// TestEventStream checks that a client asking for an event stream (Server-Sent Events) is served by net/http: each event
+// arrives as soon as the Handler flushes it, and the Handler learns through the request's context that the client left.
+func TestEventStream(t *testing.T) {
+	left := make(chan struct{})
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		rc := http.NewResponseController(w)
+		for i := 0; ; i++ {
+			fmt.Fprintf(w, "data: %d\n\n", i)
+			if err := rc.Flush(); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			select {
+			case <-r.Context().Done():
+				close(left)
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}), Options{})
+	c, err := net.Dial("tcp", s.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprint(c, "GET /events HTTP/1.1\r\nHost: a\r\nAccept: text/event-stream\r\n\r\n")
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %v, %v", resp, err)
+	}
+	events := bufio.NewReader(resp.Body)
+	for i := range 3 { // the Handler never returns, so these come only if each is sent as it is flushed
+		if line, err := events.ReadString('\n'); err != nil || line != fmt.Sprintf("data: %d\n", i) {
+			t.Fatalf("event %d: %q %v", i, line, err)
+		}
+		events.ReadString('\n')
+	}
+	c.Close()
+	select {
+	case <-left:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the Handler was not told that the client left")
+	}
+}
+
+// TestBufferedRequestContext checks that the fnet path gives a Handler a connection context without allocating a
+// separate context per request, and that it is canceled when the client closes the connection.
+func TestBufferedRequestContext(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(canceled)
+	}), Options{})
+	c, err := net.Dial("tcp", s.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(c, "GET / HTTP/1.1\r\nHost: a\r\n\r\n"); err != nil {
+		c.Close()
+		t.Fatal(err)
+	}
+	<-started
+	c.Close()
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("buffered request context was not canceled")
+	}
+}
+
+// TestRequestContextValues checks that a request's context holds the values the net/http server puts in it, which
+// middleware may type-assert without checking.
+func TestRequestContextValues(t *testing.T) {
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, isServer := r.Context().Value(http.ServerContextKey).(*http.Server)
+		fmt.Fprint(w, isServer, r.Context().Value(http.LocalAddrContextKey).(net.Addr))
+	}), Options{})
+	want := fmt.Sprint(true, s.Addr())
+	if _, body := readResp(t, dialRaw(t, s, "GET / HTTP/1.1\r\nHost: a\r\n\r\n")); body != want {
+		t.Fatalf("got %q, want %q", body, want)
+	}
+}
+
+// TestCloseDuringFirstRequest closes the client while the Handler of the connection's first request runs, the Handler
+// leaving the request's context alone: onClose then reads what the worker set up for the connection (run with -race).
+func TestCloseDuringFirstRequest(t *testing.T) {
+	done := make(chan struct{})
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond) // the client closes meanwhile
+		close(done)
+	}), Options{})
+	c, err := net.Dial("tcp", s.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(c, "GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+	time.Sleep(100 * time.Millisecond) // not synchronized with the Handler, which would hide a race from the detector
+	c.Close()
+	<-done
+}
+
+// TestDerivedRequestContext checks that the contexts a Handler derives from a request's register with the connection's
+// context, which cancels them when the connection closes, even after the request was released: had each started a
+// goroutine watching the pooled context, that goroutine could read it after the release.
+func TestDerivedRequestContext(t *testing.T) {
+	c := queueConn(&recordConn{})
+	c.last = new(lastRequest)
+	p := parsedPool.Get().(*parsedRequest)
+	p.bind(c)
+	const count = 100
+	before := runtime.NumGoroutine()
+	var derived []context.Context
+	for range count {
+		ctx, cancel := context.WithTimeout(p.request.Context(), time.Hour)
+		defer cancel()
+		derived = append(derived, ctx)
+	}
+	if started := runtime.NumGoroutine() - before; started >= count/2 {
+		t.Fatalf("%d goroutines started for %d derived contexts", started, count)
+	}
+	p.release()
+	c.onClose(nil)
+	for i, ctx := range derived {
+		if ctx.Err() == nil {
+			t.Fatalf("derived context %d not canceled when the connection closed", i)
+		}
 	}
 }

@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-// A request whose body fhttp does not buffer (see errStreamBody) is served by net/http: the worker detaches the
+// A request fhttp cannot handle on its buffered path (see errHandoff) is served by net/http: the worker detaches the
 // connection from fnet (fnet.Conn.Detach) and hands it to an http.Server through a handoffListener, and that server
 // does everything for it, reading the body as it arrives. Keep-alive is off on that server, so the connection closes
 // after this request and the client's next connection is served by fnet again.
@@ -16,10 +16,14 @@ import (
 // handoff gives the connection to net/http from the request at the front of its unconsumed data on. The worker gets
 // here only after writing the responses to the earlier requests, so the responses keep their order.
 func (c *conn) handoff() {
+	// Detach writes out what the engine still holds of those responses, which IdleTimeout bounds, as it does on the fnet
+	// path: the client may not be reading.
+	c.connection.SetDeadline(deadlineAfter(c.srv.opts.IdleTimeout))
 	nc, err := c.connection.Detach()
 	if err != nil {
 		return // the connection is closed or closing
 	}
+	c.endContext() // that of the earlier requests, whose Handlers have returned
 	c.srv.handoffs.handoff(nc)
 }
 

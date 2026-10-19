@@ -43,8 +43,9 @@ const idleWords = MaxWorkers / 64
 // DefaultTaskPool is the default goroutine pool: one shard per P (based on GOMAXPROCS at package initialization), with
 // at most MaxWorkers workers and a queue capacity of 8192 per shard (about 128KB per shard), so at most
 // 512 × GOMAXPROCS workers, which any shard may use (see Pool.borrow). Workers start only once there are tasks, and a
-// worker started stays resident, so the number of goroutines grows with the number of callbacks that block at the same
-// time; a pool that only runs short tasks keeps a handful.
+// worker started stays resident. A worker that sees more tasks queued before running one makes sure another worker
+// comes for them, so the number of goroutines grows with the number of tasks queued at the same time: callbacks that
+// block raise it, and so do bursts of short tasks.
 //
 // The worker limit has to accommodate the number of callbacks that block at the same time: with the 4 workers per shard
 // it used to have, a workload where every callback blocked for 1ms or more reached only 10% to 17% of the throughput of
@@ -95,7 +96,8 @@ func (p *Pool) Submit(task func()) {
 }
 
 // SubmitTo is like Submit but submits to the shard selected by key (key modulo the number of shards): tasks with the
-// same key always go to the same queue and are run by that shard's workers.
+// same key always go to the same queue, run by that shard's workers, or by workers it borrows from other shards once all
+// of its own are busy (see Pool.borrow).
 func (p *Pool) SubmitTo(key int, task func()) {
 	p.shards[uint(key)%uint(len(p.shards))].submit(task)
 }

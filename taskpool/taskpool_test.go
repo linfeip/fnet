@@ -116,24 +116,34 @@ func TestWakeAfterIdle(t *testing.T) {
 }
 
 // TestFullQueue checks that when the only worker is blocked and the queue is full, a new task is run by a
-// temporary goroutine, which also takes along the tasks queued up behind it.
+// temporary goroutine, which also takes along the tasks queued up behind it. The last ones queued, as many as the queue
+// holds, may wait for the worker once the temporary goroutines are done.
 func TestFullQueue(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{})
-	p := New(1, 1, 2)
+	const capacity = 2
+	p := New(1, 1, capacity)
 	p.Submit(func() {
 		close(started)
 		<-release
 	})
 	<-started
 	const tasks = 100
-	var wg sync.WaitGroup
-	wg.Add(tasks)
+	var ran atomic.Int32
 	for range tasks {
-		p.Submit(wg.Done)
+		p.Submit(func() { ran.Add(1) })
 	}
-	waitGroup(t, &wg) // the worker is still blocked
+	for deadline := time.Now().Add(10 * time.Second); ran.Load() < tasks-capacity; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d tasks ran while the worker was blocked", ran.Load(), tasks)
+		}
+	}
 	close(release)
+	for deadline := time.Now().Add(10 * time.Second); ran.Load() < tasks; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d tasks ran once the worker was released", ran.Load(), tasks)
+		}
+	}
 }
 
 // TestPanicTask verifies a panicking task is logged and the worker goes on running the tasks after it.

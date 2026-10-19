@@ -33,9 +33,10 @@ type Server struct {
 	listenerPerLoop bool
 	// acceptMu is held for reading while a connection is accepted and counted in openConnsWg, and taken once for
 	// writing by Serve after setting draining, so that no connection is counted once it waits for them.
-	acceptMu sync.RWMutex
+	acceptMu       sync.RWMutex
+	acceptRetrying atomic.Bool // a retry of the accepts that ran out of resources is pending, see retryAccept
 
-	openConnsWg sync.WaitGroup // connections not yet closed: closed means OnClose returned; Serve waits for them before exiting
+	openConnsWg sync.WaitGroup // connections not yet closed: closed means OnClose returned and the fd is closed (see conn.endLinger); Serve waits for them before exiting
 	workersWg   sync.WaitGroup // the loops' workers; Serve stops them once every connection has closed
 	draining    atomic.Bool    // Serve is closing every connection: one being opened closes itself (see loop.watch)
 	stopping    atomic.Bool    // the workers are to exit
@@ -137,9 +138,10 @@ func (s *Server) Serve() error {
 	s.draining.Store(true)
 	s.acceptMu.Lock()
 	s.acceptMu.Unlock() //nolint:staticcheck // an empty critical section: it waits for the accepts under way
+	s.closeListeners()  // a client connecting from now on is refused, instead of waiting in the listen queue until the server has gone
 	for _, l := range s.loops {
 		for _, c := range l.collectConns(func(*conn) bool { return true }) {
-			c.requestClose(ErrServerClosed)
+			c.notify(evShutdown)
 		}
 	}
 	s.openConnsWg.Wait() // the closes are carried out by the connections' tasks, which the Executor runs
@@ -209,12 +211,20 @@ func (s *Server) tick() {
 }
 
 func (s *Server) release() {
-	for _, fd := range s.listenerFds {
-		unix.Close(fd)
-	}
+	s.closeListeners()
 	for _, l := range s.loops {
 		l.close()
 	}
+}
+
+// closeListeners closes the listening sockets once no accept can run on them any more (see acceptConn), and only once:
+// their fd numbers may be reused right after. An event already retrieved for one still finds it in its loop's
+// listenerFds, and acceptConn then returns without accepting.
+func (s *Server) closeListeners() {
+	for _, fd := range s.listenerFds {
+		unix.Close(fd)
+	}
+	s.listenerFds = nil
 }
 
 // acceptConn accepts a connection on listenerFd, a listener of loop l, with its open task pending (see loop.watch), and
@@ -232,7 +242,7 @@ func (s *Server) acceptConn(listenerFd int, l *loop) *conn {
 			c := &conn{fd: fd, loop: l, remote: remote}
 			c.task = c.run
 			c.state.Store(scheduledBit | evOpen)
-			s.openConnsWg.Add(1) // decremented again in close after the OnClose callback has finished
+			s.openConnsWg.Add(1) // decremented again once OnClose has returned and the fd is closed
 			return c
 		}
 		switch err {
@@ -244,9 +254,10 @@ func (s *Server) acceptConn(listenerFd int, l *loop) *conn {
 			// affects only that one connection, and accept(2) requires retrying as with EAGAIN, so the server must not
 			// stop because of it.
 		case unix.EMFILE, unix.ENFILE, unix.ENOBUFS, unix.ENOMEM:
-			// Resource exhaustion: back off briefly. The listener is edge-triggered, so the connections left waiting are
-			// accepted when the next one arrives.
-			time.Sleep(10 * time.Millisecond)
+			// Resource exhaustion: the connection stays in the listen queue, and the edge-triggered listener raises no
+			// new event for it when resources are freed, so accepting is retried later (see retryAccept), while the
+			// worker goes on serving the connections it has.
+			s.retryAccept()
 			return nil
 		default:
 			s.shutdown(os.NewSyscallError("accept", err))
@@ -254,6 +265,24 @@ func (s *Server) acceptConn(listenerFd int, l *loop) *conn {
 		}
 	}
 	return nil
+}
+
+// acceptRetryDelay is how long accepting waits after running out of resources, see retryAccept.
+const acceptRetryDelay = 10 * time.Millisecond
+
+// retryAccept accepts on every listener again after acceptRetryDelay, unless such a retry is pending already: descriptors
+// and memory are the process's, so whichever listener ran out, every one may have connections waiting. A retry that runs
+// out again schedules the next one; after Serve has begun closing, acceptConn returns without accepting.
+func (s *Server) retryAccept() {
+	if s.acceptRetrying.Swap(true) {
+		return
+	}
+	time.AfterFunc(acceptRetryDelay, func() {
+		s.acceptRetrying.Store(false)
+		for _, l := range s.loops {
+			l.acceptAll()
+		}
+	})
 }
 
 // listen creates n listening sockets on addr, sharing it through SO_REUSEPORT when n > 1, and returns the address

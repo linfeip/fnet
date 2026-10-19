@@ -3,7 +3,6 @@
 package fnet
 
 import (
-	"os"
 	"runtime"
 	"slices"
 	"sync"
@@ -24,7 +23,10 @@ type loop struct {
 	keySpan int // number of shard keys per loop
 
 	mu    sync.Mutex
-	conns []*conn // the connections registered with this loop, see collectConns
+	added []*conn // the connections watched since collectConns last took them over
+
+	collectMu sync.Mutex // serializes collectConns, which goes over conns without holding mu
+	conns     []*conn    // the connections registered with this loop, see collectConns; guarded by collectMu
 
 	blocked atomic.Int32 // the workers waiting in poller.Block; other loops' workers skip this loop meanwhile (see help)
 }
@@ -54,6 +56,13 @@ func (l *loop) watchListener(fd int) error {
 	return nil
 }
 
+// acceptAll accepts on every listening socket of the loop, see accept.
+func (l *loop) acceptAll() {
+	for _, fd := range l.listenerFds {
+		l.accept(fd)
+	}
+}
+
 // accept accepts the connections waiting on the loop's listening socket fd until there are none left; they belong to the
 // loop, or are spread over the loops in round-robin order when the loops share the listener (see
 // Server.listenerPerLoop). The first task of each watches it (see watch) and invokes OnOpen. The listener is
@@ -80,22 +89,29 @@ func (l *loop) watch(c *conn) bool {
 		return false
 	}
 	l.mu.Lock()
-	l.conns = append(l.conns, c)
+	l.added = append(l.added, c)
 	draining := l.srv.draining.Load()
 	l.mu.Unlock()
 	if draining {
-		c.requestClose(ErrServerClosed)
+		c.notify(evShutdown)
 	}
 	return true
 }
 
-// collectConns returns the connections still registered with the loop for which keep reports true; keep runs under
-// the lock, so it must be quick and must not call into user code. The ones that have taken themselves out of
-// connsByFd (see conn.close) are dropped from the list on the way, which is how the list catches up with them.
+// collectConns returns the connections still registered with the loop for which keep reports true; keep must be quick
+// and must not call into user code. It takes over the connections watched since its last call while holding mu, then
+// goes over them all without it, so that watch, which the first task of every new connection runs, does not wait for a
+// pass over a million connections. The ones that have taken themselves out of connsByFd (see conn.closeFd) are dropped
+// from the list on the way, which is how the list catches up with them.
 func (l *loop) collectConns(keep func(c *conn) bool) []*conn {
-	var kept []*conn
+	l.collectMu.Lock()
+	defer l.collectMu.Unlock()
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	added := l.added
+	l.added = nil
+	l.mu.Unlock()
+	l.conns = append(l.conns, added...)
+	var kept []*conn
 	live := l.conns[:0]
 	for _, c := range l.conns {
 		if connsByFd.lookup(c.fd) == c {
@@ -110,16 +126,13 @@ func (l *loop) collectConns(keep func(c *conn) bool) []*conn {
 	return kept
 }
 
-// checkDeadlines requests the close of connections whose deadline has passed; the Server calls it once every
+// checkDeadlines notifies the connections whose deadline has passed, which then close; the Server calls it once every
 // deadlineCheckInterval.
 func (l *loop) checkDeadlines() {
 	now := time.Now().UnixNano()
-	expired := l.collectConns(func(c *conn) bool {
-		d := c.deadline.Load()
-		return d != 0 && d <= now
-	})
+	expired := l.collectConns(func(c *conn) bool { return c.expiredBy(now) })
 	for _, c := range expired {
-		c.requestClose(os.ErrDeadlineExceeded)
+		c.notify(evExpired)
 	}
 }
 
@@ -195,27 +208,33 @@ func (w *worker) help() bool {
 	return false
 }
 
-// runBatch hands over the tasks of the connections in the batch just retrieved from l's Poller.
+// runBatch hands over the tasks of the connections in the batch just retrieved from l's Poller, then accepts if the
+// batch reported a listening socket: accepting until none is left takes a while during a burst of connections, and the
+// connections already reported ready need not wait for it.
 func (w *worker) runBatch(l *loop) {
+	accepting := false
 	for i := range w.batch.Len() {
 		fd, ev := w.batch.Event(i)
-		l.handleEvent(fd, ev)
+		accepting = l.handleEvent(fd, ev) || accepting
+	}
+	if accepting {
+		l.acceptAll()
 	}
 }
 
-// handleEvent notifies the connection with fd, reported ready by l's Poller, which submits its task to the Executor, or
-// accepts on the listening socket fd.
+// handleEvent notifies the connection with fd, reported ready by l's Poller, which submits its task to the Executor; it
+// reports whether fd is one of l's listening sockets instead, which runBatch accepts on.
 //
 // An event left over for a connection that has already closed finds no connection. The fd may even have been reused
 // by now, by a connection of this loop (which then only gets a spurious event, and reading it finds nothing) or of
 // another one (which must not be notified through this loop).
-func (l *loop) handleEvent(fd int, ev poll.Event) {
+func (l *loop) handleEvent(fd int, ev poll.Event) (listener bool) {
 	c := connsByFd.lookup(fd)
-	if c == nil && slices.Contains(l.listenerFds, fd) {
-		l.accept(fd)
-		return
+	if c == nil {
+		return slices.Contains(l.listenerFds, fd)
 	}
-	if c != nil && c.loop == l {
+	if c.loop == l {
 		c.notify(uint32(ev))
 	}
+	return false
 }

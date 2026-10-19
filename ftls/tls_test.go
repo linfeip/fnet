@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -171,6 +172,73 @@ func TestShutdown(t *testing.T) {
 	}
 }
 
+// recordingConn keeps what the client reads from the server.
+type recordingConn struct {
+	net.Conn
+	read bytes.Buffer
+}
+
+func (c *recordingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.read.Write(b[:n])
+	return n, err
+}
+
+// TestCloseNotify checks that a connection the engine closes on its own still sends close_notify (RFC 9112 9.8): after the
+// handshake the client reads an alert record, then EOF. crypto/tls takes a bare EOF for a close as well, so the record
+// is looked at directly, over TLS 1.2, which leaves the record type of an alert in the clear.
+func TestCloseNotify(t *testing.T) {
+	cases := []struct {
+		closedBy string
+		reason   error
+	}{
+		{"peer", io.EOF}, // without close_notify of its own
+		{"deadline", os.ErrDeadlineExceeded},
+		{"server", fnet.ErrServerClosed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.closedBy, func(t *testing.T) {
+			if tc.closedBy == "server" && runtime.GOOS == "windows" {
+				t.Skip("the standard library implementation closes at once when the server closes")
+			}
+			h := newTestHandler()
+			if tc.closedBy == "deadline" {
+				h.onOpen = func(c fnet.Conn) { c.SetDeadline(time.Now().Add(50 * time.Millisecond)) }
+			}
+			srv := serve(t, h, 0)
+			raw, err := net.Dial("tcp", srv.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			recorded := &recordingConn{Conn: raw}
+			c := tls.Client(recorded, &tls.Config{InsecureSkipVerify: true, MaxVersion: tls.VersionTLS12})
+			if err := c.Handshake(); err != nil {
+				t.Fatal(err)
+			}
+			wait(t, h.opened)
+			handshake := recorded.read.Len()
+			switch tc.closedBy {
+			case "peer":
+				raw.(*net.TCPConn).CloseWrite()
+			case "server":
+				srv.Close()
+			}
+			c.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+				t.Fatalf("client read %v, want io.EOF", err)
+			}
+			const alert = 21 // the content type of an alert record
+			if rest := recorded.read.Bytes()[handshake:]; len(rest) == 0 || rest[0] != alert {
+				t.Fatalf("the server sent %x after the handshake, want close_notify", rest)
+			}
+			if err := wait(t, h.closed); err != tc.reason {
+				t.Fatalf("OnClose err = %v, want %v", err, tc.reason)
+			}
+		})
+	}
+}
+
 // TestWritev writes frames from several goroutines at once: each Writev must arrive whole.
 func TestWritev(t *testing.T) {
 	const writers, size = 8, 20 * 1024 // a frame takes more than one record
@@ -301,6 +369,111 @@ func TestPauseRead(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("received %q after ResumeRead", got)
 		}
+	}
+}
+
+// heldConn holds back what the client writes once it has read from the server, until flush: over TLS 1.3 the client's
+// Finished and its first data then arrive together.
+type heldConn struct {
+	net.Conn
+	read bool
+	held []byte
+}
+
+func (c *heldConn) Read(b []byte) (int, error) {
+	c.read = true
+	return c.Conn.Read(b)
+}
+
+func (c *heldConn) Write(b []byte) (int, error) {
+	if !c.read {
+		return c.Conn.Write(b)
+	}
+	c.held = append(c.held, b...)
+	return len(b), nil
+}
+
+func (c *heldConn) flush() error {
+	_, err := c.Conn.Write(c.held)
+	c.held = nil
+	return err
+}
+
+// TestResumeDeliversKept has the handler pause reading in OnOpen while the client's first data arrives with the end of
+// the handshake: that data, decrypted while paused, comes as soon as reading resumes, though the client, waiting for an
+// answer, sends nothing more.
+func TestResumeDeliversKept(t *testing.T) {
+	received := make(chan string, 1)
+	h := newTestHandler()
+	h.onOpen = func(c fnet.Conn) { c.PauseRead() }
+	h.onData = func(c fnet.Conn, data []byte) int {
+		received <- string(data)
+		return len(data)
+	}
+	srv := serve(t, h, 0)
+	raw, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	held := &heldConn{Conn: raw}
+	c := tls.Client(held, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	if err := c.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	c.Write([]byte("hello"))
+	if err := held.flush(); err != nil {
+		t.Fatal(err)
+	}
+	conn := wait(t, h.opened)
+	time.Sleep(100 * time.Millisecond) // "hello" has been decrypted meanwhile, and kept
+	select {
+	case got := <-received:
+		t.Fatalf("OnData while paused: %q", got)
+	default:
+	}
+	conn.ResumeRead()
+	if got := wait(t, received); got != "hello" {
+		t.Fatalf("OnData after ResumeRead got %q, want %q", got, "hello")
+	}
+}
+
+// TestResumeRedeliversUnconsumed has the handler leave its data unconsumed and pause reading, which is resumed before
+// OnData returns, as fhttp's worker may do: the data comes again as soon as reading resumes, though the client, waiting
+// for an answer, sends nothing more.
+func TestResumeRedeliversUnconsumed(t *testing.T) {
+	received := make(chan string, 2)
+	h := newTestHandler()
+	first := true // accessed only by the connection's callbacks, which run serially
+	h.onData = func(c fnet.Conn, data []byte) int {
+		received <- string(data)
+		if first {
+			first = false
+			c.PauseRead()
+			c.ResumeRead()
+			return 0
+		}
+		return len(data)
+	}
+	c := dial(t, serve(t, h, 0))
+	c.Write([]byte("hello"))
+	for range 2 {
+		if got := wait(t, received); got != "hello" {
+			t.Fatalf("OnData got %q, want %q", got, "hello")
+		}
+	}
+}
+
+// TestWriteAfterPeerClose checks that a Write after the engine closed the connection on its own (the peer closed it
+// without close_notify, and OnClosing sent one) returns net.ErrClosed, as on fnet, rather than crypto/tls's own error.
+func TestWriteAfterPeerClose(t *testing.T) {
+	h := newTestHandler()
+	c := dial(t, serve(t, h, 0))
+	conn := wait(t, h.opened)
+	c.NetConn().Close()
+	wait(t, h.closed)
+	if _, err := conn.Write([]byte("x")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Write after the engine closed the connection: %v, want net.ErrClosed", err)
 	}
 }
 

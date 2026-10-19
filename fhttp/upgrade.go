@@ -33,10 +33,11 @@ type Protocol interface {
 // when the client sent data without waiting for the upgrade response, fhttp sets the deadline according to
 // ReadHeaderTimeout, and the new protocol should override it in OnData.
 //
-// The Handler must not use w after this call. http.ErrNotSupported is returned when w is not an fhttp
-// ResponseWriter (and cannot be obtained through Unwrap); an error is returned when the connection is already
-// closed, or when the client sent a follow-up request without waiting for the upgrade response, and the connection
-// is then closed (in the latter case a 400 is replied first).
+// The Handler must not use w after this call, unless it returns http.ErrNotSupported: w is not an fhttp
+// ResponseWriter (and cannot be obtained through Unwrap), or the request is HTTP/1.0, whose Upgrade field a server
+// ignores (RFC 9110 7.8) and to which no 1xx response may go (15.2). An error is returned as well when the connection is
+// already closed, or when the client sent a follow-up request without waiting for the upgrade response, and the
+// connection is then closed (in the latter case a 400 is replied first).
 func Upgrade(w http.ResponseWriter, newProtocol func(fnet.Conn) Protocol) error {
 	for {
 		if rw, ok := w.(*response); ok {
@@ -51,10 +52,22 @@ func Upgrade(w http.ResponseWriter, newProtocol func(fnet.Conn) Protocol) error 
 }
 
 func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error {
+	if !w.req.ProtoAtLeast(1, 1) {
+		return http.ErrNotSupported
+	}
 	w.upgraded = true
+	// Reading paused for a full queue (see maxPipeline) resumes before the new protocol takes over: resumed by serve
+	// afterwards, it would undo a pause the protocol makes itself.
+	c.mu.Lock()
+	resume := c.readPaused
+	c.readPaused = false
+	c.mu.Unlock()
+	if resume {
+		c.connection.ResumeRead()
+	}
 	p := newProtocol(c.connection)
 	c.mu.Lock()
-	if c.closed {
+	if c.closed.Load() {
 		c.mu.Unlock()
 		return net.ErrClosed
 	}
@@ -66,9 +79,12 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 		return errEarlyRequest
 	}
 	c.protocol.Store(&p)
-	// No HTTP requests are handled from now on: release the request queue, the cached peer address and what
-	// parseRequest shares (accessed only by the worker, and we are the worker right now).
-	c.queue, c.remoteAddr, c.last = nil, "", nil
+	// No HTTP requests are handled from now on: release the request queue and cached peer address. Keep the small
+	// lastRequest object because it holds the context of the request currently running the upgrade.
+	c.queue, c.remoteAddr = nil, ""
+	if c.last != nil {
+		c.last.target, c.last.fields = "", ""
+	}
 	if c.partial {
 		// Data the client sent without waiting for the upgrade response is handed to the new protocol only when
 		// data next arrives; until then the request-header timeout applies.
@@ -79,16 +95,19 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 	b := &w.out
 	b.AppendString("HTTP/1.1 101 Switching Protocols\r\n")
 	accept := w.header.Get("Sec-WebSocket-Accept")
-	if len(w.header) == 3 && accept != "" &&
+	// The usual WebSocket response goes out in one piece. Anything else goes through appendHeader, an accept value with a
+	// CR or LF included, which appendHeader turns into a space so that a Handler cannot inject fields.
+	if len(w.header) == 3 && accept != "" && validValue(accept) &&
 		strings.EqualFold(w.header.Get("Upgrade"), "websocket") &&
 		strings.EqualFold(w.header.Get("Connection"), "Upgrade") {
 		b.AppendString("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
 		b.AppendString(accept)
 		b.AppendString("\r\n\r\n")
 	} else {
+		delete(w.header, "Content-Length") // a 1xx response has neither (RFC 9110 8.6, RFC 9112 6.1)
+		delete(w.header, "Transfer-Encoding")
 		appendHeader(b, w.header)
 		b.AppendString("\r\n")
 	}
-	w.flush() // the responses before it and the 101 go out before the new protocol writes anything
-	return nil
+	return w.flush() // the responses before it and the 101 go out before the new protocol writes anything
 }

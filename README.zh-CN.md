@@ -4,7 +4,7 @@
 
 面向大量并发连接、低内存占用的 Go 高性能事件驱动网络库：在同一套事件循环上提供 TCP 引擎、兼容 `net/http` 的 HTTP/1.x 服务器和 WebSocket 服务端。
 
-底层采用主从 Reactor 模型，由原生 I/O 多路复用驱动：**Linux 使用 epoll，macOS 使用 kqueue**。其它平台（含 Windows）基于标准库、一连接一个 goroutine 实现同一套 API。
+底层采用主从 Reactor 模型，由原生 I/O 多路复用驱动：**Linux 使用 epoll，macOS 使用 kqueue**。其它平台（含 Windows）基于标准库实现同一套 API。
 
 ---
 
@@ -61,8 +61,9 @@ Conn.Write 没有积压时直接写 socket，其余进发送缓冲，可写时�
 
 - **并行 accept**：开启 `Options.ReusePort` 时，Linux 上每个子 Reactor 用自己的 socket 监听同一地址（`SO_REUSEPORT`），自己 accept 到的连接由自己处理，accept 并行进行，连接留在接受它的 worker 上；否则（macOS 上总是如此）每个地址一个 listener，按轮询分给各子 Reactor。Linux 上 keepalive 和 `TCP_NODELAY`（开启 `Options.NoDelay` 时）只在 listener 上设置一次，accept 出来的 socket 直接继承。
 - **一连接一任务**：读取、回调、关闭都在连接的任务里串行完成，同一连接的回调不会重叠且保序。没有每连接一个 goroutine，也没有入站队列。
-- **零拷贝读取，内核背压**：数据直接从借用的缓冲交给 `OnData`。回调返回之前不会再读取该连接，处理慢时由 TCP 流量控制限速，而不是在内存里堆积。
-- **HTTP**：回调里只找每个请求的结束位置（头部结束符 `\r\n\r\n`，以及不超过 `MaxBufferedBodyBytes`（默认 1MB）、带 `Content-Length` 或 chunked 的请求体）。HTTP/1.x 常规形式的请求由 `fhttp` 自己解析，逐字段与 `http.ReadRequest` 的结果一致，其余交给 `http.ReadRequest`；Handler 运行在 executor（`Options.HandlerExecutor`，默认是 `taskpool.DefaultTaskPool`）的 goroutine 上，只在连接有待处理请求时占用。请求在 Handler 返回后被复用，每个请求省掉分配（见[当前限制](#当前限制)）。一起排队的多个请求（pipelining）的响应合并成一次写出。更大的或分帧方式特殊的请求体（例如大文件上传）改由 `net/http` 流式处理：连接从 `fnet` 摘下（`Conn.Detach`），交给运行同一个 Handler 的内部 `http.Server`，处理完这个请求后关闭连接。
+- **零拷贝读取，内核背压**：数据直接从借用的缓冲交给 `OnData`。回调返回之前不会再读取该连接，发送缓冲积压超过 64KB 时也不读取，因此处理慢或客户端不读回复时由 TCP 流量控制限速，而不是在内存里堆积。
+- **优雅关闭**：本端关闭的连接先只关闭写方向，把对端仍在发送的数据读掉丢弃，最多约两秒，避免内核回复 RST 导致对端丢掉最后一个响应（RFC 9112 9.6）。引擎自行关闭连接时（对端 EOF、截止时间到期、服务器关闭），`ClosingHandler` 还能先写出数据；`ftls` 在这里发送 TLS close_notify。
+- **HTTP**：回调里只找每个请求的结束位置（头部结束符 `\r\n\r\n`，头部不超过 `MaxHeaderBytes`（默认 16KB）和 500 个字段行，以及不超过 `MaxBufferedBodyBytes`（默认 1MB）、带 `Content-Length` 或 chunked 的请求体）。HTTP/1.x 常规形式的请求由 `fhttp` 自己解析，逐字段与 `http.ReadRequest` 的结果一致，其余交给 `http.ReadRequest`；Handler 运行在 executor（`Options.Executor`，默认是 `taskpool.DefaultTaskPool`）的 goroutine 上，只在连接有待处理请求时占用。提交时使用连接的 `Conn.TaskKey`，所以 Handler 通常紧接着连接自己的任务、在同一个 goroutine 和 CPU 上运行。请求在 Handler 返回后被复用，每个请求省掉分配（见[当前限制](#当前限制)）；客户端连接关闭时 `Request.Context` 被取消。一起排队的多个请求（pipelining）的响应合并成一次写出；客户端不接收响应时（积压超过 64KB，见 `Conn.Writable`），在它接收之前不再继续应答。更大的或分帧方式特殊的请求体（例如大文件上传）改由 `net/http` 流式处理：连接从 `fnet` 摘下（`Conn.Detach`），交给运行同一个 Handler 的内部 `http.Server`，处理完这个请求后关闭连接。需要 `http.Flusher` 的 Server-Sent Events 请求也这样处理。
 - **WebSocket**：帧在连接的任务里切分、解掩码，直接回调 `OnMessage`，没有消息队列；处理同一批帧期间写出的回复会合并成一次写。
 - **TLS**：`ftls` 自己不实现 TLS 协议，握手和加解密都由标准库 `crypto/tls` 完成，它底下的 `net.Conn` 由连接的回调供给数据。阻塞式的握手放在协程（`iter.Pull`）里运行，`OnData` 每收到一段数据就恢复它一次，所以没有 goroutine 在等客户端；握手完成后，`OnData` 直接解密手头的 record，把明文交给业务。空闲的 TLS 连接不占 goroutine；流式请求体交给 `net/http` 时，TLS 会话一并移交。
 
@@ -95,6 +96,8 @@ if err != nil {
 }
 log.Fatal(srv.Serve())
 ```
+
+Handler 还可以实现几个可选接口：`ClosingHandler`（`OnClosing`，引擎自行关闭连接前写出数据）、`WritableHandler`（`OnWritable`，`Conn.Writable` 重新为 true 时恢复写出，仅 Linux/macOS）和 `ResumeHandler`（`OnResume`，把暂停读取期间自己留下的数据继续交出）。`Conn.TaskKey` 返回连接任务提交给 executor 时使用的 key，回调可以用它把后续工作提交到同一个队列。
 
 ### HTTP
 
@@ -159,7 +162,7 @@ srv, err := fhttp.NewServer(":8443", mux, fhttp.Options{
 })
 ```
 
-任何 `tls.Config` 都可以用（按 SNI 选证书或 autocert 用的 `GetCertificate`、客户端证书等）。ALPN 中会去掉 `h2`，只协商 HTTP/1.1（`acme-tls/1` 等其它协议保留），握手须在 `ReadHeaderTimeout` 内完成，`r.TLS` 与 `net/http` 一样会被设置。
+任何 `tls.Config` 都可以用（按 SNI 选证书或 autocert 用的 `GetCertificate`、客户端证书等）。ALPN 中会去掉 `h2`（`GetConfigForClient` 返回的配置同样如此），只协商 HTTP/1.1（`acme-tls/1` 等其它协议保留），握手须在 `ReadHeaderTimeout` 内完成，`r.TLS` 与 `net/http` 一样会被设置。
 
 自定义 TCP 协议直接包装它的 handler：`fnet.NewServer(":9443", ftls.NewHandler(echo{}, config, 0), fnet.Options{})`，最后一个参数是握手超时（0 表示 10s）。
 
@@ -202,7 +205,7 @@ func main() {
 
 Linux 上设置 `fhttp.Options{Engine: fnet.Options{ReusePort: true}}` 后，每个子 Reactor 都有自己的 listener。
 
-`fnet` 的回调以及 WebSocket 的 `OnMessage` / `OnClose` 由执行器执行（默认 `taskpool.DefaultTaskPool`，可通过 `fnet.Options.Executor` 替换），因此必须快速返回；`http.Handler`（以及在其中运行的 WebSocket `OnOpen`）始终运行在 `taskpool.DefaultTaskPool` 上。超时与各项上限在 `fnet.Options`、`fhttp.Options`、`websocket.Options` 中设置，详见其文档注释。
+`fnet` 的回调以及 WebSocket 的 `OnMessage` / `OnClose` 由执行器执行（默认 `taskpool.DefaultTaskPool`，可通过 `fnet.Options.Executor` 替换），因此必须快速返回；`http.Handler`（以及在其中运行的 WebSocket `OnOpen`）运行在 `fhttp.Options.Executor` 上（默认同样是 `taskpool.DefaultTaskPool`），可以阻塞。超时与各项上限在 `fnet.Options`、`fhttp.Options`、`websocket.Options` 中设置，详见其文档注释。
 
 ---
 
@@ -223,8 +226,9 @@ go test ./http -run XXX -bench GET   # GET 压测：fhttp、net/http、fiber对�
 
 ## 当前限制
 
-- 发送缓冲没有上限，也没有写超时：只发请求却从不读取的客户端会让它持续增长。
-- 不支持 HTTP/2：HTTPS 只有 HTTP/1.1。响应体完整缓存在内存中（不支持 `http.Flusher` / `http.Hijacker`），为流式请求体交给 `net/http` 的连接除外。
+- 没有写超时，发送缓冲也没有硬上限：积压超过 64KB 时连接暂停读取，从不读取的客户端不会让回复无限堆积；但应用自己主动写出的数据（例如广播）仍会让它增长，除非像 `fhttp` 那样先检查 `Conn.Writable`，再等待 `WritableHandler.OnWritable`。反过来，客户端在开始读取之前写入的数据超过 socket 缓冲能容纳的量，就会和回显它的连接互相等待而卡死，与阻塞式服务端的行为相同。
+- `fhttp` 交给 `net/http` 的请求沿用 `net/http` 的默认超时，读完请求头后不再有超时：读取流式请求体的 Handler 请用 `http.ResponseController.SetReadDeadline` 自行限定。
+- 不支持 HTTP/2：HTTPS 只有 HTTP/1.1。响应体完整缓存在内存中（不支持 `http.Flusher` / `http.Hijacker`），交给 `net/http` 的连接除外：带流式请求体的请求，以及 Server-Sent Events（`Accept` 中带有 `text/event-stream` 的请求，`EventSource` 总会发送）。这类连接和在 `net/http` 上一样，每条占一个 goroutine。
 - 请求是池化对象：`*http.Request`（含 header、URL 和请求体）只在 Handler 的 `ServeHTTP` 调用期间有效。返回后继续持有——放进字段、缓存，或交给那时仍在运行的 goroutine——读到的是后续请求的数据（数据竞争），因此不能使用 `http.TimeoutHandler`。需要留存的内容请自行拷贝；请求里的字符串（包括 header 值）都是拷贝，可以放心保存。
 - TLS 只支持服务端。`ftls` 依赖 `crypto/tls` 对临时性读错误的处理方式：连接继续可用，读到一半的 record 也保留，这一点由 `go test ./ftls` 检查，升级 Go 后请先跑一遍。自定义的 `fnet.Options.Executor` 不能把它的 goroutine 锁定到系统线程上（`LockOSThread`）。
 - WebSocket：不支持 permessage-deflate，发送的消息总是单帧。

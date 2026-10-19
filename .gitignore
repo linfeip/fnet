@@ -1,4 +1,25 @@
 # Autobahn TestSuite (see websocket/autobahn)
 /websocket/autobahn/reports/
 /websocket/autobahn/autobahn_server
+
+# Local notes
 *.local.md
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.iml
+
+# Go build, test and profiling artifacts
+*.test
+*.exe
+*.prof
+*.pprof
+coverage.out
+*.coverprofile
+go.work
+go.work.sum
+
+# OS metadata
+.DS_Store
+Thumbs.db
