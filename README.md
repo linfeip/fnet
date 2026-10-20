@@ -14,7 +14,7 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 - 🧵 **Zero-goroutine idle connections**: idle sockets stay on the poller and hold no goroutine and no buffer; the read buffer is borrowed only while a task is reading.
 - ⚡ **Direct, concurrency-safe writes**: `Conn.Write` / `Writev` can be called from any goroutine, never block, and go straight to the socket (`writev` for header + payload).
 - 🔌 **Custom TCP protocols**: implement `OnOpen` / `OnData` / `OnClose`, and tell the engine how many bytes you consumed.
-- 🛡️ **Standards compatible**: use `http.Handler` / `http.ServeMux` as is; WebSocket follows RFC 6455 (frame parsing by gobwas/ws).
+- 🛡️ **Standards compatible**: use `http.Handler` / `http.ServeMux` as is; WebSocket follows RFC 6455 (frame types and protocol checks from gobwas/ws).
 - 🔒 **TLS without a goroutine per connection**: HTTPS and WSS take one option (`fhttp.Options.TLSConfig`); the standard `crypto/tls` runs inside the connection's callbacks, and `ftls` adds TLS to any `fnet.Handler`.
 - ⏱️ **Deadline-style timeouts**: slow clients cannot hold a connection by trickling bytes.
 
@@ -32,7 +32,7 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 | `poll` | epoll / kqueue wrapper |
 | `internal/bytepool` | Size-class byte buffer pool |
 
-Dependencies are one-way: `websocket → fhttp → ftls → fnet → poll`, and `fnet → taskpool`.
+Dependencies are one-way: `websocket → fhttp → ftls → fnet → poll`, and `fnet`, `fhttp` → `taskpool`.
 
 ```text
 user Handler (the only place that sees application data)
@@ -63,7 +63,7 @@ to the send buffer, which the connection task flushes when the socket is writabl
 - **Parallel accept**: with `Options.ReusePort`, on Linux every sub-reactor listens on the address with a socket of its own (`SO_REUSEPORT`) and keeps the connections it accepts, so accepts run in parallel and a connection stays with the worker that accepted it; otherwise, and always on macOS, one listener per address feeds the sub-reactors in round-robin order. On Linux keepalive and `TCP_NODELAY` (with `Options.NoDelay`) are set once on the listener, which the accepted sockets inherit.
 - **One task per connection**: reading, callbacks and closing run serially in the connection's task, so the callbacks of one connection never overlap and stay in order. There is no goroutine per connection and no inbound queue.
 - **Zero-copy reads, kernel backpressure**: data is handed to `OnData` straight from a borrowed buffer. A connection is not read again until its callback returns, so a slow handler is throttled by TCP flow control instead of piling up memory.
-- **HTTP**: the callback only looks for the end of each request (the header terminator `\r\n\r\n`, then a `Content-Length` body of up to `MaxBufferedBodyBytes`, 1MB by default); parsing and the body are left to `http.ReadRequest`, and the Handler runs on a goroutine that exists only while the connection has pending requests. A larger or chunked body (say a big file upload) is streamed by `net/http` instead: the connection is detached from `fnet` (`Conn.Detach`) and handed to an internal `http.Server` running the same Handler, which closes it after that request.
+- **HTTP**: the callback only looks for the end of each request (the header terminator `\r\n\r\n`, then a `Content-Length` body of up to `MaxBufferedBodyBytes`, 1MB by default); parsing and the body are left to `http.ReadRequest` (a plain WebSocket upgrade request takes a fast path that fills in the `http.Request` itself), and the Handler runs on a goroutine of `taskpool.DefaultTaskPool`, held only while the connection has pending requests. A larger or chunked body (say a big file upload) is streamed by `net/http` instead: the connection is detached from `fnet` (`Conn.Detach`) and handed to an internal `http.Server` running the same Handler, which closes it after that request.
 - **WebSocket**: frames are split and unmasked inside the connection's task and passed to `OnMessage` without a message queue; replies written while handling a batch of frames are coalesced into one write.
 - **TLS**: `ftls` implements no TLS of its own. The standard `crypto/tls` does the handshake and the encryption, over a `net.Conn` fed by the connection's callbacks. Its blocking handshake runs as a coroutine (`iter.Pull`) that `OnData` resumes with each piece of data, so no goroutine waits for the client; from then on `OnData` decrypts the records at hand and passes the plaintext on. An idle TLS connection holds no goroutine, and a streamed request body goes to `net/http` together with the TLS session.
 
@@ -160,7 +160,7 @@ srv, err := fhttp.NewServer(":8443", mux, fhttp.Options{
 })
 ```
 
-Any `tls.Config` works (`GetCertificate` for SNI or autocert, client certificates, ...). Only HTTP/1.1 is offered through ALPN, the handshake has to complete within `ReadHeaderTimeout`, and `r.TLS` is set as with `net/http`.
+Any `tls.Config` works (`GetCertificate` for SNI or autocert, client certificates, ...). `h2` is dropped from ALPN, so only HTTP/1.1 is negotiated (other protocols such as `acme-tls/1` are kept), the handshake has to complete within `ReadHeaderTimeout`, and `r.TLS` is set as with `net/http`.
 
 For a custom TCP protocol, wrap its handler: `fnet.NewServer(":9443", ftls.NewHandler(echo{}, config, 0), fnet.Options{})`, where the last argument is the handshake timeout (0 means 10s).
 
@@ -203,13 +203,13 @@ func main() {
 
 On Linux, `fhttp.Options{Engine: fnet.Options{ReusePort: true}}` gives every sub-reactor a listener of its own.
 
-Callbacks run on the executor (`taskpool.DefaultTaskPool` by default, replaceable through `fnet.Options.Executor`), so they must return quickly. Timeouts and limits are set in `fnet.Options`, `fhttp.Options` and `websocket.Options`; see their doc comments.
+`fnet` callbacks and WebSocket `OnMessage` / `OnClose` run on the executor (`taskpool.DefaultTaskPool` by default, replaceable through `fnet.Options.Executor`), so they must return quickly; `http.Handler`, and with it WebSocket `OnOpen`, always runs on `taskpool.DefaultTaskPool`. Timeouts and limits are set in `fnet.Options`, `fhttp.Options` and `websocket.Options`; see their doc comments.
 
 ---
 
 ## Examples
 
-The examples are a separate module (`examples/go.mod`, built against the fnet in this repository), so their dependencies, such as fasthttp for the HTTP benchmark, stay out of fnet's own `go.mod`.
+The examples are a separate module (`examples/go.mod`, built against the fnet in this repository), so their dependencies, such as fiber for the HTTP benchmark, stay out of fnet's own `go.mod`.
 
 ```bash
 cd examples
@@ -217,7 +217,7 @@ go run ./echo        # TCP echo
 go run ./http        # HTTP: GET, forms, JSON, PUT/PATCH/DELETE/OPTIONS, chunked, multipart uploads
 go run ./http -addr :8443 -tls   # HTTPS, with a self-signed certificate generated at startup (curl -k)
 go run ./websocket   # WebSocket echo
-go test ./http -run XXX -bench GET   # GET benchmark: fhttp vs net/http vs fasthttp
+go test ./http -run XXX -bench GET   # GET benchmark: fhttp vs net/http vs fiber (fasthttp)
 ```
 
 ---

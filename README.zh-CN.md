@@ -14,7 +14,7 @@
 - 🧵 **空闲连接 0 协程常驻**：空闲套接字只挂在 Poller 上，不占用 goroutine，也不持有缓冲；读缓冲只在任务读取时借用。
 - ⚡ **并发安全的直接写**：`Conn.Write` / `Writev` 可在任意 goroutine 调用，永不阻塞，直接写 socket（头部 + 负载用 `writev` 一次写出）。
 - 🔌 **自定义 TCP 协议**：实现 `OnOpen` / `OnData` / `OnClose`，由你告诉引擎消费了多少字节。
-- 🛡️ **符合标准**：直接使用 `http.Handler` / `http.ServeMux`；WebSocket 遵循 RFC 6455（帧解析使用 gobwas/ws）。
+- 🛡️ **符合标准**：直接使用 `http.Handler` / `http.ServeMux`；WebSocket 遵循 RFC 6455（帧类型与协议校验使用 gobwas/ws）。
 - 🔒 **TLS 不需要每连接一个 goroutine**：HTTPS 和 WSS 只需一个选项（`fhttp.Options.TLSConfig`）；标准库 `crypto/tls` 直接在连接的回调里运行，`ftls` 可以给任意 `fnet.Handler` 加上 TLS。
 - ⏱️ **截止时间式超时**：慢速客户端无法靠一点一点送字节来占住连接。
 
@@ -32,7 +32,7 @@
 | `poll` | epoll / kqueue 封装 |
 | `internal/bytepool` | 按大小分级的字节缓冲池 |
 
-依赖方向是单向的：`websocket → fhttp → ftls → fnet → poll`，以及 `fnet → taskpool`。
+依赖方向是单向的：`websocket → fhttp → ftls → fnet → poll`，以及 `fnet`、`fhttp` → `taskpool`。
 
 ```text
 用户 Handler（只有它看到业务数据）
@@ -62,7 +62,7 @@ Conn.Write 没有积压时直接写 socket，其余进发送缓冲，可写时�
 - **并行 accept**：开启 `Options.ReusePort` 时，Linux 上每个子 Reactor 用自己的 socket 监听同一地址（`SO_REUSEPORT`），自己 accept 到的连接由自己处理，accept 并行进行，连接留在接受它的 worker 上；否则（macOS 上总是如此）每个地址一个 listener，按轮询分给各子 Reactor。Linux 上 keepalive 和 `TCP_NODELAY`（开启 `Options.NoDelay` 时）只在 listener 上设置一次，accept 出来的 socket 直接继承。
 - **一连接一任务**：读取、回调、关闭都在连接的任务里串行完成，同一连接的回调不会重叠且保序。没有每连接一个 goroutine，也没有入站队列。
 - **零拷贝读取，内核背压**：数据直接从借用的缓冲交给 `OnData`。回调返回之前不会再读取该连接，处理慢时由 TCP 流量控制限速，而不是在内存里堆积。
-- **HTTP**：回调里只找每个请求的结束位置（头部结束符 `\r\n\r\n`，以及不超过 `MaxBufferedBodyBytes`（默认 1MB）的 `Content-Length` 请求体），解析和请求体交给 `http.ReadRequest`；Handler 运行在只在连接有待处理请求时才存在的 goroutine 中。更大的或 chunked 的请求体（例如大文件上传）改由 `net/http` 流式处理：连接从 `fnet` 摘下（`Conn.Detach`），交给运行同一个 Handler 的内部 `http.Server`，处理完这个请求后关闭连接。
+- **HTTP**：回调里只找每个请求的结束位置（头部结束符 `\r\n\r\n`，以及不超过 `MaxBufferedBodyBytes`（默认 1MB）的 `Content-Length` 请求体），解析和请求体交给 `http.ReadRequest`（普通的 WebSocket 升级请求走快速路径，由 fhttp 自己填好 `http.Request`）；Handler 运行在 `taskpool.DefaultTaskPool` 的 goroutine 上，只在连接有待处理请求时占用。更大的或 chunked 的请求体（例如大文件上传）改由 `net/http` 流式处理：连接从 `fnet` 摘下（`Conn.Detach`），交给运行同一个 Handler 的内部 `http.Server`，处理完这个请求后关闭连接。
 - **WebSocket**：帧在连接的任务里切分、解掩码，直接回调 `OnMessage`，没有消息队列；处理同一批帧期间写出的回复会合并成一次写。
 - **TLS**：`ftls` 自己不实现 TLS 协议，握手和加解密都由标准库 `crypto/tls` 完成，它底下的 `net.Conn` 由连接的回调供给数据。阻塞式的握手放在协程（`iter.Pull`）里运行，`OnData` 每收到一段数据就恢复它一次，所以没有 goroutine 在等客户端；握手完成后，`OnData` 直接解密手头的 record，把明文交给业务。空闲的 TLS 连接不占 goroutine；流式请求体交给 `net/http` 时，TLS 会话一并移交。
 
@@ -159,7 +159,7 @@ srv, err := fhttp.NewServer(":8443", mux, fhttp.Options{
 })
 ```
 
-任何 `tls.Config` 都可以用（按 SNI 选证书或 autocert 用的 `GetCertificate`、客户端证书等）。ALPN 只提供 HTTP/1.1，握手须在 `ReadHeaderTimeout` 内完成，`r.TLS` 与 `net/http` 一样会被设置。
+任何 `tls.Config` 都可以用（按 SNI 选证书或 autocert 用的 `GetCertificate`、客户端证书等）。ALPN 中会去掉 `h2`，只协商 HTTP/1.1（`acme-tls/1` 等其它协议保留），握手须在 `ReadHeaderTimeout` 内完成，`r.TLS` 与 `net/http` 一样会被设置。
 
 自定义 TCP 协议直接包装它的 handler：`fnet.NewServer(":9443", ftls.NewHandler(echo{}, config, 0), fnet.Options{})`，最后一个参数是握手超时（0 表示 10s）。
 
@@ -202,13 +202,13 @@ func main() {
 
 Linux 上设置 `fhttp.Options{Engine: fnet.Options{ReusePort: true}}` 后，每个子 Reactor 都有自己的 listener。
 
-回调由执行器执行（默认 `taskpool.DefaultTaskPool`，可通过 `fnet.Options.Executor` 替换），因此必须快速返回。超时与各项上限在 `fnet.Options`、`fhttp.Options`、`websocket.Options` 中设置，详见其文档注释。
+`fnet` 的回调以及 WebSocket 的 `OnMessage` / `OnClose` 由执行器执行（默认 `taskpool.DefaultTaskPool`，可通过 `fnet.Options.Executor` 替换），因此必须快速返回；`http.Handler`（以及在其中运行的 WebSocket `OnOpen`）始终运行在 `taskpool.DefaultTaskPool` 上。超时与各项上限在 `fnet.Options`、`fhttp.Options`、`websocket.Options` 中设置，详见其文档注释。
 
 ---
 
 ## 示例
 
-示例是一个独立的 module（`examples/go.mod`，编译时使用本仓库里的 fnet），它的依赖（例如 HTTP 压测用到的 fasthttp）不会进入 fnet 自己的 `go.mod`。
+示例是一个独立的 module（`examples/go.mod`，编译时使用本仓库里的 fnet），它的依赖（例如 HTTP 压测用到的 fiber）不会进入 fnet 自己的 `go.mod`。
 
 ```bash
 cd examples
@@ -216,7 +216,7 @@ go run ./echo        # TCP echo
 go run ./http        # HTTP：GET、表单、JSON、PUT/PATCH/DELETE/OPTIONS、chunked、multipart 上传
 go run ./http -addr :8443 -tls   # HTTPS，启动时自动生成自签名证书（curl 需加 -k）
 go run ./websocket   # WebSocket echo
-go test ./http -run XXX -bench GET   # GET 压测：fhttp、net/http、fasthttp 对比
+go test ./http -run XXX -bench GET   # GET 压测：fhttp、net/http、fiber对比
 ```
 
 ---
