@@ -33,17 +33,10 @@ func TestExecutor(t *testing.T) {
 	}
 }
 
-// TestTaskKey checks that Conn.TaskKey is the key every task of the connection is handed to the Executor with.
+// TestTaskKey checks that every task of a connection is handed to the Executor with the same key.
 func TestTaskKey(t *testing.T) {
 	keys := make(chan int, 64)
-	taskKey := make(chan int, 1)
-	srv := startServerWith(t, &funcHandler{data: func(c Conn, b []byte) int {
-		select {
-		case taskKey <- c.TaskKey():
-		default:
-		}
-		return echo(c, b)
-	}}, Options{NumLoops: 2, Executor: func(key int, task func()) {
+	srv := startServerWith(t, &funcHandler{data: echo}, Options{NumLoops: 2, Executor: func(key int, task func()) {
 		select {
 		case keys <- key:
 		default:
@@ -57,10 +50,10 @@ func TestTaskKey(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	want := <-taskKey
+	want := <-keys
 	for len(keys) > 0 {
 		if key := <-keys; key != want {
-			t.Fatalf("a task was handed to the Executor with key %d, TaskKey is %d", key, want)
+			t.Fatalf("the tasks of one connection were handed to the Executor with keys %d and %d", want, key)
 		}
 	}
 }

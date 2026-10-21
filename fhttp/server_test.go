@@ -30,6 +30,7 @@ import (
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/internal/bytepool"
 	"github.com/linfeip/fnet/internal/units"
+	"github.com/linfeip/fnet/taskpool"
 )
 
 // tlsServerConfig returns a server configuration with a self-signed certificate, which the clients do not verify.
@@ -170,19 +171,15 @@ func TestClient(t *testing.T) {
 //go:noinline
 func runOnExecutor(task func()) { task() }
 
-// TestExecutor checks that the Handlers run as tasks of Options.Executor, keyed with the connection's fnet.Conn.TaskKey:
-// two requests sent one after the other on one connection are submitted with the same key.
+// TestExecutor checks that the Handlers run as tasks of Options.Executor, those of two requests sent one after the other
+// on one connection included.
 func TestExecutor(t *testing.T) {
 	onExecutor := make(chan bool, 1)
-	keys := make(chan int, 16)
 	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		stack := make([]byte, 16*units.KB)
 		onExecutor <- strings.Contains(string(stack[:runtime.Stack(stack, false)]), "runOnExecutor")
 		io.WriteString(w, "ok")
-	}), Options{Executor: func(key int, task func()) {
-		keys <- key
-		go runOnExecutor(task)
-	}})
+	}), Options{Executor: func(_ int, task func()) { go runOnExecutor(task) }})
 	c, err := net.Dial("tcp", s.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -202,9 +199,6 @@ func TestExecutor(t *testing.T) {
 		if !<-onExecutor {
 			t.Fatal("the Handler did not run as a task of Options.Executor")
 		}
-	}
-	if first, second := <-keys, <-keys; first != second {
-		t.Fatalf("the requests of one connection were submitted with keys %d and %d", first, second)
 	}
 }
 
@@ -297,7 +291,6 @@ func (c *recordConn) Close() error   { c.closed = true; return nil }
 func (c *recordConn) PauseRead()     { c.paused = true }
 func (c *recordConn) ResumeRead()    { c.paused = false }
 func (c *recordConn) Writable() bool { return !c.full }
-func (c *recordConn) TaskKey() int   { return 0 }
 
 func (c *recordConn) Write(b []byte) (int, error) {
 	if c.err != nil {
@@ -529,8 +522,8 @@ func TestReuseRequests(t *testing.T) {
 	}
 }
 
-// TestBatchedResponses checks that the responses to queued requests go out in a single write, and that a large body
-// is written without being copied, after what was collected before it.
+// TestBatchedResponses checks that the responses to queued requests go out in a single write, and that the largest body
+// still buffered is written without being copied, after what was collected before it.
 func TestBatchedResponses(t *testing.T) {
 	const get = "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"
 	rc := &recordConn{}
@@ -545,11 +538,274 @@ func TestBatchedResponses(t *testing.T) {
 
 	rc = &recordConn{}
 	c = queueConn(rc)
-	c.onData([]byte(get + "GET /big HTTP/1.1\r\nHost: a\r\n\r\n" + get))
+	full := strings.Repeat("x", maxBufferedBody)
+	c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/full" {
+			io.WriteString(w, full)
+			return
+		}
+		io.WriteString(w, "hello world")
+	})
+	c.onData([]byte(get + "GET /full HTTP/1.1\r\nHost: a\r\n\r\n" + get))
 	c.serve()
 	if len(rc.writes) != 2 || !strings.HasPrefix(rc.writes[0], "HTTP/1.1 200 OK") || !strings.Contains(rc.writes[0], "hello world") ||
-		len(rc.writes[0]) < 4*units.MB || strings.Count(rc.writes[1], "hello world") != 1 {
-		t.Fatalf("got %d writes, want the first response together with /big, then the last response", len(rc.writes))
+		!strings.Contains(rc.writes[0], fmt.Sprintf("Content-Length: %d\r\n", maxBufferedBody)) || !strings.HasSuffix(rc.writes[0], full) ||
+		strings.Count(rc.writes[1], "hello world") != 1 {
+		t.Fatalf("got %d writes, want the first response together with /full, then the last response", len(rc.writes))
+	}
+}
+
+// TestStreamedResponse checks how a body over maxBufferedBody goes out while the Handler writes it: in chunks of
+// maxBufferedBody after the responses collected before it, with the Content-Length the Handler declared, or until the
+// connection closes on HTTP/1.0, and not at all for a response without content.
+func TestStreamedResponse(t *testing.T) {
+	const get = "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"
+	rc := &recordConn{}
+	c := queueConn(rc)
+	c.onData([]byte(get + "GET /big HTTP/1.1\r\nHost: a\r\n\r\n" + get))
+	c.serve()
+	if want := 4*units.MB/maxBufferedBody + 1; len(rc.writes) != want || !strings.Contains(rc.writes[0], "hello world") {
+		t.Fatalf("got %d writes, want %d, the first with the response collected before /big", len(rc.writes), want)
+	}
+	br := bufio.NewReader(strings.NewReader(strings.Join(rc.writes, "")))
+	for i, want := range []int{11, 4 * units.MB, 11} {
+		if resp, body := readResp(t, br); len(body) != want || (i == 1) != (resp.ContentLength == -1) {
+			t.Fatalf("response %d: %d bytes, Content-Length %d", i, len(body), resp.ContentLength)
+		}
+	}
+
+	// Small writes go out in chunks of maxBufferedBody, but for the last one.
+	rc = &recordConn{}
+	c = queueConn(rc)
+	c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for range 300 {
+			io.WriteString(w, strings.Repeat("y", 1000))
+		}
+	})
+	c.onData([]byte(get))
+	c.serve()
+	wire := strings.Join(rc.writes, "")
+	if n := strings.Count(wire, fmt.Sprintf("\n%x\r\n", maxBufferedBody)); n != 300*1000/maxBufferedBody {
+		t.Fatalf("%d chunks of maxBufferedBody, want %d", n, 300*1000/maxBufferedBody)
+	}
+	if _, body := readResp(t, bufio.NewReader(strings.NewReader(wire))); body != strings.Repeat("y", 300*1000) {
+		t.Fatalf("small writes: %d bytes", len(body))
+	}
+
+	// Silence the log from the Handler panic, as TestClient does.
+	defer func(w io.Writer, flags int) { log.SetOutput(w); log.SetFlags(flags) }(log.Writer(), log.Flags())
+	defer slog.SetDefault(slog.Default())
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	payload := strings.Repeat("x", 100*units.KB)
+	write := func(w http.ResponseWriter) error {
+		_, err := io.WriteString(w, payload)
+		return err
+	}
+	declare := func(length string) func(http.ResponseWriter) error {
+		return func(w http.ResponseWriter) error {
+			w.Header().Set("Content-Length", length)
+			return write(w)
+		}
+	}
+	const head, http10 = "HEAD /hello HTTP/1.1\r\nHost: a\r\n\r\n", "GET /hello HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"
+	for _, tt := range []struct {
+		name      string
+		request   string
+		handle    func(http.ResponseWriter) error
+		err       error    // what handle returns
+		fields    []string // field lines the header has
+		absent    []string // field names the header has not
+		body      string   // what the client reads of the body
+		truncated bool     // the body ends before its length
+		closed    bool     // the connection is closed after the response
+	}{
+		{name: "chunked", request: get, handle: write, fields: []string{"Transfer-Encoding: chunked"}, absent: []string{"Content-Length"}, body: payload},
+		{name: "declared length", request: get, handle: declare("102400"), fields: []string{"Content-Length: 102400"},
+			absent: []string{"Transfer-Encoding"}, body: payload},
+		{name: "declared length short of a piece", request: get, handle: declare("30000"), err: http.ErrContentLength,
+			fields: []string{"Content-Length: 30000"}, truncated: true, closed: true},
+		{name: "declared length short of the last piece", request: get, handle: declare("70000"), fields: []string{"Content-Length: 70000"},
+			body: payload[:70000], closed: true},
+		{name: "declared length not reached", request: get, handle: declare("200000"), fields: []string{"Content-Length: 200000"},
+			body: payload, truncated: true, closed: true},
+		{name: "HTTP/1.0", request: http10, handle: write, fields: []string{"Connection: close"},
+			absent: []string{"Content-Length", "Transfer-Encoding"}, body: payload, closed: true},
+		{name: "HTTP/1.0 declared length", request: http10, handle: declare("102400"),
+			fields: []string{"Content-Length: 102400", "Connection: keep-alive"}, body: payload},
+		{name: "HEAD", request: head, handle: write, absent: []string{"Content-Length", "Transfer-Encoding"}},
+		{name: "HEAD declared length", request: head, handle: declare("102400"), fields: []string{"Content-Length: 102400"},
+			absent: []string{"Transfer-Encoding"}},
+		{name: "205", request: get, handle: func(w http.ResponseWriter) error {
+			w.WriteHeader(http.StatusResetContent)
+			return write(w)
+		}, fields: []string{"Content-Length: 0"}, absent: []string{"Transfer-Encoding"}},
+		{name: "upgrade after the body started", request: get, handle: func(w http.ResponseWriter) error {
+			write(w)
+			return Upgrade(w, func(fnet.Conn) Protocol { panic("upgraded") })
+		}, err: http.ErrNotSupported, fields: []string{"Transfer-Encoding: chunked"}, body: payload},
+		{name: "panic", request: get, handle: func(w http.ResponseWriter) error {
+			write(w)
+			panic("boom")
+		}, fields: []string{"Transfer-Encoding: chunked"}, body: payload[:maxBufferedBody], truncated: true, closed: true},
+	} {
+		rc := &recordConn{}
+		c := queueConn(rc)
+		var err error
+		c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { err = tt.handle(w) })
+		c.onData([]byte(tt.request))
+		c.serve()
+		wire := strings.Join(rc.writes, "")
+		header, _, _ := strings.Cut(wire, "\r\n\r\n")
+		for _, field := range tt.fields {
+			if !strings.Contains(header+"\r\n", "\r\n"+field+"\r\n") {
+				t.Errorf("%s: no %q in the header %q", tt.name, field, header)
+			}
+		}
+		for _, name := range tt.absent {
+			if strings.Contains(header, "\r\n"+name+":") {
+				t.Errorf("%s: %s in the header %q", tt.name, name, header)
+			}
+		}
+		method, _, _ := strings.Cut(tt.request, " ")
+		resp, readErr := http.ReadResponse(bufio.NewReader(strings.NewReader(wire)), &http.Request{Method: method})
+		if readErr != nil {
+			t.Fatalf("%s: %v", tt.name, readErr)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		if err != tt.err || string(body) != tt.body || (readErr != nil) != tt.truncated || rc.closed != tt.closed {
+			t.Errorf("%s: Write returned %v, read %d bytes (%v), closed=%v; want %v, %d bytes, truncated=%v, closed=%v",
+				tt.name, err, len(body), readErr, rc.closed, tt.err, len(tt.body), tt.truncated, tt.closed)
+		}
+	}
+}
+
+// TestStreamBackpressure has a Handler write a large body to a client that reads none of it for a while: the Handler is
+// held back once fnet has a piece or two waiting, rather than piling the body up in memory, and goes on once the client
+// reads, which gets all of it and the answer to the request pipelined behind it.
+func TestStreamBackpressure(t *testing.T) {
+	const size = 64 * units.MB
+	var written atomic.Int64
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/stream" {
+			io.WriteString(w, "hello world")
+			return
+		}
+		piece := make([]byte, 32*units.KB)
+		for range size / len(piece) {
+			if _, err := w.Write(piece); err != nil {
+				return
+			}
+			written.Add(int64(len(piece)))
+		}
+	}), Options{})
+	br := dialRaw(t, s, "GET /stream HTTP/1.1\r\nHost: a\r\n\r\nGET /hello HTTP/1.1\r\nHost: a\r\n\r\n")
+	time.Sleep(500 * time.Millisecond)
+	if n := written.Load(); n >= 16*units.MB { // the socket buffers take a few MB, fnet and the response 192KB
+		t.Fatalf("the Handler wrote %dMB to a client that reads nothing", n/units.MB)
+	}
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := io.Copy(io.Discard, resp.Body); err != nil || n != size || resp.ContentLength != -1 {
+		t.Fatalf("streamed body: %d bytes, Content-Length %d, %v", n, resp.ContentLength, err)
+	}
+	if resp, body := readResp(t, br); resp.StatusCode != http.StatusOK || body != "hello world" {
+		t.Fatalf("pipelined response: %d %q", resp.StatusCode, body)
+	}
+}
+
+// endlessBody is a Handler writing to its client until a Write fails, which it reports on errs.
+func endlessBody(errs chan<- error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		piece := make([]byte, 32*units.KB)
+		for {
+			if _, err := w.Write(piece); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}
+}
+
+// TestStreamIdleTimeout checks that a Handler writing to a client that takes nothing gives up after IdleTimeout.
+func TestStreamIdleTimeout(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("elsewhere a write blocks in the kernel, with no time limit")
+	}
+	errs := make(chan error, 1)
+	s := serve(t, endlessBody(errs), Options{IdleTimeout: 300 * time.Millisecond})
+	dialRaw(t, s, "GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+	select {
+	case err := <-errs:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("Write returned %v, want %v", err, os.ErrDeadlineExceeded)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write still waits for a client that takes nothing")
+	}
+}
+
+// TestStreamClientGone checks that a Handler writing a large body learns soon that its client went away.
+func TestStreamClientGone(t *testing.T) {
+	errs := make(chan error, 1)
+	s := serve(t, endlessBody(errs), Options{})
+	c, err := net.Dial("tcp", s.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(c, "GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+	if _, err := io.CopyN(io.Discard, c, units.MB); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	select {
+	case <-errs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Write still goes on after the client closed")
+	}
+}
+
+// TestStreamSaturatedExecutor has Handlers waiting in Write hold every goroutine of an executor the connections' tasks
+// share. Once the Writes give up after IdleTimeout, the executor serves the connections again; a wait ended only by
+// fnet's task reporting the client took something would have stalled it for good.
+func TestStreamSaturatedExecutor(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("elsewhere the engine has no executor, and a write blocks in the kernel")
+	}
+	pool := taskpool.New(1, 2, 64)
+	started, errs := make(chan struct{}, 2), make(chan error, 2)
+	stream := endlessBody(errs)
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/hello" {
+			io.WriteString(w, "hello world")
+			return
+		}
+		started <- struct{}{}
+		stream(w, r)
+	}), Options{IdleTimeout: 500 * time.Millisecond, Executor: pool.SubmitTo, Engine: fnet.Options{Executor: pool.SubmitTo}})
+	for range 2 { // as many as the executor has goroutines
+		dialRaw(t, s, "GET /stream HTTP/1.1\r\nHost: a\r\n\r\n")
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the download did not start")
+		}
+	}
+	time.Sleep(100 * time.Millisecond) // the Handlers fill what the sockets take, then wait
+	br := dialRaw(t, s, "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n")
+	if resp, body := readResp(t, br); resp.StatusCode != http.StatusOK || body != "hello world" {
+		t.Fatalf("GET /hello: %d %q", resp.StatusCode, body)
+	}
+	if len(errs) == 0 { // a Handler reports its failed Write before it frees its goroutine
+		t.Fatal("another connection was served while both downloads held the executor")
+	}
+}
+
+// TestConnSize keeps the state every HTTP connection holds in its 128-byte size class.
+func TestConnSize(t *testing.T) {
+	if size := unsafe.Sizeof(conn{}); size > 128 {
+		t.Fatalf("conn is %d bytes, want no more than 128", size)
 	}
 }
 
@@ -1000,6 +1256,9 @@ func TestHTTPS(t *testing.T) {
 	_, addr2 := get(t, client, base+"/remote")
 	if addr1 != addr2 {
 		t.Fatalf("connection not kept alive: %s, %s", addr1, addr2)
+	}
+	if _, body := get(t, client, base+"/big"); len(body) != 4*units.MB { // streamed through the TLS connection
+		t.Fatalf("GET /big: %d bytes", len(body))
 	}
 
 	// A body over MaxBufferedBodyBytes is not buffered: net/http serves it on the connection detached from fnet.

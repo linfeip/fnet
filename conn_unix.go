@@ -51,7 +51,6 @@ type conn struct {
 func (c *conn) RemoteAddr() net.Addr { return addrPortToTCPAddr(c.remote) }
 func (c *conn) Context() any         { return c.ctx }
 func (c *conn) SetContext(ctx any)   { c.ctx = ctx }
-func (c *conn) TaskKey() int         { return c.loop.taskKey(c.fd) }
 
 func (c *conn) LocalAddr() net.Addr {
 	c.mu.Lock()

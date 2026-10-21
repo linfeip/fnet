@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/linfeip/fnet/taskpool"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -66,9 +68,13 @@ func NewServerAddrs(addrs []string, handler Handler, opts Options) (*Server, err
 	if len(addrs) == 0 {
 		return nil, errors.New("fnet: NewServerAddrs needs at least one address")
 	}
+	opts = opts.withDefaults()
+	if opts.Executor == nil {
+		opts.Executor = taskpool.NewDefault().SubmitTo
+	}
 	s := &Server{
 		handler:         handler,
-		opts:            opts.withDefaults(),
+		opts:            opts,
 		listenerPerLoop: reusePortSpreads && opts.ReusePort,
 		closing:         make(chan struct{}),
 		done:            make(chan struct{}),

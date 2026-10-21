@@ -4,7 +4,7 @@
 //   - fnet's OnData callback (on a goroutine of the executor) only finds where each request message ends: the
 //     header terminator "\r\n\r\n", then a small body, with Content-Length or in chunks. It copies the complete
 //     messages into the connection's request queue without parsing them;
-//   - a worker goroutine of Options.Executor (taskpool.DefaultTaskPool by default; the Handlers may block, so
+//   - a worker goroutine of Options.Executor (a private taskpool.NewDefault() by default; the Handlers may block, so
 //     they are not run in OnData's task, which returns at once) takes the messages out in order, parses each (a
 //     request in the plain forms of HTTP/1.x by fhttp itself, field for field the way the standard library's
 //     http.ReadRequest would, any other through http.ReadRequest), runs the http.Handler, and writes the responses
@@ -16,9 +16,11 @@
 // done (net/http writes every response out as soon as its Handler returns). A request, body included, must be
 // received in full within ReadHeaderTimeout, idle connections are closed after IdleTimeout, and the Handler's
 // execution time is not limited (see Options).
-// The response body is buffered in full before being written out, so http.Flusher and http.Hijacker are not
-// supported, except for the requests served by net/http (see below). Protocol upgrades (such as WebSocket) are done
-// through Upgrade.
+// A response body of up to 64KB is buffered and goes out with its Content-Length once the Handler returns. A larger
+// one goes out while the Handler writes it, in pieces of 64KB: with the Content-Length the Handler declared, if any,
+// otherwise in chunks (on HTTP/1.0, until the connection closes); changes to the header have no effect from then on.
+// http.Flusher and http.Hijacker are not supported, except for the requests served by net/http (see below). Protocol
+// upgrades (such as WebSocket) are done through Upgrade.
 //
 // The request handed to a Handler is pooled, which saves it its allocations: it is valid only within that ServeHTTP
 // call. A Handler, and anything it starts, must not keep the request (its header, URL and body included) past
@@ -41,7 +43,9 @@
 //
 // A client that does not take the responses is not answered further: once fnet's send buffer holds more than 64KB (see
 // fnet.Conn.Writable) the worker stops until the client has taken them, within IdleTimeout, so the queued requests of a
-// client that pipelines without reading cost memory only as requests.
+// client that pipelines without reading cost memory only as requests. A Handler writing a large body waits in Write the
+// same way, a piece at a time, so that about 64KB of the body waits in fhttp and 128KB in fnet, however large it is; when
+// the client takes nothing for IdleTimeout, Write returns os.ErrDeadlineExceeded and the connection is closed.
 package fhttp
 
 import (
@@ -78,21 +82,24 @@ type Options struct {
 	// it is 10s, when <0 it is unlimited. On timeout the connection is closed immediately.
 	ReadHeaderTimeout time.Duration
 	// IdleTimeout is the maximum time to wait for the next request while no request is being received or processed
-	// (including on a newly established connection); when 0 it is 120s, when <0 it is unlimited.
+	// (including on a newly established connection); when 0 it is 120s, when <0 it is unlimited. It is also the time a
+	// client not taking the responses has to take them, while the worker, or a Handler's Write, waits for it.
 	// The Handler's execution time is not limited.
 	IdleTimeout time.Duration
 	// Engine holds the parameters of the underlying fnet engine. Its Executor runs only the connections' own tasks
 	// (reading and splitting the requests), which never block; the Handlers run on Executor.
 	Engine fnet.Options
 	// Executor runs the Handlers: it is called when a connection has requests queued and no such task of it is
-	// running, with a task that processes the connection's queue and ends once the queue is empty. The key is the
-	// connection's fnet.Conn.TaskKey, so on Linux/macOS, with both executors left at their default, a Handler usually
-	// runs right after the connection's own task, on the same goroutine and CPU. It may be called from any
-	// goroutine, must not block, must run the task asynchronously (not directly on the caller's stack) and must not
-	// drop it; a Handler panic is recovered by fhttp. Unlike the connections' tasks the Handlers may block, so it has
-	// to cope with tasks that block: one running them on a few goroutines would stall every connection behind a slow
-	// Handler. When nil it is the SubmitTo of taskpool.DefaultTaskPool, which starts or wakes another worker for the
-	// tasks queued behind a blocked one. Unlike Engine.Executor it is used on every platform.
+	// running, with a task that processes the connection's queue and ends once the queue is empty. The key is a random
+	// one (see taskpool.RandomKey), which spreads the Handlers over the queues of an executor that picks its queue by
+	// key. It may be called from any goroutine, must not block, must run the task asynchronously (not directly on the
+	// caller's stack) and must not drop it; a Handler panic is recovered by fhttp. Unlike the connections' tasks the
+	// Handlers may block, so it has to cope with tasks that block: one running them on a few goroutines would stall
+	// every connection behind a slow Handler. A Handler writing a large body to a slow client blocks as well, in Write,
+	// until the connection's task reports the client took some of it. When it shares an executor with Engine.Executor, no
+	// connection is served while every worker holds such a Handler, until their Writes give up after IdleTimeout, so a
+	// server sending large bodies to many slow clients is better off with an executor of its own for the Handlers. When
+	// nil, NewServer creates a private taskpool.NewDefault() executor. Unlike Engine.Executor it is used on every platform.
 	Executor func(key int, task func())
 	// TLSConfig, when non-nil, has the server serve HTTPS (see package ftls), the handshake having to complete within
 	// ReadHeaderTimeout. fhttp speaks HTTP/1.1 only, so h2 is taken out of the protocols offered through ALPN.
@@ -112,9 +119,6 @@ func (o Options) withDefaults() Options {
 	}
 	if o.IdleTimeout == 0 {
 		o.IdleTimeout = 120 * time.Second
-	}
-	if o.Executor == nil {
-		o.Executor = taskpool.DefaultTaskPool.SubmitTo
 	}
 	return o
 }
@@ -142,7 +146,11 @@ func NewServerAddrs(addrs []string, handler http.Handler, opts Options) (*Server
 	if handler == nil {
 		handler = http.DefaultServeMux
 	}
-	s := &Server{handler: handler, opts: opts.withDefaults()}
+	opts = opts.withDefaults()
+	if opts.Executor == nil {
+		opts.Executor = taskpool.NewDefault().SubmitTo
+	}
+	s := &Server{handler: handler, opts: opts}
 	var h fnet.Handler = engineHandler{s}
 	if s.opts.TLSConfig != nil {
 		h = ftls.NewHandler(h, http1Config(s.opts.TLSConfig), s.opts.ReadHeaderTimeout)
@@ -207,7 +215,7 @@ func (s *Server) Serve() error {
 }
 
 // Close closes the listener and all connections. Handlers that are already running are not interrupted, but their
-// responses cannot be written out.
+// responses cannot be written out: Write returns net.ErrClosed, a Write waiting for the client included.
 func (s *Server) Close() error {
 	s.handoffs.Close()
 	s.streams.Close()
@@ -225,7 +233,7 @@ func (h engineHandler) OnOpen(c fnet.Conn) {
 	hc.setDeadline() // a new connection counts as idle; there is no concurrent access yet, so mu need not be held
 }
 
-// OnWritable resumes answering a client that has taken the responses waiting for it, see conn.serve.
+// OnWritable resumes answering a client that has taken the responses waiting for it, see conn.onWritable.
 func (h engineHandler) OnWritable(c fnet.Conn) {
 	if hc, ok := c.Context().(*conn); ok {
 		hc.onWritable()

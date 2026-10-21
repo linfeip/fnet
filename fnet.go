@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"github.com/linfeip/fnet/internal/units"
-	"github.com/linfeip/fnet/taskpool"
 )
 
 var (
@@ -47,7 +46,7 @@ var (
 // Linux/macOS the callbacks run in a goroutine of the executor (see Options.Executor), the connection is not
 // read again before the callback returns, and the callbacks of other connections share the executor's
 // goroutines as well, so a callback must return quickly and should not block: the default executor starts more
-// goroutines while callbacks block, up to its limit (see taskpool.DefaultTaskPool), and each blocked callback
+// goroutines while callbacks block, up to the default pool's limit, and each blocked callback
 // holds one of them. Time-consuming logic should be handed to other goroutines, which may safely call Conn.Write
 // and Conn.Close concurrently.
 type Handler interface {
@@ -172,12 +171,6 @@ type Conn interface {
 	// the net.Conn. Detach waits for a running callback of the connection to return, so it must not be called
 	// from a callback. It returns net.ErrClosed when the connection is closed or a close has been requested.
 	Detach() (net.Conn, error)
-	// TaskKey returns the key the connection's tasks are handed to Options.Executor with, the same for the whole life
-	// of the connection. Work a callback hands to the same executor under this key lands on the connection's own
-	// queue, where the goroutine that ran the callback usually takes it next, on the same CPU, with the connection's
-	// data still in its caches (fhttp runs its Handlers this way). On other platforms than Linux/macOS, which have no
-	// Executor, it is a random key fixed when the connection is accepted.
-	TaskKey() int
 }
 
 // detachedConn is a connection taken out of the engine by Conn.Detach. Read first returns the data OnData left
@@ -217,17 +210,16 @@ type Options struct {
 	ReadBufferSize int
 	// Executor runs a connection's tasks (reading, invoking the Handler callbacks, draining the send buffer,
 	// closing): it is called once when a connection has events, a connection has at most one task at a time,
-	// and it is called again when more events arrive while one is being processed. key is a connection key
-	// (Conn.TaskKey), the same for all of its tasks, so an executor may use it to keep a connection's tasks on one queue.
+	// and it is called again when more events arrive while one is being processed. key is a connection key, the same
+	// for all of its tasks, so an executor may use it to keep a connection's tasks on one queue.
 	// Executor may be called from any goroutine (the event loops' workers, the executor's own goroutines, the
 	// application goroutines calling Write, Close, ResumeRead and Detach, the deadline check, Server.Close) and must not
 	// block; the task must run asynchronously
 	// (it must not run directly on the caller's stack) and must not be dropped.
 	// When a callback panics the connection is closed with ErrHandlerPanic and the task panics, so Executor
 	// must recover, otherwise the process exits.
-	// When nil it is the SubmitTo of taskpool.DefaultTaskPool (lock-free submission, worker reuse, recovers and
-	// logs the panic), which puts the tasks of a connection always in the shard key selects rather than in a
-	// random one each time. Linux/macOS only.
+	// When nil, NewServer creates a private taskpool.NewDefault() executor, which puts the tasks of a connection always
+	// in the shard the key selects rather than in a random one each time. Linux/macOS only.
 	Executor func(key int, task func())
 	// ReusePort has every loop listen on each address with a socket of its own, sharing it through SO_REUSEPORT, so
 	// that the loops accept in parallel and a connection stays with the loop that accepted it; otherwise the loops
@@ -246,9 +238,6 @@ func (o Options) withDefaults() Options {
 	}
 	if o.ReadBufferSize <= 0 {
 		o.ReadBufferSize = 16 * units.KB
-	}
-	if o.Executor == nil {
-		o.Executor = taskpool.DefaultTaskPool.SubmitTo
 	}
 	return o
 }

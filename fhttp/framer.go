@@ -200,7 +200,7 @@ func dechunk(body []byte) []byte {
 // errHeaderTooLarge means too many field lines. errHandoff means fhttp does not serve the request itself: a
 // Content-Length above maxBody, an unsupported Transfer-Encoding, or anything unusual (a repeated or invalid
 // Content-Length, another Expect), all of which the standard library judges instead; or a client asking for an event
-// stream (Server-Sent Events), which fhttp, buffering responses in full, cannot send as it is written.
+// stream (Server-Sent Events), which needs the http.Flusher fhttp does not provide.
 //
 // A field this scan misses cannot smuggle a request, although the message ends where this scan says: readRequest
 // rejects it, as a name that is no token (say "Content-Length :", see validStdRequest) or because the standard library

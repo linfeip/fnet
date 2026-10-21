@@ -44,9 +44,9 @@ func (c *conn) notify(ev uint32) bool {
 	return false
 }
 
-// schedule submits the connection's task to the Executor (taskpool.DefaultTaskPool.SubmitTo by default), keyed by the
+// schedule submits the connection's task to the Executor (a private taskpool.NewDefault().SubmitTo by default), keyed by the
 // connection's loop-affine key. The caller must hold the task, see markEvents.
-func (c *conn) schedule() { c.loop.srv.opts.Executor(c.TaskKey(), c.task) }
+func (c *conn) schedule() { c.loop.srv.opts.Executor(c.loop.taskKey(c.fd), c.task) }
 
 // markEvents merges events and takes the right to submit the connection's single task; a caller it returns true for
 // must submit it, never drop it.

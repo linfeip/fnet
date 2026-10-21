@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"github.com/linfeip/fnet/ftls"
 	"github.com/linfeip/fnet/internal/bytepool"
 	"github.com/linfeip/fnet/internal/units"
+	"github.com/linfeip/fnet/taskpool"
 )
 
 // maxPipeline and maxQueuedBytes bound the requests queued for processing on a connection, by number and by size: once
@@ -52,18 +54,19 @@ type conn struct {
 	last       *lastRequest // what parseRequest shares with the next request, made on the first one; accessed only by the worker, except for its ctx (see context)
 	serveTask  func()       // serve, bound once, so that handing it to a worker does not allocate each time
 
-	framer framer // accessed only by fnet's callbacks (callbacks of one connection run serially)
-	broken bool   // a protocol error has occurred, all subsequent data is discarded; accessed only by fnet's callbacks
+	framer      framer // accessed only by fnet's callbacks (callbacks of one connection run serially)
+	queuedBytes int32  // the total size of the messages in the queue, below maxLimit; guarded by mu, placed here to fill the room framer leaves
 
 	protocol atomic.Pointer[Protocol] // the protocol that takes over the connection after Upgrade switches; written only while holding mu
 
-	mu          sync.Mutex
-	queue       []request
-	worker      workerState // what the connection's worker is doing
-	partial     bool        // the connection buffer holds an incomplete request; written only by fnet's callbacks
-	readPaused  bool        // too much is queued, so reading is paused until the worker has emptied the queue (see maxPipeline)
-	closed      atomic.Bool // set by onClose while holding mu; read without it by the response's writes
-	queuedBytes int32       // the total size of the messages in the queue, below maxLimit
+	mu         sync.Mutex
+	queue      []request
+	writable   chan struct{} // signaled by onWritable and onClose for a Handler waiting in waitWritable, made the first time one waits
+	worker     workerState   // what the connection's worker is doing
+	partial    bool          // the connection buffer holds an incomplete request; written only by fnet's callbacks
+	readPaused bool          // too much is queued, so reading is paused until the worker has emptied the queue (see maxPipeline)
+	broken     bool          // a protocol error has occurred, all subsequent data is discarded; accessed only by fnet's callbacks
+	closed     atomic.Bool   // set by onClose while holding mu; read without it by the response's writes
 }
 
 // workerState is what the worker of a connection is doing (see serve); it changes while holding mu. At most one worker
@@ -194,7 +197,7 @@ func (c *conn) onData(data []byte) int {
 	}
 	c.mu.Unlock()
 	if submit {
-		c.srv.opts.Executor(c.connection.TaskKey(), c.serveTask)
+		c.srv.opts.Executor(taskpool.RandomKey(), c.serveTask)
 	}
 	return consumed
 }
@@ -221,6 +224,7 @@ func (c *conn) onClose(err error) {
 		c.queue[i].msg.Release()
 	}
 	c.queue, c.queuedBytes = nil, 0
+	c.wakeWriter() // a Handler waiting in Write gives up, see waitWritable
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -302,9 +306,11 @@ func (c *conn) closeFromWorker() {
 	c.connection.Close()
 }
 
-// onWritable resumes the worker that stopped while the client was not taking the responses, see serve.
+// onWritable resumes the worker that stopped while the client was not taking the responses, see serve, or the Handler
+// waiting in Write for it to take a response, see waitWritable.
 func (c *conn) onWritable() {
 	c.mu.Lock()
+	c.wakeWriter()
 	resume := c.worker == workerWaiting && !c.closed.Load()
 	if resume {
 		c.worker = workerServing
@@ -312,7 +318,46 @@ func (c *conn) onWritable() {
 	}
 	c.mu.Unlock()
 	if resume {
-		c.srv.opts.Executor(c.connection.TaskKey(), c.serveTask)
+		c.srv.opts.Executor(taskpool.RandomKey(), c.serveTask)
+	}
+}
+
+// waitWritable has the Handler's Write wait while the client is not taking the response (fnet's send buffer holds more
+// than fnet.Conn.Writable allows), until onWritable reports the buffer back down or onClose the connection closed. The
+// client has IdleTimeout to take it, as between requests (see serve). The wait is timed here rather than by the
+// connection's deadline: only a task of the executor carries a deadline out, and the Handlers waiting may hold every
+// goroutine of the executor.
+func (c *conn) waitWritable() error {
+	if c.connection.Writable() {
+		return nil
+	}
+	c.mu.Lock()
+	if c.writable == nil {
+		c.writable = make(chan struct{}, 1)
+	}
+	c.mu.Unlock()
+	var expired <-chan time.Time
+	if timeout := c.srv.opts.IdleTimeout; timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		expired = timer.C
+	}
+	for !c.connection.Writable() && !c.closed.Load() { // looked at again: onWritable may have come before writable was made
+		select {
+		case <-c.writable:
+		case <-expired:
+			return os.ErrDeadlineExceeded
+		}
+	}
+	return nil // once closed, the write that follows fails with net.ErrClosed
+}
+
+// wakeWriter wakes the Handler waiting in waitWritable, if any, and requires the caller to hold mu. A signal left when no
+// Handler waits only has the next wait look at Writable once more.
+func (c *conn) wakeWriter() {
+	select {
+	case c.writable <- struct{}{}: // never ready while writable is nil
+	default:
 	}
 }
 

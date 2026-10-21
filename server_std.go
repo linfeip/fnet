@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/linfeip/fnet/internal/units"
-	"github.com/linfeip/fnet/taskpool"
 )
 
 // Server is a simple implementation on top of the standard library net package (for platforms such as Windows):
@@ -117,7 +116,7 @@ func (s *Server) accept(ln net.Listener) error {
 			return err
 		}
 		tempDelay = 0
-		c := &stdConn{netConnection: nc, taskKey: taskpool.RandomKey()}
+		c := &stdConn{netConnection: nc}
 		c.readResumed.L = &c.mu
 		s.mu.Lock()
 		if s.closed {
@@ -292,7 +291,6 @@ const (
 type stdConn struct {
 	netConnection net.Conn
 	ctx           any
-	taskKey       int          // see TaskKey
 	closedBy      atomic.Int32 // who initiated the close, which decides the err reported to OnClose
 
 	mu          sync.Mutex
@@ -307,7 +305,6 @@ func (c *stdConn) LocalAddr() net.Addr  { return c.netConnection.LocalAddr() }
 func (c *stdConn) RemoteAddr() net.Addr { return c.netConnection.RemoteAddr() }
 func (c *stdConn) Context() any         { return c.ctx }
 func (c *stdConn) SetContext(ctx any)   { c.ctx = ctx }
-func (c *stdConn) TaskKey() int         { return c.taskKey }
 
 func (c *stdConn) Write(b []byte) (int, error) {
 	if c.closedBy.Load() != 0 {

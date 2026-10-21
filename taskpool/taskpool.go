@@ -1,6 +1,5 @@
 // Package taskpool is a goroutine pool organized into shards that reuses the goroutines running short tasks, saving the
-// cost of creating and destroying a goroutine per task. DefaultTaskPool can be used directly, and websocket uses it to
-// run callbacks by default.
+// cost of creating and destroying a goroutine per task.
 //
 // Each shard uses a bounded lock-free queue and keeps at most maxWorkers workers. Large batches are spread evenly
 // across the shards; small batches keep their random placement and merge notifications, and each shard decides once
@@ -40,22 +39,13 @@ const MaxWorkers = 512
 // idleWords is the number of words in a shard's bitmap of suspended workers.
 const idleWords = MaxWorkers / 64
 
-// DefaultTaskPool is the default goroutine pool: one shard per P (based on GOMAXPROCS at package initialization), with
-// at most MaxWorkers workers and a queue capacity of 8192 per shard (about 128KB per shard), so at most
-// 512 × GOMAXPROCS workers, which any shard may use (see Pool.borrow). Workers start only once there are tasks, and a
-// worker started stays resident. A worker that sees more tasks queued before running one makes sure another worker
-// comes for them, so the number of goroutines grows with the number of tasks queued at the same time: callbacks that
-// block raise it, and so do bursts of short tasks.
-//
-// The worker limit has to accommodate the number of callbacks that block at the same time: with the 4 workers per shard
-// it used to have, a workload where every callback blocked for 1ms or more reached only 10% to 17% of the throughput of
-// one goroutine per task, and with 64 about 100% (measured on 24 CPUs with 1024 connections).
-//
-// The capacity has to accommodate the number of connections that have a task at the same time (each fnet connection has
-// at most one task at a time): when the capacity is enough the backlog stays in the queue at 16 bytes per task; only
-// once it is full does each overflowing task get its own temporary goroutine, which is far more expensive, and with many
-// backed-up connections the goroutines and the buffers they borrow show up by the thousand.
-var DefaultTaskPool = New(runtime.GOMAXPROCS(0), MaxWorkers, 8192)
+const defaultQueueCapacity = 8192
+
+// NewDefault creates a Pool with one shard per P, MaxWorkers workers per shard, and a queue capacity of 8192 per shard.
+// Workers start only once there are tasks, and a worker started stays resident.
+func NewDefault() *Pool {
+	return New(runtime.GOMAXPROCS(0), MaxWorkers, defaultQueueCapacity)
+}
 
 // Pool is a goroutine pool.
 type Pool struct {

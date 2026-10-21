@@ -34,8 +34,9 @@ type Protocol interface {
 // ReadHeaderTimeout, and the new protocol should override it in OnData.
 //
 // The Handler must not use w after this call, unless it returns http.ErrNotSupported: w is not an fhttp
-// ResponseWriter (and cannot be obtained through Unwrap), or the request is HTTP/1.0, whose Upgrade field a server
-// ignores (RFC 9110 7.8) and to which no 1xx response may go (15.2). An error is returned as well when the connection is
+// ResponseWriter (and cannot be obtained through Unwrap), the request is HTTP/1.0, whose Upgrade field a server
+// ignores (RFC 9110 7.8) and to which no 1xx response may go (15.2), or the response has started going out (more than
+// 64KB of body was written, see the package documentation). An error is returned as well when the connection is
 // already closed, or when the client sent a follow-up request without waiting for the upgrade response, and the
 // connection is then closed (in the latter case a 400 is replied first).
 func Upgrade(w http.ResponseWriter, newProtocol func(fnet.Conn) Protocol) error {
@@ -52,7 +53,7 @@ func Upgrade(w http.ResponseWriter, newProtocol func(fnet.Conn) Protocol) error 
 }
 
 func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error {
-	if !w.req.ProtoAtLeast(1, 1) {
+	if !w.req.ProtoAtLeast(1, 1) || w.streamed {
 		return http.ErrNotSupported
 	}
 	w.upgraded = true

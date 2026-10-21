@@ -1276,7 +1276,8 @@ func BenchmarkEchoScheduling(b *testing.B) {
 				b.Run(fmt.Sprintf("loops=%d/pipeline=%d/batch=%t", loops, pipeline, batch), func(b *testing.B) {
 					engine := fnet.Options{NumLoops: loops}
 					if !batch {
-						engine.Executor = func(_ int, task func()) { taskpool.DefaultTaskPool.Submit(task) }
+						pool := taskpool.NewDefault()
+						engine.Executor = func(_ int, task func()) { pool.Submit(task) }
 					}
 					mux := http.NewServeMux()
 					mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {

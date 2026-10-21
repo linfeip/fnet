@@ -82,6 +82,15 @@ var readerPool = sync.Pool{New: func() any {
 	return rd
 }}
 
+// RequestBody returns the buffered body bytes of r if available and not yet consumed.
+// When the request body is buffered in memory by fhttp, it returns the slice directly without allocation.
+// Otherwise it falls back to reading r.Body.
+func RequestBody(r *http.Request) ([]byte, error) {
+	if b, ok := r.Body.(interface{ Bytes() []byte }); ok {
+		return b.Bytes(), nil
+	}
+	return io.ReadAll(r.Body)
+}
 // unread returns the number of bytes of the message not read yet.
 func (rd *reader) unread() int { return rd.bufferedReader.Buffered() + rd.bytesReader.Len() }
 
@@ -414,6 +423,13 @@ func validStdRequest(header []byte, req *http.Request) bool {
 type body struct {
 	data   []byte
 	closed bool
+}
+
+func (b *body) Bytes() []byte {
+	if b.closed {
+		return nil
+	}
+	return b.data
 }
 
 func (b *body) Read(p []byte) (int, error) {
