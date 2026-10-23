@@ -56,10 +56,20 @@ type response struct {
 	chunked         bool // the streamed body goes out in chunks
 	discardBody     bool // the response has no content (HEAD, 205, a tunnel): what is written of the body is dropped
 	keepAlive       bool // whether to keep the connection alive, decided with the header (see writeHeader)
-	remainingLength int  // what a streamed body still has to send of the Content-Length the Handler declared, -1 for none
+	remainingLength int  // what the Handler may still write of the Content-Length it declared, -1 for none
+	declaredLength  int  // that Content-Length
 	writeErr        error
 	body            bytepool.Buffer
 	out             bytepool.Buffer // the responses serialized and not written out yet, see flush
+
+	// What commitHeader takes of the Handler's header when the status is written; later changes to the header do not count.
+	fields     bytepool.Buffer // the fields, serialized, but for Connection
+	connection []string        // the values of the Connection field, which goes out only if the body leaves the connection open
+	hasLength  bool            // the header has a Content-Length
+	hasType    bool            // the header has a Content-Type
+	hasDate    bool            // the header has a Date
+	encoded    bool            // the header has a Content-Encoding
+	closing    bool            // the Connection field says close
 }
 
 var responsePool = sync.Pool{New: func() any { return &response{header: make(http.Header)} }}
@@ -74,6 +84,7 @@ func (w *response) start(req *http.Request) {
 func (w *response) release() {
 	w.body.Release()
 	w.out.Release()
+	w.fields.Release()
 	clear(w.header)
 	*w = response{header: w.header}
 	responsePool.Put(w)
@@ -112,10 +123,11 @@ func (w *response) WriteHeader(code int) {
 		return
 	}
 	w.wroteHeader, w.status = true, code
+	w.commitHeader()
 }
 
 func (w *response) Write(p []byte) (int, error) {
-	if err := w.beforeWrite(); err != nil {
+	if err := w.beforeWrite(len(p)); err != nil {
 		return 0, err
 	}
 	if w.body.Len()+len(p) > maxBufferedBody {
@@ -126,19 +138,20 @@ func (w *response) Write(p []byte) (int, error) {
 }
 
 func (w *response) WriteString(s string) (int, error) {
-	if w.body.Len()+len(s) > maxBufferedBody {
-		return w.Write([]byte(s)) // the copy costs little next to sending it
-	}
-	if err := w.beforeWrite(); err != nil {
+	if err := w.beforeWrite(len(s)); err != nil {
 		return 0, err
+	}
+	if w.body.Len()+len(s) > maxBufferedBody {
+		return w.streamString(s)
 	}
 	w.body.AppendString(s)
 	return len(s), nil
 }
 
-// beforeWrite fills in the default 200 status code before the response body is written; it returns
-// http.ErrBodyNotAllowed when the status code does not allow a body.
-func (w *response) beforeWrite() error {
+// beforeWrite readies the response for n more bytes of its body. It fills in the default 200 status code, and returns
+// http.ErrBodyNotAllowed when the status code does not allow a body, and http.ErrContentLength, as on net/http, when the
+// n bytes would go past the Content-Length the Handler declared: none of them are written then.
+func (w *response) beforeWrite(n int) error {
 	if w.writeErr != nil {
 		return w.writeErr
 	}
@@ -151,6 +164,12 @@ func (w *response) beforeWrite() error {
 	}
 	if !bodyAllowedForStatus(w.status) {
 		return http.ErrBodyNotAllowed
+	}
+	if w.remainingLength >= 0 {
+		if n > w.remainingLength {
+			return http.ErrContentLength
+		}
+		w.remainingLength -= n
 	}
 	return nil
 }
@@ -172,29 +191,39 @@ func (w *response) stream(p []byte) (int, error) {
 		err := w.send(piece)
 		w.body.Reset()
 		if err != nil {
-			return 0, err
+			return n - len(p), err
 		}
 	}
 	w.body.Append(p)
 	return n, nil
 }
 
+// streamString is stream for a string, which cannot be sent from as it is: it is copied into the buffer a piece at a
+// time, so that however long it is no more than a piece of it is held in addition.
+func (w *response) streamString(s string) (int, error) {
+	n := len(s)
+	for w.body.Len()+len(s) > maxBufferedBody {
+		fill := maxBufferedBody - w.body.Len()
+		w.body.AppendString(s[:fill])
+		s = s[fill:]
+		err := w.send(w.body.Bytes())
+		w.body.Reset()
+		if err != nil {
+			return n - len(s), err
+		}
+	}
+	w.body.AppendString(s)
+	return n, nil
+}
+
 // send writes out a piece of the streamed body, after the header when it is the first piece, once the client has taken
-// enough of what went before (see conn.waitWritable). What goes past the Content-Length the Handler declared is not
-// sent and fails the response with http.ErrContentLength, as on net/http.
+// enough of what went before (see conn.waitWritable).
 func (w *response) send(piece []byte) error {
 	if !w.streamed {
 		w.writeHeader(piece, true) // into the output, after the responses collected before it
 	}
 	if w.discardBody {
 		return nil
-	}
-	if w.remainingLength >= 0 {
-		if len(piece) > w.remainingLength {
-			w.writeErr = http.ErrContentLength
-			return w.writeErr
-		}
-		w.remainingLength -= len(piece)
 	}
 	if err := w.conn.waitWritable(); err != nil {
 		w.writeErr = err
@@ -226,9 +255,9 @@ func (w *response) finish() bool {
 	switch {
 	case w.discardBody:
 		body = nil
-	case w.remainingLength >= 0 && len(body) != w.remainingLength:
-		// The Handler wrote other than the Content-Length it declared: what goes out ends there, and so does the connection.
-		body, keepAlive = body[:min(len(body), w.remainingLength)], false
+	case w.streamed && w.remainingLength > 0:
+		// The Handler wrote less than the Content-Length it declared: what goes out ends there, and so does the connection.
+		keepAlive = false
 	case w.chunked: // body holds at least a byte, see stream
 		appendChunkSize(&w.out, len(body))
 		end = lastChunk
@@ -249,6 +278,52 @@ func (w *response) finish() bool {
 	return keepAlive && w.writeErr == nil
 }
 
+// bodyAllowed reports whether the response has content. A 2xx response to CONNECT turns the connection into a tunnel
+// right after its header (RFC 9110 9.3.6), which fhttp does not provide: it has no content and no Content-Length (8.6).
+func (w *response) bodyAllowed() bool {
+	return bodyAllowedForStatus(w.status) && !(w.req.Method == http.MethodConnect && w.status/100 == 2)
+}
+
+// commitHeader fixes the Handler's header as it is when the status is written, as net/http does: changes to the header
+// after that do not count. One pass over the fields serializes those to send, but for Connection, which goes out only if
+// the body leaves the connection open (see writeHeader), and notes the few that writeHeader decides on: Transfer-Encoding
+// and Content-Length are decided there (the actual length when the whole body is at hand), and a 304 has no Content-Type.
+func (w *response) commitHeader() {
+	keepLength := w.req.Method == http.MethodHead && w.bodyAllowed() && w.status != http.StatusResetContent // HEAD keeps the Content-Length declared by the Handler
+	var stack [16]field
+	fields := stack[:0]
+	w.remainingLength, w.connection = -1, nil
+	w.hasLength, w.hasType, w.hasDate, w.encoded, w.closing = false, false, false, false, false
+	for name, values := range w.header {
+		switch name {
+		case "Transfer-Encoding":
+			continue
+		case "Content-Length":
+			w.remainingLength = declaredLength(values)
+			if w.hasLength = true; !keepLength {
+				continue
+			}
+		case "Content-Type":
+			if w.hasType = true; w.status == http.StatusNotModified {
+				continue
+			}
+		case "Content-Encoding":
+			w.encoded = len(values) > 0 && values[0] != ""
+		case "Date":
+			w.hasDate = true
+		case "Connection":
+			w.closing, w.connection = hasToken(values, "close"), slices.Clone(values)
+			continue
+		}
+		if validName(name) {
+			fields = append(fields, field{name, values})
+		}
+	}
+	w.declaredLength = w.remainingLength
+	w.fields.Reset()
+	appendFields(&w.fields, fields)
+}
+
 // writeHeader serializes the response header into the output, after the responses collected before it, and decides how
 // the body goes out and whether to keep the connection alive; content is the start of the body, to detect its type
 // from. A streamed body (see stream) has the Content-Length the Handler declared, if any; otherwise its length is not
@@ -260,57 +335,27 @@ func (w *response) writeHeader(content []byte, streamed bool) {
 	req := w.req
 	http11 := req.ProtoAtLeast(1, 1)
 	isHEAD := req.Method == http.MethodHead
-	// A 2xx response to CONNECT turns the connection into a tunnel right after its header (RFC 9110 9.3.6), which fhttp
-	// does not provide: the response has no content and no Content-Length (8.6), and the connection closes after it.
-	tunnel := req.Method == http.MethodConnect && w.status/100 == 2
-	bodyAllowed := bodyAllowedForStatus(w.status) && !tunnel
+	bodyAllowed := w.bodyAllowed()
 	if w.status == http.StatusResetContent {
 		w.body.Reset() // a 205 has no content (RFC 9110 15.3.6), so it goes out with Content-Length: 0
 		content = nil
 	}
 	keepLength := isHEAD && bodyAllowed && w.status != http.StatusResetContent // HEAD keeps the Content-Length declared by the Handler
-	w.streamed, w.chunked, w.remainingLength = streamed, false, -1
+	w.streamed, w.chunked = streamed, false
 	w.discardBody = isHEAD || !bodyAllowed || w.status == http.StatusResetContent
 	closeDelimited := false
 	if streamed && !w.discardBody {
-		w.remainingLength = declaredLength(w.header)
-		w.chunked = w.remainingLength < 0 && http11
-		closeDelimited = w.remainingLength < 0 && !http11 // HTTP/1.0 has no chunks
+		w.chunked = w.declaredLength < 0 && http11
+		closeDelimited = w.declaredLength < 0 && !http11 // HTTP/1.0 has no chunks
 	}
-	mustClose := req.Close || tunnel || closeDelimited
-	// One pass over the Handler's fields finds those writeHeader decides on, and the names it writes out:
-	// Transfer-Encoding and Content-Length are decided here (the actual length when the whole body is at hand), and a
-	// 304 has no Content-Type.
-	var stack [16]field
-	fields := stack[:0]
-	var hasLength, hasType, hasDate, hasConnection, encoded, closing bool
-	for name, values := range w.header {
-		switch name {
-		case "Transfer-Encoding":
-			continue
-		case "Content-Length":
-			if hasLength = true; !keepLength {
-				continue
-			}
-		case "Content-Type":
-			if hasType = true; w.status == http.StatusNotModified {
-				continue
-			}
-		case "Content-Encoding":
-			encoded = len(values) > 0 && values[0] != ""
-		case "Date":
-			hasDate = true
-		case "Connection":
-			if closing = hasToken(values, "close"); mustClose && !closing {
-				continue // the request, the tunnel or the end of the body closes the connection, so "Connection: close" goes out in its place
-			}
-			hasConnection = true
-		}
-		if validName(name) {
-			fields = append(fields, field{name, values})
-		}
-	}
-	w.keepAlive = !mustClose && !closing
+	// Whatever its status, the response to a CONNECT closes the connection: after a rejection, a client or an intermediary
+	// that takes the request for one that opens a tunnel goes on sending the data of that tunnel, which the server would
+	// read as requests of their own.
+	mustClose := req.Close || req.Method == http.MethodConnect || closeDelimited
+	w.keepAlive = !mustClose && !w.closing
+	// The Handler's Connection field goes out unless the request, the tunnel or the end of the body closes the connection
+	// and it does not say so: "Connection: close" goes out in its place.
+	handlerConnection := w.connection != nil && (w.closing || !mustClose)
 
 	b := &w.out
 	if cap(b.Bytes()) == 0 {
@@ -324,30 +369,34 @@ func (w *response) writeHeader(content []byte, streamed bool) {
 	switch {
 	case !bodyAllowed:
 	case !streamed || w.status == http.StatusResetContent: // the whole body is at hand
-		if !keepLength || !hasLength && w.body.Len() > 0 {
+		if !keepLength || !w.hasLength && w.body.Len() > 0 {
 			appendContentLength(b, w.body.Len())
 		}
-	case w.remainingLength >= 0:
-		appendContentLength(b, w.remainingLength)
+	case w.declaredLength >= 0:
+		appendContentLength(b, w.declaredLength)
 	case w.chunked:
 		b.AppendString("Transfer-Encoding: chunked\r\n")
 	}
-	if !hasType && bodyAllowed && len(content) > 0 && !encoded {
+	hasType := w.hasType
+	if !hasType && bodyAllowed && len(content) > 0 && !w.encoded {
 		b.AppendString("Content-Type: ")
 		b.AppendString(http.DetectContentType(content))
 		b.AppendString("\r\n")
 	}
-	if !hasDate {
+	if !w.hasDate {
 		appendDate(b)
 	}
-	if !hasConnection {
+	if !handlerConnection {
 		if !w.keepAlive {
 			b.AppendString("Connection: close\r\n")
 		} else if !http11 {
 			b.AppendString("Connection: keep-alive\r\n")
 		}
 	}
-	appendFields(b, fields)
+	b.Append(w.fields.Bytes())
+	if handlerConnection {
+		appendFields(b, []field{{"Connection", w.connection}})
+	}
 	b.AppendString("\r\n")
 }
 
@@ -429,10 +478,10 @@ func appendChunkSize(b *bytepool.Buffer, size int) {
 	b.AppendString("\r\n")
 }
 
-// declaredLength returns the Content-Length the Handler declared in h, or -1 when it declared none, or not as a single
-// number.
-func declaredLength(h http.Header) int {
-	if values := h["Content-Length"]; len(values) == 1 {
+// declaredLength returns the Content-Length the Handler declared in the values of its field, or -1 when it declared it not
+// as a single number.
+func declaredLength(values []string) int {
+	if len(values) == 1 {
 		if n, err := strconv.Atoi(values[0]); err == nil && n >= 0 {
 			return n
 		}

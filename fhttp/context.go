@@ -38,7 +38,7 @@ type connContext struct {
 }
 
 // context returns the context of the connection's requests, making it when a Handler first asks for it. It is made
-// while holding mu, against which onClose sets closed and cancels it.
+// while holding mu, against which onClose sets closed and halfClose queues statusClose, and cancel it.
 //
 // It holds the values the net/http server puts in a request's context, which some middleware relies on: the local
 // address, and as the server the http.Server that serves the requests handed to net/http, with the same Handler.
@@ -53,11 +53,22 @@ func (c *conn) context() context.Context {
 	if c.last.ctx.Load() == nil {
 		ctx, cancel := context.WithCancel(values)
 		c.last.ctx.Store(&connContext{Context: ctx, cancel: cancel})
-		if c.closed.Load() {
+		if c.closed.Load() || c.halfClosed() {
 			cancel()
 		}
 	}
 	return c.last.ctx.Load().Context
+}
+
+// contextCancel returns the function that cancels the context of the connection's requests, nil while no Handler has asked
+// for it yet; the caller holds mu, against which context makes it.
+func (c *conn) contextCancel() context.CancelFunc {
+	if c.last != nil {
+		if ctx := c.last.ctx.Load(); ctx != nil {
+			return ctx.cancel
+		}
+	}
+	return nil
 }
 
 // endContext cancels the context of the connection's requests once the connection has gone to a new protocol or to

@@ -18,7 +18,10 @@
 // execution time is not limited (see Options).
 // A response body of up to 64KB is buffered and goes out with its Content-Length once the Handler returns. A larger
 // one goes out while the Handler writes it, in pieces of 64KB: with the Content-Length the Handler declared, if any,
-// otherwise in chunks (on HTTP/1.0, until the connection closes); changes to the header have no effect from then on.
+// otherwise in chunks (on HTTP/1.0, until the connection closes). As on net/http, the header is what the Handler left
+// when it wrote the status, with WriteHeader or with the first Write: later changes to it do not count, though a buffered
+// response is serialized only when the Handler returns. A Write that would go past the Content-Length the Handler
+// declared fails with http.ErrContentLength; a buffered body that falls short of it goes out with the length it has.
 // http.Flusher and http.Hijacker are not supported, except for the requests served by net/http (see below). Protocol
 // upgrades (such as WebSocket) are done through Upgrade.
 //
@@ -99,7 +102,8 @@ type Options struct {
 	// until the connection's task reports the client took some of it. When it shares an executor with Engine.Executor, no
 	// connection is served while every worker holds such a Handler, until their Writes give up after IdleTimeout, so a
 	// server sending large bodies to many slow clients is better off with an executor of its own for the Handlers. When
-	// nil, NewServer creates a private taskpool.NewDefault() executor. Unlike Engine.Executor it is used on every platform.
+	// nil, NewServer creates a private taskpool.NewDefault() executor, whose workers end when the server closes (an
+	// executor of your own is yours to end). Unlike Engine.Executor it is used on every platform.
 	Executor func(key int, task func())
 	// TLSConfig, when non-nil, has the server serve HTTPS (see package ftls), the handshake having to complete within
 	// ReadHeaderTimeout. fhttp speaks HTTP/1.1 only, so h2 is taken out of the protocols offered through ALPN.
@@ -127,6 +131,7 @@ func (o Options) withDefaults() Options {
 type Server struct {
 	handler  http.Handler
 	opts     Options
+	pool     *taskpool.Pool // the pool of the Executor NewServerAddrs made when Options.Executor is nil, closed by release
 	engine   *fnet.Server
 	streams  *http.Server     // serves the handed-off connections, see conn.handoff
 	handoffs *handoffListener // what streams accepts from
@@ -147,21 +152,24 @@ func NewServerAddrs(addrs []string, handler http.Handler, opts Options) (*Server
 		handler = http.DefaultServeMux
 	}
 	opts = opts.withDefaults()
+	var pool *taskpool.Pool
 	if opts.Executor == nil {
-		opts.Executor = taskpool.NewDefault().SubmitTo
+		pool = taskpool.NewDefault()
+		opts.Executor = pool.SubmitTo
 	}
-	s := &Server{handler: handler, opts: opts}
+	s := &Server{handler: handler, opts: opts, pool: pool}
 	var h fnet.Handler = engineHandler{s}
 	if s.opts.TLSConfig != nil {
 		h = ftls.NewHandler(h, http1Config(s.opts.TLSConfig), s.opts.ReadHeaderTimeout)
 	}
 	engine, err := fnet.NewServerAddrs(addrs, h, s.opts.Engine)
 	if err != nil {
+		s.closePool()
 		return nil, err
 	}
 	s.engine = engine
 	// The header of a handed-off request has already arrived, so of net/http's limits only MaxHeaderBytes matters.
-	s.streams = &http.Server{Handler: handler, MaxHeaderBytes: s.opts.MaxHeaderBytes}
+	s.streams = &http.Server{Handler: validRequests(handler), MaxHeaderBytes: s.opts.MaxHeaderBytes}
 	s.streams.SetKeepAlivesEnabled(false) // one request per handed-off connection, the next one comes back to fnet
 	if s.opts.TLSConfig != nil {
 		serveTLSState(s.streams)
@@ -208,6 +216,7 @@ func (s *Server) Addrs() []net.Addr { return s.engine.Addrs() }
 func (s *Server) Serve() error {
 	go s.streams.Serve(s.handoffs)
 	err := s.engine.Serve()
+	s.release() // after Close this has been done already; it is for the engine stopping on its own, on a fatal error
 	if errors.Is(err, fnet.ErrServerClosed) {
 		return http.ErrServerClosed
 	}
@@ -217,9 +226,24 @@ func (s *Server) Serve() error {
 // Close closes the listener and all connections. Handlers that are already running are not interrupted, but their
 // responses cannot be written out: Write returns net.ErrClosed, a Write waiting for the client included.
 func (s *Server) Close() error {
+	s.release()
+	return s.engine.Close()
+}
+
+// release closes the connections handed off to net/http and the pool of the Handlers. The pool may go before the engine
+// has closed its connections: tasks submitted to a closed pool still run, each in a goroutine of its own. It may be
+// called more than once.
+func (s *Server) release() {
 	s.handoffs.Close()
 	s.streams.Close()
-	return s.engine.Close()
+	s.closePool()
+}
+
+// closePool ends the workers of the pool NewServerAddrs made for the Handlers, if it made one.
+func (s *Server) closePool() {
+	if s.pool != nil {
+		s.pool.Close()
+	}
 }
 
 // engineHandler feeds fnet's connection events into the HTTP processing flow; it runs on a goroutine of fnet's
@@ -238,6 +262,12 @@ func (h engineHandler) OnWritable(c fnet.Conn) {
 	if hc, ok := c.Context().(*conn); ok {
 		hc.onWritable()
 	}
+}
+
+// OnHalfClose keeps the connection open for the requests of a client that closed its write direction, see conn.halfClose.
+func (h engineHandler) OnHalfClose(c fnet.Conn) bool {
+	hc, ok := c.Context().(*conn)
+	return ok && hc.halfClose()
 }
 
 // OnData and OnClose find the connection's state in its context: the HTTP conn, or, once a protocol has taken the

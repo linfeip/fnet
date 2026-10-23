@@ -13,8 +13,10 @@ var (
 	// errURITooLong means the request line alone exceeds MaxHeaderBytes; RFC 9112 3 requires a 414 (URI Too Long) for a
 	// request target longer than the server parses.
 	errURITooLong = errors.New("fhttp: request URI too long")
-	// errBadRequest means the request cannot be framed because its header ends in an empty line made of a bare LF. It is
-	// answered with 400 (Bad Request); valid but unsupported body framing is handed to net/http instead.
+	// errBadRequest means the request cannot be framed: its header ends in an empty line made of a bare LF, its Content-Length
+	// is no number or differs from another, or its Transfer-Encoding does not end in chunked (RFC 9112 6.3). It is answered
+	// with 400 (Bad Request), with the Date the net/http server leaves out of its own; valid but unsupported body framing
+	// is handed to net/http instead.
 	errBadRequest = errors.New("fhttp: request cannot be framed")
 	// errHandoff means fhttp cannot safely handle the request on its buffered path; the connection is handed to net/http.
 	errHandoff = errors.New("fhttp: request is handed to net/http")
@@ -123,8 +125,8 @@ func tooLarge(data []byte, maxHeaderBytes int) error {
 }
 
 // chunks goes over the chunks of the body that have arrived, from f.pos on, and returns the end of the message once the
-// last chunk is there, 0 before. Only the plain form is buffered, up to limit: hexadecimal sizes, no chunk extensions
-// and no trailer fields; anything else is errHandoff, for the standard library to judge.
+// last chunk is there, 0 before. Only the plain form is buffered, up to limit: hexadecimal sizes, chunk extensions of
+// maxChunkLine at most and no trailer fields; anything else is errHandoff, for the standard library to judge.
 func (f *framer) chunks(data []byte, limit int) (int, error) {
 	for {
 		pos := int(f.pos)
@@ -154,10 +156,10 @@ func (f *framer) chunks(data []byte, limit int) (int, error) {
 	}
 }
 
-// chunkHeader reads the size line at the start of b, a hexadecimal size and CRLF, and returns the size and the line's
-// length; the length is 0 when the line has not arrived in full. ok=false for anything else, and for sizes of more than
-// 7 digits: 256MB and up, far above any buffered body, so that a size never overflows an int, even on 32-bit platforms
-// (RFC 9112 7.1).
+// chunkHeader reads the size line at the start of b, a hexadecimal size, the chunk extensions if there are any (see
+// chunkExtensions) and CRLF, and returns the size and the line's length; the length is 0 when the line has not arrived in
+// full. ok=false for anything else, and for sizes of more than 7 digits: 256MB and up, far above any buffered body, so
+// that a size never overflows an int, even on 32-bit platforms (RFC 9112 7.1).
 func chunkHeader(b []byte) (size, n int, ok bool) {
 	for i, c := range b {
 		switch {
@@ -172,6 +174,12 @@ func chunkHeader(b []byte) (size, n int, ok bool) {
 				return 0, 0, true
 			}
 			return size, i + 2, b[i+1] == '\n'
+		case (c == ' ' || c == '\t' || c == ';') && i > 0:
+			extensions, ok := chunkExtensions(b[i:])
+			if extensions == 0 || !ok {
+				return 0, 0, ok
+			}
+			return size, i + extensions, true
 		default:
 			return 0, 0, false
 		}
@@ -180,6 +188,93 @@ func chunkHeader(b []byte) (size, n int, ok bool) {
 		}
 	}
 	return 0, 0, true
+}
+
+// maxChunkLine bounds the chunk extensions fhttp reads on the line of a chunk size, so that a line that never ends does not
+// make it keep more and more data: a request with longer ones is handed to net/http.
+const maxChunkLine = 256
+
+// chunkExtensions reads what follows a chunk size on its line, at the start of b: any number of ";" and a name, with a
+// value after an "=" that is a token or a quoted string, blanks allowed around the ";" and the "=" but not before the CRLF
+// that ends it all (RFC 9112 7.1.1). It returns the length of the lot, the CRLF included; 0 when it has not arrived in full;
+// and ok=false for anything else, and for a line of more than maxChunkLine bytes.
+func chunkExtensions(b []byte) (n int, ok bool) {
+	line := b[:min(len(b), maxChunkLine)]
+	n, ok = readChunkExtensions(line)
+	return n, ok && (n != 0 || len(line) == len(b)) // not in full within maxChunkLine bytes: it never will be
+}
+
+// readChunkExtensions is chunkExtensions for b alone, whatever follows it.
+func readChunkExtensions(b []byte) (n int, ok bool) {
+	i := 0
+	for i < len(b) && b[i] != '\r' {
+		if i = skipBlanks(b, i); i == len(b) {
+			return 0, true
+		}
+		if b[i] != ';' {
+			return 0, false
+		}
+		start := skipBlanks(b, i+1)
+		if i = tokenEnd(b, start); i == start {
+			return 0, i == len(b)
+		}
+		j := skipBlanks(b, i)
+		if j == len(b) {
+			return 0, true
+		}
+		if b[j] != '=' { // the blanks belong to what follows: another extension, or nothing, which is not valid
+			continue
+		}
+		if i = skipBlanks(b, j+1); i == len(b) {
+			return 0, true
+		}
+		if b[i] != '"' {
+			start = i
+			if i = tokenEnd(b, start); i == start {
+				return 0, false
+			}
+			continue
+		}
+		for i++; ; i++ { // a quoted string, in which a backslash escapes the byte after it
+			if i == len(b) {
+				return 0, true
+			}
+			c := b[i]
+			if c == '"' {
+				i++
+				break
+			}
+			if c == '\\' {
+				if i++; i == len(b) {
+					return 0, true
+				}
+				c = b[i]
+			}
+			if c < ' ' && c != '\t' || c == 0x7f {
+				return 0, false
+			}
+		}
+	}
+	if i+1 >= len(b) {
+		return 0, true
+	}
+	return i + 2, b[i+1] == '\n'
+}
+
+// skipBlanks returns the index of the first byte of b from i on that is no space or tab.
+func skipBlanks(b []byte, i int) int {
+	for i < len(b) && (b[i] == ' ' || b[i] == '\t') {
+		i++
+	}
+	return i
+}
+
+// tokenEnd returns the index of the first byte of b from i on that is no token character.
+func tokenEnd(b []byte, i int) int {
+	for i < len(b) && byteClasses[b[i]]&tokenByte != 0 {
+		i++
+	}
+	return i
 }
 
 // dechunk decodes in place a chunked body the framer delimited (see framer.chunks) and returns the data.
@@ -197,16 +292,20 @@ func dechunk(body []byte) []byte {
 
 // inspectHeader goes once over the field lines of header, deciding how fhttp takes the message in: it returns the length
 // of a Content-Length body, whether the body is chunked instead, and whether the client sent "Expect: 100-continue".
-// errHeaderTooLarge means too many field lines. errHandoff means fhttp does not serve the request itself: a
-// Content-Length above maxBody, an unsupported Transfer-Encoding, or anything unusual (a repeated or invalid
-// Content-Length, another Expect), all of which the standard library judges instead; or a client asking for an event
-// stream (Server-Sent Events), which needs the http.Flusher fhttp does not provide.
+// errHeaderTooLarge means too many field lines. errBadRequest means a message whose body length cannot be told: a
+// Content-Length that is no number, or differs from another, and a Transfer-Encoding whose last coding is not chunked (RFC
+// 9112 6.3). errHandoff means fhttp does not serve the request itself: a Content-Length above maxBody, an unsupported
+// Transfer-Encoding, or anything unusual (a repeated Content-Length, another Expect), all of which the standard library
+// judges instead; or a client asking for an event stream (Server-Sent Events), which needs the http.Flusher fhttp does
+// not provide.
 //
 // A field this scan misses cannot smuggle a request, although the message ends where this scan says: readRequest
 // rejects it, as a name that is no token (say "Content-Length :", see validStdRequest) or because the standard library
 // frames the message differently.
 func inspectHeader(header []byte, maxBody int) (length int, chunked, expectContinue bool, err error) {
-	seenLength := false
+	var lengths, codings int // the field lines of Content-Length and of Transfer-Encoding
+	var declared uint64      // the first Content-Length
+	finalChunked, handoff := false, false
 	end := bytes.IndexByte(header, '\n')
 	requestLine, lines := bytes.TrimSuffix(header[:end], []byte("\r")), header[end+1:]
 	for fieldLines := 0; len(lines) > 0; fieldLines++ {
@@ -218,34 +317,36 @@ func inspectHeader(header []byte, maxBody int) (length int, chunked, expectConti
 		}
 		switch {
 		case hasField(line, "Content-Length"):
-			if seenLength {
-				return 0, false, false, errHandoff
+			n, ok := parseLength(line[len("Content-Length:"):])
+			if !ok || lengths > 0 && n != declared {
+				return 0, false, false, errBadRequest
 			}
-			seenLength = true
-			var ok bool
-			if length, ok = parseLength(line[len("Content-Length:"):], maxBody); !ok {
-				return 0, false, false, errHandoff
+			if lengths, declared = lengths+1, n; n > uint64(maxBody) {
+				handoff = true
+			} else {
+				length = int(n)
 			}
 		case hasField(line, "Transfer-Encoding"):
+			value := fieldValue(line, "Transfer-Encoding")
 			// Only a single field line of just "chunked" has a boundary fhttp frames itself.
-			if chunked || !bytes.EqualFold(fieldValue(line, "Transfer-Encoding"), []byte("chunked")) {
-				return 0, false, false, errHandoff
-			}
-			chunked = true
+			chunked = codings == 0 && bytes.EqualFold(value, []byte("chunked"))
+			finalChunked = bytes.EqualFold(bytes.Trim(value[bytes.LastIndexByte(value, ',')+1:], " \t"), []byte("chunked"))
+			codings++
 		case hasField(line, "Expect"):
 			if !bytes.EqualFold(fieldValue(line, "Expect"), []byte("100-continue")) {
-				return 0, false, false, errHandoff
+				handoff = true
 			}
 			expectContinue = !bytes.HasSuffix(requestLine, []byte("HTTP/1.0")) // no 1xx response goes to an HTTP/1.0 client
 		case hasField(line, "Accept"):
-			if hasEventStream(fieldValue(line, "Accept")) {
-				return 0, false, false, errHandoff
-			}
+			handoff = handoff || hasEventStream(fieldValue(line, "Accept"))
 		}
+	}
+	if codings > 0 && !finalChunked {
+		return 0, false, false, errBadRequest
 	}
 	// A chunked body is framed here only on HTTP/1.1 (RFC 9112 6.1) and without a Content-Length (6.2); net/http judges
 	// the others.
-	if chunked && (seenLength || !bytes.HasSuffix(requestLine, []byte("HTTP/1.1"))) {
+	if handoff || codings > 1 || lengths > 1 || codings == 1 && !chunked || chunked && (lengths > 0 || !bytes.HasSuffix(requestLine, []byte("HTTP/1.1"))) {
 		return 0, false, false, errHandoff
 	}
 	return length, chunked, expectContinue, nil
@@ -281,9 +382,9 @@ func fieldValue(line []byte, name string) []byte {
 }
 
 // parseLength parses a Content-Length value the way the standard library does (see parseContentLength in net/http):
-// the surrounding whitespace and the line's trailing CR are trimmed, and what is left must be a decimal number.
-// ok=false for anything else or for a length above maxBody.
-func parseLength(value []byte, maxBody int) (int, bool) {
+// the surrounding whitespace and the line's trailing CR are trimmed, and what is left must be a decimal number. ok=false
+// for anything else.
+func parseLength(value []byte) (n uint64, ok bool) {
 	n, err := strconv.ParseUint(string(bytes.Trim(value, " \t\r")), 10, 63)
-	return int(n), err == nil && n <= uint64(maxBody)
+	return n, err == nil
 }

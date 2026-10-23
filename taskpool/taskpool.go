@@ -17,7 +17,7 @@
 // than N.
 // When the queue is full it falls back to running the task in a temporary goroutine that helps drain the queue, so
 // submitters never block.
-// A worker stays resident once started (it is never reclaimed).
+// A worker stays resident once started, until the pool is closed (see Pool.Close).
 // When a task panics it is logged (with the stack trace), and the goroutine running it goes on with the following tasks.
 package taskpool
 
@@ -42,7 +42,7 @@ const idleWords = MaxWorkers / 64
 const defaultQueueCapacity = 8192
 
 // NewDefault creates a Pool with one shard per P, MaxWorkers workers per shard, and a queue capacity of 8192 per shard.
-// Workers start only once there are tasks, and a worker started stays resident.
+// Workers start only once there are tasks, and a worker started stays resident until the pool is closed.
 func NewDefault() *Pool {
 	return New(runtime.GOMAXPROCS(0), MaxWorkers, defaultQueueCapacity)
 }
@@ -50,6 +50,7 @@ func NewDefault() *Pool {
 // Pool is a goroutine pool.
 type Pool struct {
 	shards []shard
+	closed atomic.Bool         // set by Close; read by every Submit along with shards, so it shares their cache line
 	_      [cacheLineSize]byte // every Submit reads shards: keep it off the cache line of starving
 	// starving is set when a shard had tasks queued and found no suspended worker and no room for a new one anywhere in
 	// the pool; the next worker to suspend clears it and notifies every shard once (see shard.work). It is written only
@@ -97,10 +98,21 @@ func (p *Pool) SubmitTo(key int, task func()) {
 // the number of shards, so it suits an executor of any size.
 func RandomKey() int { return int(cheaprandn(math.MaxInt32)) }
 
-// submit puts the task into this shard's queue and makes sure a worker comes for it; when the queue is full a
-// temporary goroutine runs the task and helps drain the queue.
+// Close ends the pool's workers: a suspended one exits at once, one running a task when it finds the queue empty, so
+// the tasks submitted before all run. A task submitted afterwards runs in a goroutine of its own, as when the queue is
+// full. Close does not wait for the workers, and may be called more than once.
+func (p *Pool) Close() {
+	p.closed.Store(true)
+	for i := range p.shards {
+		for p.shards[i].wakeIdle(nil) { // a worker sent no shard exits
+		}
+	}
+}
+
+// submit puts the task into this shard's queue and makes sure a worker comes for it; when the queue is full, or the pool
+// closed, a temporary goroutine runs the task and helps drain the queue.
 func (s *shard) submit(task func()) {
-	if !s.push(task) {
+	if s.pool.closed.Load() || !s.push(task) {
 		go s.help(task)
 		return
 	}
@@ -115,8 +127,10 @@ func (p *Pool) SubmitBatch(tasks []func()) {
 	if len(tasks) == 0 {
 		return
 	}
-	if len(tasks) == 1 {
-		p.Submit(tasks[0])
+	if len(tasks) == 1 || p.closed.Load() {
+		for _, task := range tasks {
+			p.Submit(task)
+		}
 		return
 	}
 	count := len(p.shards)
@@ -278,6 +292,10 @@ func (s *shard) notify() {
 			return
 		}
 		s.wakingWorkers.Add(-1)
+		if p.closed.Load() { // the workers have left, so the next to suspend would not come: a goroutine of its own does
+			go s.help(s.pop())
+			return
+		}
 		if !p.starving.Load() {
 			p.starving.Store(true)
 		}
@@ -359,12 +377,15 @@ func (p *Pool) hasIdleWorker() bool {
 // work is the worker with id id of shard s: it takes and runs the tasks of target (s itself, or a shard s lent it to)
 // until that queue is empty, then suspends in s waiting for a wakeup, which names the shard to serve next.
 func (s *shard) work(id int32, wakeup chan *shard, target *shard) {
-	// The loop never ends; the only way out is a task calling runtime.Goexit (which recover cannot stop). A replacement
-	// worker is then started with the same id, on its way back to the same queue: it is still counted in liveWorkers,
-	// and without the replacement this shard would be one worker short forever.
+	// The loop ends only with Pool.Close. The other way out is a task calling runtime.Goexit (which recover cannot stop).
+	// A replacement worker is then started with the same id, on its way back to the same queue: it is still counted in
+	// liveWorkers, and without the replacement this shard would be one worker short forever.
+	closed := false
 	defer func() {
-		target.wakingWorkers.Add(1)
-		go s.work(id, wakeup, target)
+		if !closed {
+			target.wakingWorkers.Add(1)
+			go s.work(id, wakeup, target)
+		}
 	}()
 	p := s.pool
 	word, bit := &s.idleWorkers[id/64], uint64(1)<<(id%64)
@@ -391,8 +412,16 @@ func (s *shard) work(id int32, wakeup chan *shard, target *shard) {
 				p.shards[i].notify()
 			}
 		}
-		target = <-wakeup
+		// Once the pool is closed this worker leaves, unless a waker has taken its bit: a shard, or Close's nil, is then on
+		// its way to it. Checked after registering as suspended, like the queue, so that Close and the worker see each other.
+		if p.closed.Load() && word.And(^bit)&bit != 0 {
+			break
+		}
+		if target = <-wakeup; target == nil {
+			break
+		}
 	}
+	closed = true
 }
 
 // help runs task when the queue is full, then helps take the remaining tasks in the queue before exiting.

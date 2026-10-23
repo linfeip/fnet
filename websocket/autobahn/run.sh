@@ -35,11 +35,11 @@ elif command -v wstest >/dev/null 2>&1; then
     echo "=== Running Autobahn Testsuite via local wstest ==="
     wstest -m fuzzingclient -s fuzzingclient.json
 else
-    echo "Notice: docker or wstest not found on host."
+    echo "Error: docker or wstest not found on host, so nothing was tested."
     echo "To run the complete official Autobahn fuzzing client against websocket:"
     echo "  1) Install Docker or wstest"
     echo "  2) Run ./run.sh again"
-    exit 0
+    exit 1
 fi
 
 echo "=== Autobahn test complete! Reports generated in $DIR/reports/servers/index.html ==="

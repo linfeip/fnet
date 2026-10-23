@@ -125,7 +125,7 @@ func (c *conn) handle(ev uint32) {
 		}
 	}
 	// While the backlog is over maxBacklog the read is skipped; the flush that brings it back down reads again.
-	if ev&evRead != 0 && !c.readPaused.Load() && c.Writable() {
+	if ev&evRead != 0 && !c.readClosed && !c.readPaused.Load() && c.Writable() {
 		c.read()
 	}
 	var err error
@@ -175,8 +175,10 @@ func (c *conn) read() {
 		case unix.EINTR: // interrupted by a signal: this edge-triggered event was used up without reading data, read again
 			c.notify(evRead)
 		case nil: // EOF: the peer closed its write direction
-			c.onClosing(io.EOF)
-			c.requestCloseOnEOF()
+			if !c.halfClose() {
+				c.onClosing(io.EOF)
+				c.requestCloseOnEOF()
+			}
 		default:
 			c.requestClose(err)
 		}
@@ -295,16 +297,27 @@ func (c *conn) expiredBy(now int64) bool {
 // onClosing invokes the OnClosing callback of a ClosingHandler before the engine requests the close of the connection on
 // its own, err being the reason, unless a close has been requested already.
 func (c *conn) onClosing(err error) {
-	h, ok := c.loop.srv.handler.(ClosingHandler)
-	if !ok {
-		return
-	}
-	c.mu.Lock()
-	closing := c.closing
-	c.mu.Unlock()
-	if !closing {
+	if h, ok := c.loop.srv.handler.(ClosingHandler); ok && !c.closeRequested() {
 		h.OnClosing(c, err)
 	}
+}
+
+// halfClose asks a HalfCloseHandler whether to keep the connection open now that EOF is read, and reports whether it does:
+// the connection is then not read again. A connection a close has been requested for is not asked.
+func (c *conn) halfClose() bool {
+	h, ok := c.loop.srv.handler.(HalfCloseHandler)
+	if !ok || c.closeRequested() || !h.OnHalfClose(c) {
+		return false
+	}
+	c.readClosed = true
+	return true
+}
+
+// closeRequested reports whether a close has been requested, see requestClose.
+func (c *conn) closeRequested() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closing
 }
 
 // closeIfRequested closes the connection when a close has been requested and either an immediate close was asked for or
@@ -334,7 +347,9 @@ func (c *conn) close(err error) {
 		c.beginLinger()
 	} else {
 		defer c.loop.srv.openConnsWg.Done()
-		c.discardInbound()
+		if err != io.EOF { // once EOF is read nothing is left to read away
+			c.discardInbound()
+		}
 		c.closeFd()
 	}
 	c.loop.srv.handler.OnClose(c, err)

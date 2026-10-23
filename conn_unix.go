@@ -33,6 +33,7 @@ type conn struct {
 	closeNow   bool          // close immediately, without draining the send buffer (error or deadline); accessed while holding mu
 	closed     bool          // written only by the task while holding the lock, so the task itself can read it lock-free
 	peerClosed bool          // the peer closed or an error occurred (see evHup), accessed only by the task
+	readClosed bool          // EOF has been read and a HalfCloseHandler kept the connection open, so it is not read again; accessed only by the task
 	loop       *loop
 	fd         int
 	task       func() // run bound once, so that handing the task over does not allocate a method value each time
@@ -186,7 +187,9 @@ func (c *conn) ResumeRead() {
 func (c *conn) Detach() (net.Conn, error) {
 	for !c.state.CompareAndSwap(0, scheduledBit) {
 		c.mu.Lock()
-		closed := c.closed // a closed connection keeps scheduledBit set for good (see run), unless it lingers, and then closing is set
+		// A closed connection keeps scheduledBit set for good (see run), unless it lingers. One that is closing may not become
+		// idle for minutes: its peer takes none of the send buffer, and the events it keeps getting each run a task.
+		closed := c.closed || c.closing
 		c.mu.Unlock()
 		if closed {
 			return nil, net.ErrClosed

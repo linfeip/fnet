@@ -27,6 +27,8 @@ type Server struct {
 	listenerFds []int         // the listening sockets, one per address and loop or one per address (see listenerPerLoop)
 	loops       []*loop       // sub-reactors
 	nextLoop    atomic.Uint32 // round-robin over the loops for the connections of a listener they share
+	// pool is the pool of the Executor that NewServerAddrs made because Options.Executor is nil; release closes it.
+	pool *taskpool.Pool
 	// listenerPerLoop: every loop listens on each address with a socket of its own, sharing the address through
 	// SO_REUSEPORT, and serves the connections it accepts, so the loops accept in parallel instead of contending for one
 	// listener and a connection stays with the worker that accepted it; otherwise the loops share one listener per
@@ -69,12 +71,15 @@ func NewServerAddrs(addrs []string, handler Handler, opts Options) (*Server, err
 		return nil, errors.New("fnet: NewServerAddrs needs at least one address")
 	}
 	opts = opts.withDefaults()
+	var pool *taskpool.Pool
 	if opts.Executor == nil {
-		opts.Executor = taskpool.NewDefault().SubmitTo
+		pool = taskpool.NewDefault()
+		opts.Executor = pool.SubmitTo
 	}
 	s := &Server{
 		handler:         handler,
 		opts:            opts,
+		pool:            pool,
 		listenerPerLoop: reusePortSpreads && opts.ReusePort,
 		closing:         make(chan struct{}),
 		done:            make(chan struct{}),
@@ -220,6 +225,9 @@ func (s *Server) release() {
 	s.closeListeners()
 	for _, l := range s.loops {
 		l.close()
+	}
+	if s.pool != nil { // no task is submitted any more: every connection has closed, or none was ever accepted
+		s.pool.Close()
 	}
 }
 

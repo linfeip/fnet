@@ -225,6 +225,7 @@ func (s *Server) readLoop(c *stdConn) (in []byte, err error) {
 	if h, ok := s.handler.(ClosingHandler); ok && c.closedBy.Load() == 0 && (err == io.EOF || err == os.ErrDeadlineExceeded) {
 		c.netConnection.SetWriteDeadline(time.Now().Add(closingWriteTimeout))
 		h.OnClosing(c, err)
+		c.netConnection.SetWriteDeadline(time.Time{}) // it bounds OnClosing alone
 	}
 	return in, err
 }
@@ -277,8 +278,10 @@ func (s *Server) handOver(c *stdConn, in []byte) {
 	s.mu.Lock()
 	delete(s.conns, c)
 	s.mu.Unlock()
+	c.mu.Lock() // Detach takes closedBy and sets detached under it: the read loop may end on its own meanwhile
 	c.in = in
 	close(c.detached)
+	c.mu.Unlock()
 }
 
 const (

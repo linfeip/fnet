@@ -149,22 +149,32 @@ func checkHandshake(r *http.Request) (key string, err error) {
 		return "", ws.ErrHandshakeBadMethod
 	case !r.ProtoAtLeast(1, 1):
 		return "", ws.ErrHandshakeBadProtocol
-	case !strings.EqualFold(r.Header.Get("Upgrade"), "websocket"):
+	case !hasToken(r.Header["Upgrade"], "websocket"):
 		return "", ws.ErrHandshakeBadUpgrade
 	case !hasToken(r.Header["Connection"], "upgrade"):
 		return "", ws.ErrHandshakeBadConnection
 	}
-	switch r.Header.Get("Sec-WebSocket-Version") {
-	case "13":
-	case "":
+	// Neither of these may be repeated (RFC 6455 11.3.1, 11.3.5): the parties on the way could take different ones.
+	versions, keys := r.Header["Sec-Websocket-Version"], r.Header["Sec-Websocket-Key"]
+	switch {
+	case len(versions) != 1:
 		return "", ws.ErrHandshakeBadSecVersion
-	default:
+	case versions[0] != "13":
 		return "", ws.ErrHandshakeUpgradeRequired
-	}
-	if key = r.Header.Get("Sec-WebSocket-Key"); len(key) != 24 { // base64 of a 16-byte random value
+	case len(keys) != 1 || !validNonce(keys[0]):
 		return "", ws.ErrHandshakeBadSecKey
 	}
-	return key, nil
+	return keys[0], nil
+}
+
+// validNonce reports whether key is a Sec-WebSocket-Key: the base64 encoding of 16 bytes (RFC 6455 4.1), 24 characters.
+func validNonce(key string) bool {
+	var nonce [18]byte
+	if len(key) != 24 {
+		return false
+	}
+	n, err := base64.StdEncoding.Decode(nonce[:], []byte(key))
+	return err == nil && n == 16
 }
 
 // acceptGUID is the GUID RFC 6455 appends to the key to compute Sec-WebSocket-Accept.

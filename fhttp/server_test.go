@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"reflect"
 	"runtime"
@@ -479,6 +480,23 @@ func TestFlushFailure(t *testing.T) {
 	}
 }
 
+// TestHandlerGoexit checks that a Handler exiting its goroutine (runtime.Goexit, which is what a test's FailNow does)
+// closes the connection after the responses to the requests before it, rather than leaving the client waiting for
+// answers no worker is left to give.
+func TestHandlerGoexit(t *testing.T) {
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/exit" {
+			runtime.Goexit()
+		}
+		io.WriteString(w, "ok")
+	}), Options{})
+	br := dialRaw(t, s, "GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /exit HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n")
+	if resp, body := readResp(t, br); resp.StatusCode != http.StatusOK || body != "ok" {
+		t.Fatalf("the request before the Handler exited: got %d %q", resp.StatusCode, body)
+	}
+	expectClosed(t, br)
+}
+
 // TestSlowReader has a client pipeline requests for large responses and read none: the server answers only as many as
 // the socket and fnet's send buffer take, rather than piling every response up in memory.
 func TestSlowReader(t *testing.T) {
@@ -622,10 +640,16 @@ func TestStreamedResponse(t *testing.T) {
 		{name: "chunked", request: get, handle: write, fields: []string{"Transfer-Encoding: chunked"}, absent: []string{"Content-Length"}, body: payload},
 		{name: "declared length", request: get, handle: declare("102400"), fields: []string{"Content-Length: 102400"},
 			absent: []string{"Transfer-Encoding"}, body: payload},
-		{name: "declared length short of a piece", request: get, handle: declare("30000"), err: http.ErrContentLength,
-			fields: []string{"Content-Length: 30000"}, truncated: true, closed: true},
-		{name: "declared length short of the last piece", request: get, handle: declare("70000"), fields: []string{"Content-Length: 70000"},
-			body: payload[:70000], closed: true},
+		// A Write that would go past the declared length fails whole, as on net/http. Before any of the body has gone out
+		// the response is the one of what was written, and after it the declared length stands, with the connection closed.
+		{name: "declared length exceeded", request: get, handle: declare("30000"), err: http.ErrContentLength,
+			fields: []string{"Content-Length: 0"}},
+		{name: "declared length exceeded after the body started", request: get, handle: func(w http.ResponseWriter) error {
+			w.Header().Set("Content-Length", "70000")
+			io.WriteString(w, payload[:maxBufferedBody+1])
+			_, err := io.WriteString(w, payload[:10000])
+			return err
+		}, err: http.ErrContentLength, fields: []string{"Content-Length: 70000"}, body: payload[:maxBufferedBody+1], truncated: true, closed: true},
 		{name: "declared length not reached", request: get, handle: declare("200000"), fields: []string{"Content-Length: 200000"},
 			body: payload, truncated: true, closed: true},
 		{name: "HTTP/1.0", request: http10, handle: write, fields: []string{"Connection: close"},
@@ -676,6 +700,137 @@ func TestStreamedResponse(t *testing.T) {
 			t.Errorf("%s: Write returned %v, read %d bytes (%v), closed=%v; want %v, %d bytes, truncated=%v, closed=%v",
 				tt.name, err, len(body), readErr, rc.closed, tt.err, len(tt.body), tt.truncated, tt.closed)
 		}
+	}
+}
+
+// TestHeaderFixedWhenStatusWritten checks that the header goes out as the Handler left it when it wrote the status, with
+// WriteHeader or with the first Write: changes after that do not count, as on net/http, though the response is
+// serialized only when the Handler returns.
+func TestHeaderFixedWhenStatusWritten(t *testing.T) {
+	for _, path := range []string{"/explicit", "/implicit"} {
+		rc := &recordConn{}
+		c := queueConn(rc)
+		c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			header := w.Header()
+			header.Set("X-Phase", "committed")
+			header.Set("Connection", "keep-alive")
+			if r.URL.Path == "/explicit" {
+				w.WriteHeader(http.StatusCreated)
+			} else {
+				io.WriteString(w, "body")
+			}
+			header.Set("X-Phase", "too-late")
+			header.Set("X-Late", "1")
+			header.Set("Content-Type", "text/csv")
+			header.Del("Connection")
+			io.WriteString(w, "!")
+		})
+		c.onData([]byte("GET " + path + " HTTP/1.1\r\nHost: a\r\n\r\n"))
+		c.serve()
+		resp, body := readResp(t, bufio.NewReader(strings.NewReader(strings.Join(rc.writes, ""))))
+		if resp.Header.Get("X-Phase") != "committed" || resp.Header.Get("X-Late") != "" || resp.Header.Get("Connection") != "keep-alive" ||
+			resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" || !strings.HasSuffix(body, "!") {
+			t.Errorf("%s: header %v, body %q", path, resp.Header, body)
+		}
+	}
+}
+
+// TestDeclaredContentLength checks the Content-Length a Handler declares, as on net/http: a Write that would go past it
+// fails whole with http.ErrContentLength, one that fits is written, and a buffered body that falls short goes out with the
+// length it has.
+func TestDeclaredContentLength(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		writes []string
+		errs   []error // what each Write returns
+		body   string
+	}{
+		{"fits", []string{"abc", "de"}, []error{nil, nil}, "abcde"},
+		{"exceeded", []string{"abc", "defg"}, []error{nil, http.ErrContentLength}, "abc"},
+		{"exceeded, then fits", []string{"abc", "defg", "de"}, []error{nil, http.ErrContentLength, nil}, "abcde"},
+		{"short", []string{"abc"}, []error{nil}, "abc"},
+	} {
+		rc := &recordConn{}
+		c := queueConn(rc)
+		var errs []error
+		c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "5")
+			for _, write := range tt.writes {
+				_, err := io.WriteString(w, write)
+				errs = append(errs, err)
+			}
+		})
+		c.onData([]byte("GET / HTTP/1.1\r\nHost: a\r\n\r\n"))
+		c.serve()
+		resp, body := readResp(t, bufio.NewReader(strings.NewReader(strings.Join(rc.writes, ""))))
+		if !slices.Equal(errs, tt.errs) || body != tt.body || resp.ContentLength != int64(len(tt.body)) || rc.closed {
+			t.Errorf("%s: Writes returned %v, body %q with Content-Length %d, closed=%v; want %v, %q", tt.name, errs, body,
+				resp.ContentLength, rc.closed, tt.errs, tt.body)
+		}
+	}
+}
+
+// TestStreamWriteCount checks that a Write that fails once part of it is on its way reports how much of it was taken.
+func TestStreamWriteCount(t *testing.T) {
+	rc := &recordConn{err: net.ErrClosed}
+	c := queueConn(rc)
+	var n int
+	var err error
+	c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, err = w.Write(make([]byte, 3*maxBufferedBody))
+	})
+	c.onData([]byte("GET / HTTP/1.1\r\nHost: a\r\n\r\n"))
+	c.serve()
+	if n != maxBufferedBody || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Write returned %d, %v; want the first piece, %d, and the error", n, err, maxBufferedBody)
+	}
+}
+
+// discardConn is a fnet.Conn that counts what is written to it.
+type discardConn struct {
+	recordConn
+	written int
+}
+
+func (c *discardConn) Write(b []byte) (int, error) { c.written += len(b); return len(b), nil }
+
+func (c *discardConn) Writev(bs [][]byte) (n int, err error) {
+	for _, b := range bs {
+		n += len(b)
+	}
+	c.written += n
+	return n, nil
+}
+
+// TestWriteStringLong checks that a string over maxBufferedBody goes out as bytes do, and that no copy of all of it is
+// made: it is copied into the buffer a piece at a time.
+func TestWriteStringLong(t *testing.T) {
+	run := func(long string, connection fnet.Conn) *conn {
+		c := &conn{srv: &Server{opts: Options{}.withDefaults()}, connection: connection, worker: workerServing}
+		c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if n, err := io.WriteString(w, long); n != len(long) || err != nil {
+				t.Errorf("WriteString returned %d, %v; want %d, nil", n, err, len(long))
+			}
+		})
+		c.onData([]byte("GET / HTTP/1.1\r\nHost: a\r\n\r\n"))
+		c.serve()
+		return c
+	}
+	short := strings.Repeat("0123456789abcdef", 12*units.KB) // 192KB: three pieces
+	rc := &recordConn{}
+	run(short, rc)
+	if _, body := readResp(t, bufio.NewReader(strings.NewReader(strings.Join(rc.writes, "")))); body != short {
+		t.Fatalf("a string of %d bytes came out as %d bytes", len(short), len(body))
+	}
+
+	long := strings.Repeat("0123456789abcdef", 512*units.KB) // 8MB
+	dc := new(discardConn)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	run(long, dc)
+	runtime.ReadMemStats(&after)
+	if dc.written < len(long) || after.TotalAlloc-before.TotalAlloc > uint64(len(long))/4 {
+		t.Fatalf("a string of %d bytes took %d bytes written and %d allocated", len(long), dc.written, after.TotalAlloc-before.TotalAlloc)
 	}
 }
 
@@ -872,19 +1027,24 @@ func TestBadRequests(t *testing.T) {
 		{"GET /hello HTTP/1.1\r\nHost: a\n\r\n", 400},
 		// A bare CR before the request line is no empty line (RFC 9112 2.2).
 		{"\r\rGET /hello HTTP/1.1\r\nHost: a\r\n\r\n", 400},
-		// Unless chunked is the final transfer coding the body's length is unknown (RFC 9112 6.3), where the net/http
-		// server answers 501.
-		{"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n", 501},
-		{"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", 501},
-		// An invalid Host field, which the host of an absolute-form target stands in for, and a CONNECT to an empty or
-		// invalid port (RFC 9110 9.3.6).
+		// Unless chunked is the final transfer coding the body's length is unknown (RFC 9112 6.3): 400, where the net/http
+		// server answers 501. So it is for a Content-Length that is no number, or differs from another one.
+		{"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n", 400},
+		{"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", 400},
+		{"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n", 400},
+		{"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxy", 400},
+		// An invalid Host field, which the host of an absolute-form target stands in for, a CONNECT without one, and a
+		// CONNECT to an empty or invalid port (RFC 9110 9.3.6).
 		{"GET http://a/hello HTTP/1.1\r\nHost: b c\r\n\r\n", 400},
+		{"CONNECT a:443 HTTP/1.1\r\n\r\n", 400},
 		{"CONNECT a HTTP/1.1\r\nHost: a\r\n\r\n", 400},
 		{"CONNECT a: HTTP/1.1\r\nHost: a:\r\n\r\n", 400},
 		{"CONNECT a:65536 HTTP/1.1\r\nHost: a:65536\r\n\r\n", 400},
+		// An invalid Host or a CONNECT to no port is answered 400 on a request net/http reads as well.
+		{"GET /hello HTTP/1.1\r\nHost: a:foo\r\nAccept: text/event-stream\r\n\r\n", 400},
+		{"CONNECT a:65536 HTTP/1.1\r\nHost: a:65536\r\nAccept: text/event-stream\r\n\r\n", 400},
 		// Not buffered by fhttp, so net/http answers them, the same as the net/http server would.
 		{"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", 501},
-		{"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n", 400},
 		{"POST /echo HTTP/1.1\r\nHost: a\r\nExpect: foo\r\nContent-Length: 1\r\n\r\nx", 417},
 		{"GET /hello HTTP/9.9\r\nHost: a\r\n\r\n", 505},
 		{"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 505},
@@ -897,6 +1057,8 @@ func TestBadRequests(t *testing.T) {
 		{"GET /hello HTTP/1.1\r\nHost: a\"b\r\n\r\n", 400},
 		{"GET /hello HTTP/1.1\r\nHost: evil.com/path\r\n\r\n", 400},
 		{"GET /hello HTTP/1.1\r\nHost: <script>\r\n\r\n", 400},
+		{"GET /hello HTTP/1.1\r\nHost: a:foo\r\n\r\n", 400},
+		{"GET /hello HTTP/1.1\r\nHost: [bad\r\n\r\n", 400},
 	}
 	for _, tt := range tests {
 		br := dialRaw(t, s, tt.req)
@@ -995,12 +1157,33 @@ func TestResponseSemantics(t *testing.T) {
 	}
 }
 
+// TestRejectedConnect checks that the response to a CONNECT closes the connection whatever its status, not only after a
+// 2xx that would open a tunnel: what follows the request on the connection may be the data of the tunnel a client or an
+// intermediary took the request to open, and is not executed.
+func TestRejectedConnect(t *testing.T) {
+	var served atomic.Int32
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		served.Add(1)
+		if r.Method == http.MethodConnect {
+			w.WriteHeader(http.StatusProxyAuthRequired)
+		}
+	}), Options{})
+	br := dialRaw(t, s, "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n\r\nGET /hello HTTP/1.1\r\nHost: a\r\n\r\n")
+	if resp, _ := readResp(t, br); resp.StatusCode != http.StatusProxyAuthRequired || !resp.Close {
+		t.Fatalf("CONNECT: got %d, close=%v; want 407, true", resp.StatusCode, resp.Close)
+	}
+	expectClosed(t, br)
+	if n := served.Load(); n != 1 {
+		t.Fatalf("%d requests were executed, want only the CONNECT", n)
+	}
+}
+
 // TestValidHost checks that a Host may be a hostname, an IPv4 address or an IPv6 literal with a zone
 // identifier, optionally with a port; any other character is rejected.
 func TestValidHost(t *testing.T) {
 	for _, host := range []string{
 		"", "localhost", "example.com", "example.com:8080", "127.0.0.1:80", "[::1]", "[::1]:8080", "[fe80::1%25en0]:80",
-		"a_b-c.d~e", "a+b", "a,b", "a;b", "a=b", "a'b", "a!b", "a$b", "a(b)", "a*b", "a&b",
+		"a_b-c.d~e", "a+b", "a,b", "a;b", "a=b", "a'b", "a!b", "a$b", "a(b)", "a*b", "a&b", "localhost:", "[::1]:", "a:0",
 	} {
 		if !validHost(host) {
 			t.Errorf("validHost(%q) = false, want true", host)
@@ -1008,6 +1191,8 @@ func TestValidHost(t *testing.T) {
 	}
 	for _, host := range []string{
 		"a b", "a\tb", "a\"b", "a/b", "a\\b", "a<b>", "a@b", "a?b", "a#b", "a{b}", "a|b", "a^b", "a`b", "a\x00b", "a\x7fb", "aéb",
+		// The structure: a port of digits after a single colon, and brackets around an IP literal only.
+		"[bad", "a:foo", "a:80:90", "::1", "[]", "[::1]x", "[::1", "a]", "[a][b]", "[[::1]", "[::1]:80:90", ":80x",
 	} {
 		if validHost(host) {
 			t.Errorf("validHost(%q) = true, want false", host)
@@ -1289,6 +1474,173 @@ func TestHTTPS(t *testing.T) {
 	}
 }
 
+// halfCloseHandler answers with the path and the body of the request once its context has ended, which is when the engine
+// has read the client's FIN: the responses then have to go out on a connection whose client has closed its write
+// direction, as the net/http server's do (it ends the context as well). canceled counts the contexts that ended.
+func halfCloseHandler(canceled *atomic.Int32) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			canceled.Add(1)
+		case <-time.After(5 * time.Second):
+		}
+		body, _ := io.ReadAll(r.Body)
+		fmt.Fprintf(w, "%s %s", r.URL.Path, body)
+	})
+}
+
+// TestHalfClose checks that a client that closes its write direction once it has sent its requests, which does not mean it
+// no longer awaits the responses (RFC 9112 9.6), gets every one, in order, and then the end of the connection, as with
+// net/http; and that a connection with nothing to answer is closed at once, an incomplete request included.
+func TestHalfClose(t *testing.T) {
+	const get = "GET /%s HTTP/1.1\r\nHost: a\r\n\r\n"
+	var canceled atomic.Int32
+	s := serve(t, halfCloseHandler(&canceled), Options{})
+	for _, tc := range []struct {
+		name, request string
+		want          []string
+	}{
+		{"GET", fmt.Sprintf(get, "a"), []string{"/a "}},
+		{"HTTP/1.0", "GET /a HTTP/1.0\r\n\r\n", []string{"/a "}},
+		{"Content-Length", "POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi", []string{"/p hi"}},
+		{"chunked", "POST /p HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n", []string{"/p hi"}},
+		{"pipelined", fmt.Sprintf(get, "a") + fmt.Sprintf(get, "b") + fmt.Sprintf(get, "c"), []string{"/a ", "/b ", "/c "}},
+		{"incomplete request last", fmt.Sprintf(get, "a") + "GET /b HTT", []string{"/a "}},
+		{"nothing to answer", "", nil},
+		{"incomplete request only", "GET /b HTT", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := canceled.Load()
+			c, err := net.Dial("tcp", s.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			c.SetDeadline(time.Now().Add(10 * time.Second))
+			io.WriteString(c, tc.request)
+			c.(*net.TCPConn).CloseWrite()
+			br := bufio.NewReader(c)
+			for _, want := range tc.want {
+				if resp, body := readResp(t, br); resp.StatusCode != http.StatusOK || body != want {
+					t.Fatalf("got %d %q, want 200 %q", resp.StatusCode, body, want)
+				}
+			}
+			expectClosed(t, br)
+			if n := canceled.Load() - before; int(n) != len(tc.want) {
+				t.Fatalf("%d contexts ended, want one for each of the %d requests answered", n, len(tc.want))
+			}
+		})
+	}
+}
+
+// TestHalfCloseTLS is TestHalfClose over TLS, where the client closes its write direction with a close_notify (what
+// crypto/tls's CloseWrite sends) or with a FIN alone.
+func TestHalfCloseTLS(t *testing.T) {
+	var canceled atomic.Int32
+	s := serve(t, halfCloseHandler(&canceled), Options{TLSConfig: tlsServerConfig(t)})
+	for name, closeWrite := range map[string]func(*tls.Conn) error{
+		"close_notify": (*tls.Conn).CloseWrite,
+		"FIN":          func(c *tls.Conn) error { return c.NetConn().(*net.TCPConn).CloseWrite() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := tls.Dial("tcp", s.Addr().String(), &tls.Config{InsecureSkipVerify: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			c.SetDeadline(time.Now().Add(10 * time.Second))
+			io.WriteString(c, "GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n")
+			if err := closeWrite(c); err != nil {
+				t.Fatal(err)
+			}
+			br := bufio.NewReader(c)
+			for _, want := range []string{"/a ", "/b "} {
+				if resp, body := readResp(t, br); resp.StatusCode != http.StatusOK || body != want {
+					t.Fatalf("got %d %q, want 200 %q", resp.StatusCode, body, want)
+				}
+			}
+			if b, err := br.ReadByte(); err != io.EOF {
+				t.Fatalf("want the connection to be closed, got %q %v", b, err)
+			}
+		})
+	}
+}
+
+// TestHalfCloseQueue follows halfClose through the states of a connection: with no worker (nothing to answer) or a
+// protocol in charge it leaves the close to the engine; with a worker on the queue it queues the close behind the
+// requests, the worker answers them and closes the connection, and the requests' context has ended.
+func TestHalfCloseQueue(t *testing.T) {
+	const get = "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+	c := queueConn(&recordConn{})
+	c.worker = workerIdle
+	if c.halfClose() {
+		t.Fatal("halfClose kept a connection open that has no request to answer")
+	}
+	c.worker = workerServing
+	var p Protocol
+	c.protocol.Store(&p)
+	if c.halfClose() {
+		t.Fatal("halfClose kept a connection open that a protocol is in charge of")
+	}
+
+	rc := &recordConn{}
+	c = queueConn(rc)
+	var ctxErr error // read in the Handler: the request, and with it its context, is released once the Handler returns
+	c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctxErr = r.Context().Err()
+		io.WriteString(w, "ok")
+	})
+	c.onData([]byte(get + get))
+	if !c.halfClose() || !c.halfClosed() || len(c.queue) != 3 {
+		t.Fatalf("with a worker on two requests: queue of %d, want those two and the close", len(c.queue))
+	}
+	c.serve() // the worker queueConn stands for
+	if got := strings.Count(strings.Join(rc.writes, ""), "HTTP/1.1 200 OK"); got != 2 || !rc.closed || c.worker != workerClosing {
+		t.Fatalf("%d responses, closed=%v, worker state %d; want 2, true, closing", got, rc.closed, c.worker)
+	}
+	if ctxErr == nil {
+		t.Fatal("the context of a request answered after the client closed its write direction has not ended")
+	}
+}
+
+// TestQueryParam checks that QueryParam and ForEachQuery read the query the way r.URL.Query() does, escapes, invalid
+// pairs and repeated keys included, and that they allocate nothing when there is nothing to unescape.
+func TestQueryParam(t *testing.T) {
+	for _, query := range []string{
+		"", "a=1", "a=1&b=2", "a=1&a=2", "a", "a=", "=v", "&&a=1&", "a=a+b%2Fc", "a%62=x&ab=y", "a=%zz&b=2", "%zz=1&b=2",
+		"a=1;b=2&c=3", "a=1&b=%41%42&c=%e4%bd%a0", "a==b", "a=b=c",
+	} {
+		r := &http.Request{URL: &url.URL{RawQuery: query}}
+		want := r.URL.Query()
+		for _, key := range []string{"a", "ab", "b", "c", "", "a=1"} {
+			if got := QueryParam(r, key); got != want.Get(key) {
+				t.Errorf("QueryParam(%q, %q) = %q, want %q", query, key, got, want.Get(key))
+			}
+		}
+		got := url.Values{}
+		ForEachQuery(r, func(key, value string) bool {
+			got.Add(key, value)
+			return true
+		})
+		if !reflect.DeepEqual(got, want) && (len(got) != 0 || len(want) != 0) {
+			t.Errorf("ForEachQuery(%q) saw %v, want %v", query, got, want)
+		}
+	}
+
+	r := &http.Request{URL: &url.URL{RawQuery: "a=1&b=2&c=3"}}
+	var keys []string
+	ForEachQuery(r, func(key, _ string) bool {
+		keys = append(keys, key)
+		return key != "b"
+	})
+	if !slices.Equal(keys, []string{"a", "b"}) {
+		t.Errorf("ForEachQuery went on after fn returned false: %v", keys)
+	}
+	if allocs := testing.AllocsPerRun(100, func() { QueryParam(r, "c") }); allocs != 0 {
+		t.Errorf("QueryParam allocated %v times", allocs)
+	}
+}
+
 // TestDate checks that the Date field line is that of the current second.
 func TestDate(t *testing.T) {
 	var b bytepool.Buffer
@@ -1423,6 +1775,27 @@ func TestParseRequest(t *testing.T) {
 	for _, raw := range parseCases.slow {
 		if msg, m := readMessage(t, raw); parseRequest(msg, m, new(lastRequest)) != nil {
 			t.Errorf("%q: parseRequest should leave it to http.ReadRequest", raw)
+		}
+	}
+}
+
+// TestRetainedRequest checks that a connection keeps the target and the header block of its request for the next one to
+// share only up to maxRetainedBytes.
+func TestRetainedRequest(t *testing.T) {
+	for _, tt := range []struct {
+		name, target, header string
+		retained             bool
+	}{
+		{"short", "/a", "Host: a\r\n", true},
+		{"at the limit", "/" + strings.Repeat("a", maxRetainedBytes-1), "Host: a\r\n", true},
+		{"long target", "/" + strings.Repeat("a", maxRetainedBytes), "Host: a\r\n", false},
+		{"long header", "/a", "Host: a\r\nCookie: " + strings.Repeat("a", maxRetainedBytes) + "\r\n", false},
+	} {
+		msg, m := readMessage(t, "GET "+tt.target+" HTTP/1.1\r\n"+tt.header+"\r\n")
+		var last lastRequest
+		parseRequest(msg, m, &last).release()
+		if got := last.target != "" && last.fields != ""; got != tt.retained || !tt.retained && last.target+last.fields == tt.target+tt.header {
+			t.Errorf("%s: kept target of %d bytes and header of %d, want kept=%v", tt.name, len(last.target), len(last.fields), tt.retained)
 		}
 	}
 }

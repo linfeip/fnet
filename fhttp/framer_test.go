@@ -74,7 +74,12 @@ func TestFramer(t *testing.T) {
 		// Earlier messages are split out before the one that goes to net/http, which judges the body itself.
 		{"chunked too large", get + chunked + "21\r\n", []string{get}, errHandoff},
 		{"chunked too large in total", chunked + "10\r\n0123456789abcdef\r\n10\r\n0123456789abcdef\r\n", nil, errHandoff},
-		{"chunk extension", chunked + "5;a=b\r\nhello\r\n0\r\n\r\n", nil, errHandoff},
+		// Chunk extensions are read by fhttp, blanks around the ';' and the '=' included (RFC 9112 7.1.1), which net/http's
+		// reader does not take; see TestChunkHeader for the forms.
+		{"chunk extension", chunked + "5;a=b\r\nhello\r\n0\r\n\r\n", []string{chunked + "5;a=b\r\nhello\r\n0\r\n\r\n"}, nil},
+		{"chunk extension with blanks", chunked + "5 ; a = b\r\nhello\r\n0\r\n\r\n", []string{chunked + "5 ; a = b\r\nhello\r\n0\r\n\r\n"}, nil},
+		{"chunk extension on the last chunk", chunked + "5\r\nhello\r\n0;x\r\n\r\n", []string{chunked + "5\r\nhello\r\n0;x\r\n\r\n"}, nil},
+		{"chunk extension of no end", chunked + "5;" + strings.Repeat("a", 300) + "\r\nhello\r\n0\r\n\r\n", nil, errHandoff},
 		{"chunk size with spaces", chunked + "5 \r\nhello\r\n0\r\n\r\n", nil, errHandoff},
 		{"chunk without CRLF", chunked + "5\r\nhelloX\r\n0\r\n\r\n", nil, errHandoff},
 		{"bare LF after chunk size", chunked + "5\nhello\r\n0\r\n\r\n", nil, errHandoff},
@@ -88,13 +93,21 @@ func TestFramer(t *testing.T) {
 		// error without fhttp trying to guess the body boundary.
 		{"chunked on HTTP/1.0", "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", nil, errHandoff},
 		{"chunked and Content-Length on HTTP/1.0", "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello", nil, errHandoff},
-		{"no chunked", "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n", nil, errHandoff},
-		{"chunked not last", "POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", nil, errHandoff},
-		{"chunked not in the last line", "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n", nil, errHandoff},
-		{"no chunked on HTTP/1.0", "POST / HTTP/1.0\r\nTransfer-Encoding: gzip\r\n\r\n", nil, errHandoff},
-		{"invalid Content-Length", "POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n", nil, errHandoff},
-		{"empty Content-Length", "POST / HTTP/1.1\r\nContent-Length: \r\n\r\n", nil, errHandoff},
+		{"chunked in the last line only", "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n", nil, errHandoff},
+		// A Transfer-Encoding whose last coding is not chunked leaves the length of the body unknown: 400 (RFC 9112 6.3), and
+		// not net/http's 501, whatever else would have the request handed over.
+		{"no chunked", "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n", nil, errBadRequest},
+		{"chunked not last", "POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", nil, errBadRequest},
+		{"chunked not in the last line", "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n", nil, errBadRequest},
+		{"no chunked on HTTP/1.0", "POST / HTTP/1.0\r\nTransfer-Encoding: gzip\r\n\r\n", nil, errBadRequest},
+		{"no chunked and an event stream", "GET / HTTP/1.1\r\nAccept: text/event-stream\r\nTransfer-Encoding: gzip\r\n\r\n", nil, errBadRequest},
+		// A Content-Length that is no number, or differs from another one, is answered by fhttp, with a Date.
+		{"invalid Content-Length", "POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n", nil, errBadRequest},
+		{"empty Content-Length", "POST / HTTP/1.1\r\nContent-Length: \r\n\r\n", nil, errBadRequest},
+		{"Content-Length list", "POST / HTTP/1.1\r\nContent-Length: 1, 1\r\n\r\nx", nil, errBadRequest},
+		{"differing Content-Length", "POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxy", nil, errBadRequest},
 		{"duplicate Content-Length", "POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx", nil, errHandoff},
+		{"duplicate large Content-Length", "POST / HTTP/1.1\r\nContent-Length: 99\r\nContent-Length: 99\r\n\r\n", nil, errHandoff},
 		{"other Expect", "POST / HTTP/1.1\r\nExpect: foo\r\n\r\n", nil, errHandoff},
 		// An event stream is answered by net/http, which sends it as it is written.
 		{"event stream", get + "GET /events HTTP/1.1\r\naccept: text/html, text/event-stream;q=0.9\r\n\r\n", []string{get}, errHandoff},
@@ -117,6 +130,59 @@ func TestFramer(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestChunkHeader checks the size line of a chunk: the extensions that may follow the size are *( BWS ";" BWS name [ BWS
+// "=" BWS value ] ), a value being a token or a quoted string, and nothing may stand between them and the CRLF.
+func TestChunkHeader(t *testing.T) {
+	for _, line := range []string{
+		"5\r\n", "a\r\n", "A0\r\n", "5;a\r\n", "5;a=b\r\n", "5 ; a = b\r\n", "5\t;\ta\t=\tb\r\n", "5;a;b=c;d\r\n", "5;a=b ;c=d\r\n",
+		"5;a=\"b c\"\r\n", "5;a=\"b;\\\"\"\r\n", "5;a=\"\"\r\n", "0;last=1\r\n", "5;a=\xff\r\n"[:0] + "5;!#$%&'*+-.^_`|~=0\r\n",
+	} {
+		size, n, ok := chunkHeader([]byte(line + "data"))
+		if wantSize := map[byte]int{'5': 5, 'a': 10, 'A': 160, '0': 0}[line[0]]; !ok || n != len(line) || size != wantSize {
+			t.Errorf("%q: size %d, length %d, ok=%v; want %d, %d, true", line, size, n, ok, wantSize, len(line))
+		}
+		for i := range len(line) {
+			if _, n, ok := chunkHeader([]byte(line[:i])); n != 0 || !ok {
+				t.Errorf("%q: length %d, ok=%v; want a line not in full yet", line[:i], n, ok)
+			}
+		}
+	}
+	for _, line := range []string{
+		"\r\n", ";a\r\n", "x\r\n", "5x\r\n", "5 \r\n", "5\t\r\n", "5;\r\n", "5; \r\n", "5;=b\r\n", "5;a=\r\n", "5;a= \r\n", "5;a \r\n", "5;a=b \r\n",
+		"5;a b\r\n", "5 a\r\n", "5;a=b=c\r\n", "5;a=\"b\r\n", "5;a=\"b\"c\r\n", "5;a=\"\x00\"\r\n", "5;a=\"\\\x00\"\r\n", "5;a=b\n", "5;a=b\rx",
+		"5;a=\"b\r\n\"\r\n", "5;(=b\r\n", "000000005\r\n", "5;" + strings.Repeat("a", maxChunkLine+1) + "\r\n",
+	} {
+		if _, n, ok := chunkHeader([]byte(line)); ok && n != 0 {
+			t.Errorf("%q: read as a line of %d bytes, want it refused", line, n)
+		}
+	}
+}
+
+// FuzzChunkHeader checks what the framer relies on, as the data of a size line arrives in pieces: a line that is read ends
+// at the one CRLF in it, no shorter prefix of it counts as a line, and what follows it does not change how it is read.
+func FuzzChunkHeader(f *testing.F) {
+	for _, line := range []string{"5\r\n", "a;b=c\r\n", "5 ; a = \"b\\\"\"\r\n", "0;x\r\n", "5;a=b \r\n", "5;a=\"b\r\n"} {
+		f.Add(line)
+	}
+	f.Fuzz(func(t *testing.T, line string) {
+		size, n, ok := chunkHeader([]byte(line))
+		if !ok || n == 0 {
+			return
+		}
+		if n > len(line) || line[n-2:n] != "\r\n" || strings.ContainsAny(line[:n-2], "\r\n") || size < 0 || n > 8+maxChunkLine {
+			t.Fatalf("%q: size %d, length %d", line, size, n)
+		}
+		for i := range n - 1 {
+			if _, prefixLength, prefixOK := chunkHeader([]byte(line[:i])); prefixLength != 0 || !prefixOK {
+				t.Fatalf("%q: its prefix %q is read as a line of %d bytes, ok=%v", line[:n], line[:i], prefixLength, prefixOK)
+			}
+		}
+		if sameSize, sameLength, sameOK := chunkHeader([]byte(line[:n] + "\r\ntail;")); sameSize != size || sameLength != n || !sameOK {
+			t.Fatalf("%q: read differently with more data after it", line[:n])
+		}
+	})
 }
 
 // TestFramerExpectContinue checks that 100 Continue is asked for only while the body has not arrived, and never for
@@ -169,21 +235,20 @@ func TestFramerFieldLines(t *testing.T) {
 func TestParseLength(t *testing.T) {
 	for _, tt := range []struct {
 		value string
-		max   int
-		n     int
+		n     uint64
 		ok    bool
 	}{
-		{"0", 10, 0, true},
-		{" 10\t\r", 10, 10, true},
-		{"11", 10, 0, false},
-		{"1a", 10, 0, false},
-		{"+1", 10, 0, false},
-		{"", 10, 0, false},
-		{"99999999999999999999999", 1<<63 - 1, 0, false}, // overflow
-		{"9223372036854775807", 1<<63 - 1, 1<<63 - 1, true},
+		{"0", 0, true},
+		{" 10\t\r", 10, true},
+		{"1a", 0, false},
+		{"+1", 0, false},
+		{"-1", 0, false},
+		{"", 0, false},
+		{"99999999999999999999999", 0, false}, // overflow
+		{"9223372036854775807", 1<<63 - 1, true},
 	} {
-		if n, ok := parseLength([]byte(tt.value), tt.max); ok != tt.ok || ok && n != tt.n { // n means nothing when !ok
-			t.Errorf("parseLength(%q, %d) = %d, %v; want %d, %v", tt.value, tt.max, n, ok, tt.n, tt.ok)
+		if n, ok := parseLength([]byte(tt.value)); ok != tt.ok || ok && n != tt.n { // n means nothing when !ok
+			t.Errorf("parseLength(%q) = %d, %v; want %d, %v", tt.value, n, ok, tt.n, tt.ok)
 		}
 	}
 }

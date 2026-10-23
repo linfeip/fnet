@@ -28,10 +28,15 @@ type parsedRequest struct {
 	reader         *reader   // what the body of a request http.ReadRequest read reads from, see readRequest
 }
 
-// lastRequest holds what a connection's requests share, made on its first one: the strings of the previous request that
-// parseRequest shares with the next one when it has the same bytes there (a client usually sends the same header fields
-// every time, and often requests the same target again: polling, reporting, calling the same API), the TLS state and
-// the context.
+// maxRetainedBytes is the longest request target or header block a connection keeps for the next request to share (see
+// lastRequest). Longer ones are copied again each time: held by every idle connection, a header of the 16KB allowed would
+// add up to gigabytes at a million connections.
+const maxRetainedBytes = units.KB
+
+// lastRequest holds what a connection's requests share, made on its first one: the strings of the previous request, up to
+// maxRetainedBytes, that parseRequest shares with the next one when it has the same bytes there (a client usually sends
+// the same header fields every time, and often requests the same target again: polling, reporting, calling the same API),
+// the TLS state and the context.
 type lastRequest struct {
 	target string                      // the request target
 	fields string                      // the header fields, up to the empty line ending them
@@ -91,6 +96,7 @@ func RequestBody(r *http.Request) ([]byte, error) {
 	}
 	return io.ReadAll(r.Body)
 }
+
 // unread returns the number of bytes of the message not read yet.
 func (rd *reader) unread() int { return rd.bufferedReader.Buffered() + rd.bytesReader.Len() }
 
@@ -147,6 +153,12 @@ func readRequest(msg []byte, m message) (*http.Request, *parsedRequest, int) {
 	}
 	parsed := parsedPool.Get().(*parsedRequest) // for its context, which the request takes as well (see pooledContext)
 	parsed.reader = rd                          // the request's body reads from it, so it goes back to its pool with the request
+	if m.chunked {
+		// The chunks are decoded here, as parseRequest does, since the standard library reads fewer chunk extensions than
+		// the framer let through.
+		parsed.body.data = dechunk(msg[m.header:m.size])
+		req.Body = &parsed.body
+	}
 	return req.WithContext(&parsed.requestContext), parsed, 0
 }
 
@@ -182,7 +194,7 @@ func parseRequest(msg []byte, m message, last *lastRequest) *parsedRequest {
 	uri := last.target
 	if string(target) != uri {
 		uri = string(target)
-		last.target = uri
+		last.target = retained(uri)
 	}
 	path, query, hasQuery := strings.Cut(uri, "?")
 	if !validPath(path) || !validQuery(query) {
@@ -191,7 +203,7 @@ func parseRequest(msg []byte, m message, last *lastRequest) *parsedRequest {
 	fields := last.fields
 	if string(msg[end+1:m.header]) != fields {
 		fields = string(msg[end+1 : m.header])
-		last.fields = fields
+		last.fields = retained(fields)
 	}
 
 	count := strings.Count(fields, "\n") - 1 // the last line is the empty one ending the header
@@ -263,6 +275,14 @@ func parseRequest(msg []byte, m message, last *lastRequest) *parsedRequest {
 		r.Body = http.NoBody
 	}
 	return p
+}
+
+// retained returns s if a connection keeps it for its next request, "" if it is longer than maxRetainedBytes.
+func retained(s string) string {
+	if len(s) > maxRetainedBytes {
+		return ""
+	}
+	return s
 }
 
 // methods are the request methods parseRequest reads, and protos the protocols by minor version.
@@ -373,8 +393,9 @@ func validValue(value string) bool {
 	return true
 }
 
-// validHost reports whether the Host value contains only characters allowed in host names, IPv4 and IPv6 literals
-// (including the zone identifier) and ports, matching the net/http server's validation.
+// validHost reports whether the Host value is empty or a host name, an IPv4 address or an IPv6 literal in brackets
+// (including the zone identifier), optionally followed by a colon and a port of digits (RFC 9110 7.2, RFC 3986 3.2.2).
+// The characters of a name are those the net/http server allows, so that what it serves is served here as well.
 func validHost(host string) bool {
 	for i := 0; i < len(host); i++ {
 		switch c := host[i]; {
@@ -384,7 +405,42 @@ func validHost(host string) bool {
 			return false
 		}
 	}
+	rest := host // what follows the host: nothing, or a colon and the port
+	if strings.HasPrefix(host, "[") {
+		end := strings.IndexByte(host, ']')
+		if end < 2 || strings.IndexByte(host[1:end], '[') >= 0 { // not closed, empty, or opened again
+			return false
+		}
+		rest = host[end+1:]
+	} else if i := strings.IndexAny(host, ":[]"); i < 0 {
+		return true
+	} else if host[i] != ':' { // brackets enclose an IP literal only
+		return false
+	} else {
+		rest = host[i:]
+	}
+	if rest == "" {
+		return true
+	}
+	if rest[0] != ':' {
+		return false
+	}
+	for i := 1; i < len(rest); i++ {
+		if rest[i] < '0' || rest[i] > '9' {
+			return false
+		}
+	}
 	return true
+}
+
+// validConnectTarget reports whether a CONNECT request names a port, as its target, a host and a port, must (RFC 9110
+// 9.3.6); any other request passes.
+func validConnectTarget(req *http.Request) bool {
+	if req.Method != http.MethodConnect || req.URL.Path != "" {
+		return true
+	}
+	_, err := strconv.ParseUint(req.URL.Port(), 10, 16)
+	return err == nil
 }
 
 // validStdRequest makes the checks the net/http server makes on a request http.ReadRequest read out of header (see
@@ -392,30 +448,26 @@ func validHost(host string) bool {
 //   - Every field name is a token: http.ReadRequest keeps a name with a space before its colon, for which RFC 9112 5.1
 //     requires a 400. Accepted, "Content-Length : 5" frames no body for fhttp, but a body for an intermediary that reads
 //     it as Content-Length, and so smuggles a request in.
-//   - Request.Host is valid, and an HTTP/1.1 request other than CONNECT has a valid Host field, even an empty one and even
-//     with an absolute-form target (RFC 9112 3.2). http.ReadRequest drops the field, with an absolute-form target's host
-//     in Request.Host in its place, so it is looked up in header, the request line and the field lines after it.
-//   - Unlike on the net/http server, a CONNECT to an empty or invalid port is rejected as well (RFC 9110 9.3.6).
+//   - Request.Host is valid, and an HTTP/1.1 request has a valid Host field, even an empty one and even with an
+//     absolute-form target (RFC 9112 3.2). http.ReadRequest drops the field, with an absolute-form target's host in
+//     Request.Host in its place, so it is looked up in header, the request line and the field lines after it.
+//   - Unlike on the net/http server, a CONNECT needs a Host field as well, and one to an empty or invalid port is
+//     rejected (RFC 9110 9.3.6).
 func validStdRequest(header []byte, req *http.Request) bool {
 	for name := range req.Header {
 		if !validName(name) {
 			return false
 		}
 	}
-	if !validHost(req.Host) {
+	if !validHost(req.Host) || !validConnectTarget(req) {
 		return false
-	}
-	if req.Method == http.MethodConnect && req.URL.Path == "" { // the authority form, host and port
-		if _, err := strconv.ParseUint(req.URL.Port(), 10, 16); err != nil {
-			return false
-		}
 	}
 	for i := bytes.IndexByte(header, '\n'); i >= 0; i = bytes.IndexByte(header, '\n') {
 		if header = header[i+1:]; hasField(header, "Host") {
 			return validHost(string(fieldValue(header[:bytes.IndexByte(header, '\n')], "Host")))
 		}
 	}
-	return !req.ProtoAtLeast(1, 1) || req.Method == http.MethodConnect
+	return !req.ProtoAtLeast(1, 1)
 }
 
 // body is the Body of a request parseRequest built: the buffered body, which the Handler must not read once it has
@@ -457,4 +509,39 @@ func (b *body) WriteTo(w io.Writer) (int64, error) {
 func (b *body) Close() error {
 	b.data, b.closed = nil, true
 	return nil
+}
+
+// QueryParam returns the first value associated with key in r.URL.RawQuery, as r.URL.Query().Get(key) does, but without
+// allocating a map: nor a string, unless there is something in the query to unescape.
+func QueryParam(r *http.Request, key string) (value string) {
+	ForEachQuery(r, func(k, v string) bool {
+		if k == key {
+			value = v
+			return false
+		}
+		return true
+	})
+	return value
+}
+
+// ForEachQuery calls fn for each key-value pair in r.URL.RawQuery, in order, until fn returns false. The pairs are those
+// r.URL.Query() holds, unescaped the same way (a pair with an invalid escape or a semicolon is left out), but no map is
+// allocated: nor a string, unless there is something in the query to unescape.
+func ForEachQuery(r *http.Request, fn func(key, value string) bool) {
+	for query := r.URL.RawQuery; query != ""; {
+		var pair string
+		pair, query, _ = strings.Cut(query, "&")
+		if pair == "" || strings.Contains(pair, ";") {
+			continue
+		}
+		key, value, _ := strings.Cut(pair, "=")
+		key, keyErr := url.QueryUnescape(key)
+		value, valueErr := url.QueryUnescape(value)
+		if keyErr != nil || valueErr != nil {
+			continue
+		}
+		if !fn(key, value) {
+			return
+		}
+	}
 }

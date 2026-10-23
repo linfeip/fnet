@@ -523,3 +523,35 @@ func TestDetach(t *testing.T) {
 	default:
 	}
 }
+
+// openConn is the little of an fnet.Conn that Handler.OnOpen and OnClose ask for.
+type openConn struct {
+	fnet.Conn
+	ctx any
+}
+
+func (c *openConn) Context() any          { return c.ctx }
+func (c *openConn) SetContext(ctx any)    { c.ctx = ctx }
+func (c *openConn) SetDeadline(time.Time) {}
+func (c *openConn) RemoteAddr() net.Addr  { return &net.TCPAddr{} }
+func (c *openConn) LocalAddr() net.Addr   { return &net.TCPAddr{} }
+
+// TestSilentConnections checks that a connection that has sent nothing costs no goroutine: the handshake's coroutine
+// starts with the first data, so peers that connect and keep quiet do not hold a stack each until the handshake times out.
+// One closed before that has no coroutine to end.
+func TestSilentConnections(t *testing.T) {
+	h := NewHandler(newTestHandler(), tlsServerConfig(t), time.Minute)
+	const conns = 200
+	before := runtime.NumGoroutine()
+	opened := make([]*openConn, conns)
+	for i := range opened {
+		opened[i] = &openConn{}
+		h.OnOpen(opened[i])
+	}
+	if grown := runtime.NumGoroutine() - before; grown > conns/10 {
+		t.Fatalf("%d silent connections started %d goroutines", conns, grown)
+	}
+	for _, c := range opened {
+		h.OnClose(c, nil) // the handshake never started: nothing to end
+	}
+}

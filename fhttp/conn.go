@@ -2,7 +2,6 @@ package fhttp
 
 import (
 	"bytes"
-	"context"
 	"log/slog"
 	"net/http"
 	"os"
@@ -35,16 +34,21 @@ const (
 const maxRetainedQueueCapacity = 16
 
 // request is one item in the request queue: either a complete request message, or a status code to reply with
-// (100 Continue, or an error that closes the connection), or statusHandoff.
+// (100 Continue, or an error that closes the connection), or statusHandoff or statusClose.
 type request struct {
 	msg     bytepool.Buffer
 	header  int32 // the length of the message's request line and headers (see maxLimit)
-	status  int16 // 0 for a message, otherwise the status code to reply with, or statusHandoff
+	status  int16 // 0 for a message, otherwise the status code to reply with, or statusHandoff or statusClose
 	chunked bool  // the message's body is chunked
 }
 
-// statusHandoff is the queue item that hands the connection to net/http, see conn.handoff.
-const statusHandoff = -1
+const (
+	// statusHandoff is the queue item that hands the connection to net/http, see conn.handoff.
+	statusHandoff = -1
+	// statusClose is the queue item that closes the connection once the requests before it are answered, see
+	// conn.halfClose.
+	statusClose = -2
+)
 
 // conn is the state of one HTTP connection.
 type conn struct {
@@ -211,15 +215,37 @@ func (c *conn) push(data []byte, m message, status int16) {
 	c.queuedBytes += int32(len(data))
 }
 
+// halfClose is called when the client has closed its write direction, which the engine finds out only after it has read
+// all that the client sent, so the requests sent in full are queued. Those not answered yet still are, as on net/http,
+// and the connection closes behind the last of them (see statusClose); the requests' context ends, as it does on
+// net/http, since the client is leaving. It reports whether the connection stays open: it does not when there is no
+// request left to answer, or a protocol that took the connection over is in charge of it.
+func (c *conn) halfClose() bool {
+	c.mu.Lock()
+	if c.protocol.Load() != nil || c.worker != workerServing && c.worker != workerWaiting {
+		c.mu.Unlock()
+		return false
+	}
+	c.push(nil, message{}, statusClose)
+	cancel := c.contextCancel()
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return true
+}
+
+// halfClosed reports whether the client has closed its write direction while requests were still to be answered, which is
+// when the queue ends with statusClose; the caller holds mu.
+func (c *conn) halfClosed() bool {
+	n := len(c.queue)
+	return n > 0 && c.queue[n-1].status == statusClose
+}
+
 func (c *conn) onClose(err error) {
 	c.mu.Lock()
 	c.closed.Store(true)
-	var cancel context.CancelFunc // the requests' context, see conn.context
-	if c.last != nil {
-		if ctx := c.last.ctx.Load(); ctx != nil {
-			cancel = ctx.cancel
-		}
-	}
+	cancel := c.contextCancel()
 	for i := range c.queue {
 		c.queue[i].msg.Release()
 	}
@@ -238,10 +264,27 @@ func (c *conn) onClose(err error) {
 // serve processes the queued requests in order on a worker, until the queue is empty or the connection needs to be
 // closed. The responses are collected and written out together whenever the queue is found empty, so pipelined
 // requests are answered in one write.
+//
+// A Handler that exits the goroutine (runtime.Goexit, which is what a test's FailNow does), or a panic that serveHTTP does
+// not stop, ends the worker without it having stopped: no other is submitted while it is serving, and the client would
+// wait for answers for good. The connection is closed instead, after the responses collected so far, as on net/http.
 func (c *conn) serve() {
 	w := responsePool.Get().(*response)
 	w.conn = c
 	defer w.release()
+	returned := false
+	defer func() {
+		if !returned {
+			w.flush()
+			c.closeFromWorker()
+		}
+	}()
+	c.serveQueue(w)
+	returned = true
+}
+
+// serveQueue is the loop of serve.
+func (c *conn) serveQueue(w *response) {
 	for {
 		c.mu.Lock()
 		// The client is not taking the responses: answering more would only pile them up in fnet's send buffer.
@@ -379,6 +422,8 @@ func (c *conn) handle(w *response, r request) bool {
 		}
 		c.handoff()
 		return false // closing the detached connection does nothing
+	case statusClose:
+		return false
 	default:
 		w.writeError(int(r.status))
 		return false

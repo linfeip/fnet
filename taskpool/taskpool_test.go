@@ -175,6 +175,109 @@ func TestGoexitTask(t *testing.T) {
 	}
 }
 
+// waitGoroutines waits until no more goroutines are running than before, which is when the workers a pool started are all
+// gone.
+func waitGoroutines(t *testing.T, before int) {
+	t.Helper()
+	waitUntil(t, func() bool { return runtime.NumGoroutine() <= before }, "the workers of the closed pool did not exit")
+}
+
+// TestClose checks that closing the pool ends its workers, the suspended ones and one that is running a task, and that a
+// task submitted afterwards, alone or in a batch, still runs.
+func TestClose(t *testing.T) {
+	before := runtime.NumGoroutine()
+	p := New(4, 8, 64)
+	var wg sync.WaitGroup
+	wg.Add(200)
+	for range 200 {
+		p.Submit(wg.Done)
+	}
+	waitGroup(t, &wg)
+	waitQuiescent(t, p)
+
+	release, running := make(chan struct{}), make(chan struct{})
+	p.Submit(func() {
+		close(running)
+		<-release
+	})
+	<-running
+	p.Close()
+	p.Close() // may be repeated
+
+	wg.Add(3)
+	p.Submit(wg.Done)
+	p.SubmitBatch([]func(){wg.Done, wg.Done})
+	waitGroup(t, &wg)
+	close(release) // the worker that was running a task leaves as soon as it is done
+	waitGoroutines(t, before)
+}
+
+// TestCloseReplacedWorker checks that the replacement of a worker whose task called runtime.Goexit leaves with the others.
+func TestCloseReplacedWorker(t *testing.T) {
+	before := runtime.NumGoroutine()
+	p := New(1, 2, 8)
+	for range 3 {
+		p.Submit(runtime.Goexit)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	p.Submit(wg.Done)
+	waitGroup(t, &wg)
+	p.Close()
+	waitGoroutines(t, before)
+}
+
+// TestCloseStraggler checks the task of a submitter that saw the pool open before it closed, and queues it only after the
+// workers have left, with every slot of the shard used up: no worker could be found for it, nor the next to suspend, so a
+// goroutine of its own runs it. submitTo queues it the way Submit does once it has found the pool open.
+func TestCloseStraggler(t *testing.T) {
+	before := runtime.NumGoroutine()
+	p := New(1, 1, 8)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	p.Submit(wg.Done)
+	waitGroup(t, &wg)
+	p.Close()
+	waitGoroutines(t, before)
+
+	wg.Add(1)
+	submitTo(p, 0, wg.Done)
+	waitGroup(t, &wg)
+}
+
+// TestCloseWhileSubmitting closes the pool while submitters are at work: every task still runs exactly once, whether it
+// was queued for a worker before the close or is run by a goroutine of its own after it, and no worker is left.
+func TestCloseWhileSubmitting(t *testing.T) {
+	const submitters, tasksPerSubmitter = 8, 5000
+	for range 20 {
+		before := runtime.NumGoroutine()
+		runs := make([]atomic.Int32, submitters*tasksPerSubmitter)
+		var wg sync.WaitGroup
+		wg.Add(len(runs))
+		p := New(4, 2, 64)
+		for s := range submitters {
+			go func() {
+				for i := range tasksPerSubmitter {
+					p.Submit(func() {
+						runs[s*tasksPerSubmitter+i].Add(1)
+						wg.Done()
+					})
+					if s == 0 && i == tasksPerSubmitter/2 {
+						p.Close()
+					}
+				}
+			}()
+		}
+		waitGroup(t, &wg)
+		for i := range runs {
+			if n := runs[i].Load(); n != 1 {
+				t.Fatalf("task %d ran %d times", i, n)
+			}
+		}
+		waitGoroutines(t, before)
+	}
+}
+
 // TestSubmitNoAlloc verifies Submit itself does not allocate (once the worker has been started).
 func TestSubmitNoAlloc(t *testing.T) {
 	p := New(1, 1, 1024)

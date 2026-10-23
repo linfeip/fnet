@@ -283,12 +283,18 @@ func TestAppendFrameHeader(t *testing.T) {
 }
 
 // checkParseHeader checks that parseHeader agrees with ws.ReadHeader on data: the same header and header length, the
-// same error, and "incomplete" exactly when ws.ReadHeader hits the end of data.
+// same error, and "incomplete" exactly when ws.ReadHeader hits the end of data. The one difference is a length sent in
+// more bytes than it needs, which ws.ReadHeader reads and parseHeader rejects (RFC 6455 5.2).
 func checkParseHeader(t *testing.T, data []byte) {
 	t.Helper()
 	var r bytes.Reader
 	r.Reset(data)
 	want, wantErr := ws.ReadHeader(&r)
+	if wantErr == nil {
+		if code := data[1] & 0x7f; code == 126 && want.Length < 126 || code == 127 && want.Length <= math.MaxUint16 {
+			wantErr = errLengthNotMinimal
+		}
+	}
 	got, n, err := parseHeader(data)
 	if wantErr == io.EOF || wantErr == io.ErrUnexpectedEOF {
 		if n != 0 || err != nil {
@@ -687,6 +693,16 @@ func TestHandshakeErrors(t *testing.T) {
 		{"GET /ws HTTP/1.1\r\nHost: a\r\n" + valid + "Sec-WebSocket-Version: 8\r\n\r\n", http.StatusUpgradeRequired},
 		{"GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: short\r\n" +
 			"Sec-WebSocket-Version: 13\r\n\r\n", http.StatusBadRequest},
+		// A key of 24 characters that is not the base64 encoding of 16 bytes (RFC 6455 4.1): no base64, or 18 bytes.
+		{"GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: !!!!!!!!!!!!!!!!!!!!!!!!\r\n" +
+			"Sec-WebSocket-Version: 13\r\n\r\n", http.StatusBadRequest},
+		{"GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: aaaaaaaaaaaaaaaaaaaaaaaa\r\n" +
+			"Sec-WebSocket-Version: 13\r\n\r\n", http.StatusBadRequest},
+		// The key and the version may not be repeated (RFC 6455 11.3.1, 11.3.5), whatever the values.
+		{"GET /ws HTTP/1.1\r\nHost: a\r\n" + valid + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+			http.StatusBadRequest},
+		{"GET /ws HTTP/1.1\r\nHost: a\r\n" + valid + "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Version: 13\r\n\r\n",
+			http.StatusBadRequest},
 	}
 	for _, tt := range tests {
 		conn, err := net.Dial("tcp", s.Addr().String())
@@ -703,6 +719,53 @@ func TestHandshakeErrors(t *testing.T) {
 			t.Fatalf("426 should carry Sec-WebSocket-Version: %v", resp.Header)
 		}
 		conn.Close()
+	}
+}
+
+// TestHandshakeUpgradeList checks that the Upgrade field may list protocols as long as websocket is one of them
+// (RFC 6455 4.2.1).
+func TestHandshakeUpgradeList(t *testing.T) {
+	s := newTestServer(t, &testHandler{}, Options{})
+	conn, err := net.Dial("tcp", s.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	io.WriteString(conn, "GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: h2c, WebSocket\r\nConnection: Upgrade\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil || resp.StatusCode != http.StatusSwitchingProtocols ||
+		resp.Header.Get("Sec-WebSocket-Accept") != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
+		t.Fatalf("got %v %v, want 101 with the accept value of RFC 6455 1.3", resp, err)
+	}
+}
+
+// TestLengthNotMinimal checks that a frame whose payload length is sent in more bytes than it needs fails the
+// connection with a protocol error (RFC 6455 5.2), in the 16-bit and the 64-bit form.
+func TestLengthNotMinimal(t *testing.T) {
+	h := &testHandler{}
+	s := newTestServer(t, h, Options{})
+	for name, header := range map[string][]byte{
+		"1 in 16 bits":     {0x81, 0x80 | 126, 0, 1},
+		"1 in 64 bits":     {0x81, 0x80 | 127, 0, 0, 0, 0, 0, 0, 0, 1},
+		"65535 in 64 bits": {0x81, 0x80 | 127, 0, 0, 0, 0, 0, 0, 0xff, 0xff},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := dial(t, s)
+			c.Write(slices.Concat(header, []byte{1, 2, 3, 4, 'x' ^ 1})) // the header is rejected as soon as it is there
+			c.expectClose(t, ws.StatusProtocolError)
+			if err := h.waitClose(t); err != errLengthNotMinimal {
+				t.Fatalf("OnClose(%v), want %v", err, errLengthNotMinimal)
+			}
+		})
+	}
+
+	// The same lengths in their shortest form are served.
+	for _, size := range []int{125, 126, math.MaxUint16, math.MaxUint16 + 1} {
+		c := dial(t, s)
+		c.send(t, ws.OpBinary, true, string(make([]byte, size)))
+		c.expectMessage(t, ws.OpBinary, make([]byte, size))
 	}
 }
 

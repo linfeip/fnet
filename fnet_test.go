@@ -403,6 +403,106 @@ func TestClosingHandler(t *testing.T) {
 	}
 }
 
+// halfCloseHandler is a closingHandler that is a HalfCloseHandler as well.
+type halfCloseHandler struct {
+	closingHandler
+	halfClose func(c Conn) bool
+}
+
+func (h *halfCloseHandler) OnHalfClose(c Conn) bool { return h.halfClose(c) }
+
+// TestHalfCloseHandler has a peer send its request and close its write direction, and checks what a HalfCloseHandler
+// can answer the EOF with: keep the connection open and answer from another goroutine, which then closes it (the
+// connection is not read again, and neither OnClosing nor a close reason is made up for that close); keep it open and
+// leave its end to a deadline or to the server; or decline, and have the engine close the connection as it does for any
+// Handler.
+func TestHalfCloseHandler(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("the standard library implementation closes the connection when it reads EOF")
+	}
+	for _, tc := range []struct {
+		name     string
+		keepOpen bool
+		end      string // how a connection kept open ends: "close" by the handler, "deadline" or "server"
+		received string // OnClosing writes "bye"
+		reason   error
+		closings []error // what OnClosing was called with
+	}{
+		{"closed by the handler", true, "close", "answer", nil, nil},
+		{"deadline", true, "deadline", "bye", os.ErrDeadlineExceeded, []error{os.ErrDeadlineExceeded}},
+		{"server", true, "server", "bye", ErrServerClosed, []error{ErrServerClosed}},
+		{"declined", false, "", "bye", io.EOF, []error{io.EOF}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var halfCloses atomic.Int32
+			var mu sync.Mutex
+			var closings []error
+			reasons := make(chan error, 1)
+			srv := startServer(t, &halfCloseHandler{
+				closingHandler: closingHandler{
+					funcHandler: funcHandler{
+						data: func(c Conn, b []byte) int {
+							if halfCloses.Load() > 0 {
+								t.Error("OnData after EOF")
+							}
+							switch tc.end {
+							case "close":
+								go func() {
+									time.Sleep(100 * time.Millisecond) // the EOF is read meanwhile
+									c.Write([]byte("answer"))
+									c.Close()
+								}()
+							case "deadline":
+								c.SetDeadline(time.Now().Add(50 * time.Millisecond))
+							}
+							return len(b)
+						},
+						close: func(c Conn, err error) { reasons <- err },
+					},
+					closing: func(c Conn, err error) {
+						mu.Lock()
+						closings = append(closings, err)
+						mu.Unlock()
+						c.Write([]byte("bye"))
+					},
+				},
+				halfClose: func(Conn) bool {
+					halfCloses.Add(1)
+					return tc.keepOpen
+				},
+			})
+			c := dial(t, srv).(*net.TCPConn)
+			c.Write([]byte("request"))
+			c.CloseWrite()
+			if tc.end == "server" {
+				for deadline := time.Now().Add(5 * time.Second); halfCloses.Load() == 0; time.Sleep(time.Millisecond) {
+					if time.Now().After(deadline) {
+						t.Fatal("OnHalfClose was not called")
+					}
+				}
+				srv.Close()
+			}
+			c.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if got, err := io.ReadAll(c); err != nil || string(got) != tc.received {
+				t.Fatalf("received %q, err=%v, want %q and EOF", got, err, tc.received)
+			}
+			select {
+			case reason := <-reasons:
+				if reason != tc.reason {
+					t.Fatalf("OnClose(%v), want %v", reason, tc.reason)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("OnClose was not called")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !slices.Equal(closings, tc.closings) || halfCloses.Load() != 1 {
+				t.Fatalf("OnClosing called with %v, OnHalfClose %d times; want %v, once", closings, halfCloses.Load(), tc.closings)
+			}
+		})
+	}
+}
+
 // TestAddrs verifies RemoteAddr returns the peer address both in OnOpen and in OnClose where the
 // connection is already closed, and that LocalAddr returns the local side's address.
 func TestAddrs(t *testing.T) {
@@ -1022,6 +1122,87 @@ func TestDetachClosed(t *testing.T) {
 	<-closed
 	if _, err := sc.Detach(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Detach after close: %v", err)
+	}
+}
+
+// TestDetachWhileClosing checks that Detach reports a close that has been requested at once, rather than wait for the
+// connection's task to be idle, which a connection that is closing may not be for as long as its peer takes none of the
+// send buffer and goes on sending. Called from the connection's own task, as it must not be, the task never is idle.
+func TestDetachWhileClosing(t *testing.T) {
+	detached := make(chan error, 1)
+	srv := startServer(t, &funcHandler{data: func(c Conn, b []byte) int {
+		c.Close()
+		_, err := c.Detach()
+		detached <- err
+		return len(b)
+	}})
+	dial(t, srv).Write([]byte("x"))
+	select {
+	case err := <-detached:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Detach while a close was requested: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Detach did not return")
+	}
+}
+
+// TestDetachRace has Detach race against Close, while the peer goes on sending, on many connections: each ends up either
+// detached whole, never called back again, or closed by the engine with one OnClose, and the race detector checks the
+// hand-over of the connection's state.
+func TestDetachRace(t *testing.T) {
+	const conns = 100
+	opened := make(chan Conn, conns)
+	var closes atomic.Int32
+	srv := startServer(t, &funcHandler{
+		open:  func(c Conn) { opened <- c },
+		data:  echo,
+		close: func(Conn, error) { closes.Add(1) },
+	})
+	stop := make(chan struct{})
+	defer close(stop)
+	for range conns {
+		c := dial(t, srv)
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(time.Millisecond):
+				}
+				if _, err := c.Write([]byte("ping")); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	var detached atomic.Int32
+	var wg sync.WaitGroup
+	for range conns {
+		sc := <-opened
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			sc.Close()
+		}()
+		go func() {
+			defer wg.Done()
+			nc, err := sc.Detach()
+			if err != nil {
+				if !errors.Is(err, net.ErrClosed) {
+					t.Errorf("Detach: %v", err)
+				}
+				return
+			}
+			detached.Add(1)
+			nc.Close()
+		}()
+	}
+	wg.Wait()
+	for deadline := time.Now().Add(5 * time.Second); int(detached.Load()+closes.Load()) != conns; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d detached and %d closed of %d connections", detached.Load(), closes.Load(), conns)
+		}
 	}
 }
 

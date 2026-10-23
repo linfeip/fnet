@@ -61,11 +61,23 @@ type Handler interface {
 	// OnClose is called after the connection has been closed; err is the close reason: nil for an explicit
 	// Close, io.EOF when the peer closed.
 	//
-	// Half-close is not supported: after EOF is read (the peer closed its write direction) the engine first
-	// sends out the data in the send buffer and then closes the connection, and writes after that return
-	// net.ErrClosed. A reply written synchronously in OnData (or OnClosing, see ClosingHandler) is unaffected, but a
-	// reply written by another goroutine only after the EOF is discarded.
+	// Half-close is not supported, unless the Handler is a HalfCloseHandler: after EOF is read (the peer closed its
+	// write direction) the engine first sends out the data in the send buffer and then closes the connection, and
+	// writes after that return net.ErrClosed. A reply written synchronously in OnData (or OnClosing, see
+	// ClosingHandler) is unaffected, but a reply written by another goroutine only after the EOF is discarded.
 	OnClose(c Conn, err error)
+}
+
+// HalfCloseHandler is a Handler that may still have to answer a peer that closed its write direction (half-closed): an
+// HTTP client that has sent its request still awaits the response (RFC 9112 9.6), which package fhttp writes from
+// another goroutine. When EOF is read the engine calls OnHalfClose, in place of OnClosing and the close that would
+// follow it; if it returns true the connection stays open and is not read again, until the handler closes it with
+// Conn.Close (OnClose then gets a nil reason), its deadline expires or the server closes. It returns false to have the
+// engine close the connection as it does for any other Handler. Linux/macOS only: elsewhere the engine closes the
+// connection when EOF is read.
+type HalfCloseHandler interface {
+	Handler
+	OnHalfClose(c Conn) (keepOpen bool)
 }
 
 // ClosingHandler is a Handler with something to send before a connection goes away without having been closed through
@@ -125,8 +137,9 @@ type Conn interface {
 	Writev(bs [][]byte) (n int, err error)
 	// Writable reports whether no more than 64KB waits in the send buffer, the point past which the connection is not
 	// read (see Write): one that writes regardless of reading checks it before writing more, and waits for
-	// WritableHandler.OnWritable while it reports false. It always reports true on other platforms than Linux/macOS,
-	// where Write blocks.
+	// WritableHandler.OnWritable while it reports false, which comes only once, as the buffer comes down: a caller outside
+	// the callbacks checks Writable again after it has started to wait, as that may have happened before. It always
+	// reports true on other platforms than Linux/macOS, where Write blocks.
 	Writable() bool
 	// Close closes the connection. Data in the send buffer that has not been sent yet is sent out in full
 	// before closing, even if an EOF from the peer is read in the meantime; on an error or an expired deadline
@@ -219,7 +232,8 @@ type Options struct {
 	// When a callback panics the connection is closed with ErrHandlerPanic and the task panics, so Executor
 	// must recover, otherwise the process exits.
 	// When nil, NewServer creates a private taskpool.NewDefault() executor, which puts the tasks of a connection always
-	// in the shard the key selects rather than in a random one each time. Linux/macOS only.
+	// in the shard the key selects rather than in a random one each time, and whose workers end when the server has
+	// stopped (an executor of your own is yours to end). Linux/macOS only.
 	Executor func(key int, task func())
 	// ReusePort has every loop listen on each address with a socket of its own, sharing it through SO_REUSEPORT, so
 	// that the loops accept in parallel and a connection stays with the loop that accepted it; otherwise the loops

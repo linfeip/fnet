@@ -2,15 +2,17 @@
 // TLS.
 //
 // All of it runs in the engine's callbacks, and a connection costs no goroutine. crypto/tls drives the handshake with
-// blocking reads, so the handshake runs as a coroutine (iter.Pull) that OnData resumes with the data that arrives, and
-// that ends with the handshake; the executor's goroutines passing it on to each other must not be locked to OS threads
-// (runtime.LockOSThread). From then on OnData feeds the ciphertext to crypto/tls and passes the plaintext on: once
-// the ciphertext is used up the read returns a temporary error, which crypto/tls hands back without failing the
-// connection, keeping a record cut short until more data arrives.
+// blocking reads, so the handshake runs as a coroutine (iter.Pull) that OnData starts when the first data arrives, resumes
+// with the data that follows and that ends with the handshake, so a connection that has sent nothing costs none either;
+// the executor's goroutines passing it on to each other must not be locked to OS threads (runtime.LockOSThread). From then
+// on OnData feeds the ciphertext to crypto/tls and passes the plaintext on: once the ciphertext is used up the read
+// returns a temporary error, which crypto/tls hands back without failing the connection, keeping a record cut short until
+// more data arrives.
 package ftls
 
 import (
 	"crypto/tls"
+	"io"
 	"iter"
 	"net"
 	"sync/atomic"
@@ -60,7 +62,7 @@ func NewHandler(handler fnet.Handler, config *tls.Config, handshakeTimeout time.
 func (h *Handler) OnOpen(c fnet.Conn) {
 	tc := &Conn{Conn: c, handler: h.handler}
 	tc.tlsConn = tls.Server((*rawConn)(tc), h.config)
-	tc.resume, tc.stop = iter.Pull(tc.handshake)
+	tc.handshaking = true
 	c.SetContext(tc)
 	if h.handshakeTimeout > 0 {
 		c.SetDeadline(time.Now().Add(h.handshakeTimeout))
@@ -72,7 +74,7 @@ func (h *Handler) OnOpen(c fnet.Conn) {
 func (h *Handler) OnData(c fnet.Conn, data []byte) int {
 	tc := c.Context().(*Conn)
 	tc.ciphertext = data
-	if tc.resume == nil || tc.open() {
+	if !tc.handshaking || tc.open() {
 		tc.drain()
 	}
 	tc.ciphertext = nil
@@ -83,7 +85,7 @@ func (h *Handler) OnData(c fnet.Conn, data []byte) int {
 // OnClosing, if it is an fnet.ClosingHandler. As with crypto/tls, no alert goes out before the handshake has succeeded.
 func (h *Handler) OnClosing(c fnet.Conn, err error) {
 	tc := c.Context().(*Conn)
-	if tc.resume != nil {
+	if tc.handshaking {
 		return
 	}
 	if ch, ok := tc.handler.(fnet.ClosingHandler); ok {
@@ -93,11 +95,19 @@ func (h *Handler) OnClosing(c fnet.Conn, err error) {
 	tc.tlsConn.CloseWrite() // sends close_notify, once: a no-op if the handler has called Close
 }
 
+// OnHalfClose lets the handler keep the connection open for what the peer awaits after it closed its write direction, if
+// it is an fnet.HalfCloseHandler; the engine closes the connection otherwise, close_notify included (see OnClosing), as it
+// does before the handshake has succeeded.
+func (h *Handler) OnHalfClose(c fnet.Conn) bool {
+	tc := c.Context().(*Conn)
+	return !tc.handshaking && tc.halfClose()
+}
+
 // OnWritable passes the engine's OnWritable on to the handler, if it is an fnet.WritableHandler: what waits in the send
 // buffer is ciphertext, which Conn.Writable reports on as it is.
 func (h *Handler) OnWritable(c fnet.Conn) {
 	tc := c.Context().(*Conn)
-	if tc.resume != nil {
+	if tc.handshaking {
 		return
 	}
 	if wh, ok := tc.handler.(fnet.WritableHandler); ok {
@@ -109,7 +119,7 @@ func (h *Handler) OnWritable(c fnet.Conn) {
 // fnet.ResumeHandler.
 func (h *Handler) OnResume(c fnet.Conn) {
 	tc := c.Context().(*Conn)
-	if tc.resume != nil {
+	if tc.handshaking {
 		return
 	}
 	if tc.plaintext.Len() > 0 && !tc.readPaused.Load() {
@@ -123,8 +133,10 @@ func (h *Handler) OnResume(c fnet.Conn) {
 // OnClose reports the close to the handler, or ends the handshake of a connection the handler never saw.
 func (h *Handler) OnClose(c fnet.Conn, err error) {
 	tc := c.Context().(*Conn)
-	if tc.resume != nil {
-		tc.stop() // a handshake waiting for data fails
+	if tc.handshaking {
+		if tc.stop != nil {
+			tc.stop() // a handshake waiting for data fails
+		}
 		return
 	}
 	if tc.closeErr != nil {
@@ -141,7 +153,7 @@ type Conn struct {
 	tlsConn    *tls.Conn
 	handler    fnet.Handler
 	userCtx    any
-	resume     func() (struct{}, bool) // resumes the handshake, see open; nil once it has succeeded
+	resume     func() (struct{}, bool) // resumes the handshake, see open; nil until the first data arrives, and once it has succeeded
 	stop       func()                  // ends the handshake
 	yield      func(struct{}) bool     // suspends the handshake until more data arrives, see rawConn.Read
 	ciphertext []byte                  // what OnData received, for rawConn.Read
@@ -151,6 +163,8 @@ type Conn struct {
 	readPaused atomic.Bool
 	closing    atomic.Bool // Close or OnClosing was called: the engine's close reason stands, and writes fail with net.ErrClosed
 	detached   atomic.Bool
+
+	handshaking bool // the handshake has not succeeded yet, so the handler has not seen the connection
 }
 
 // Context returns the user data bound to the connection.
@@ -243,6 +257,9 @@ func (c *Conn) handshake(yield func(struct{}) bool) {
 // open resumes the handshake with the data at hand and, once it has succeeded, opens the connection for the handler; it
 // reports whether it did.
 func (c *Conn) open() bool {
+	if c.resume == nil {
+		c.resume, c.stop = iter.Pull(c.handshake) // the coroutine, and its goroutine, exist from the first data on
+	}
 	if _, waiting := c.resume(); waiting {
 		return false
 	}
@@ -250,6 +267,7 @@ func (c *Conn) open() bool {
 		c.Conn.Close() // the handler never sees the connection
 		return false
 	}
+	c.handshaking = false
 	c.resume, c.stop, c.yield = nil, nil, nil
 	c.Conn.SetDeadline(time.Time{}) // the handshake's; the handler sets its own
 	c.handler.OnOpen(c)
@@ -258,7 +276,8 @@ func (c *Conn) open() bool {
 
 // drain feeds the ciphertext to TLS and passes the plaintext on to the handler, until the ciphertext is used up; a
 // record cut short stays in TLS for the next call. A TLS error, or the peer's close_notify (io.EOF), closes the
-// connection and becomes the close reason.
+// connection and becomes the close reason, unless the handler keeps the connection open for the peer that has closed its
+// write direction (see halfClose).
 //
 // As on the engine's reads, the plaintext goes into a buffer borrowed for the call, after what the handler left
 // unconsumed when that is small (a large leftover has the new plaintext appended to it instead), and only what the
@@ -285,6 +304,9 @@ func (c *Conn) drain() {
 		if err == errWouldBlock {
 			return
 		}
+		if err == io.EOF && c.halfClose() {
+			return
+		}
 		if err != nil {
 			if !c.closing.Load() {
 				c.closeErr = err
@@ -293,6 +315,13 @@ func (c *Conn) drain() {
 			return
 		}
 	}
+}
+
+// halfClose asks the handler, if it is an fnet.HalfCloseHandler, whether to keep the connection open now that the peer has
+// closed its write direction: with its close_notify, or at the TCP level (see Handler.OnHalfClose).
+func (c *Conn) halfClose() bool {
+	h, ok := c.handler.(fnet.HalfCloseHandler)
+	return ok && h.OnHalfClose(c)
 }
 
 // deliver passes the plaintext on to the handler, unless reading is paused; data holds the new plaintext after room for

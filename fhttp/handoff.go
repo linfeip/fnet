@@ -27,6 +27,18 @@ func (c *conn) handoff() {
 	c.srv.handoffs.handoff(nc)
 }
 
+// validRequests serves with handler the requests net/http reads, but for the ones that fail what fhttp's parser checks
+// beyond the net/http server (see validStdRequest): an invalid Host, a CONNECT to no port. They are answered 400.
+func validRequests(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !validHost(r.Host) || !validConnectTarget(r) {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+}
+
 // tlsStateKey is the context key of a handed-off TLS connection's state, see serveTLSState.
 type tlsStateKey struct{}
 

@@ -3,6 +3,7 @@ package websocket
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -36,9 +37,10 @@ const (
 )
 
 var (
-	errMessageTooBig  = errors.New("websocket: message too big")
-	errHandlerPanic   = errors.New("websocket: handler panic")
-	errInvalidMessage = errors.New("websocket: WriteMessage sends text and binary messages, and pings and pongs of up to 125 bytes")
+	errMessageTooBig    = errors.New("websocket: message too big")
+	errHandlerPanic     = errors.New("websocket: handler panic")
+	errInvalidMessage   = errors.New("websocket: WriteMessage sends text and binary messages, and pings and pongs of up to 125 bytes")
+	errLengthNotMinimal = errors.New("websocket: payload length not encoded in the fewest bytes")
 )
 
 // closeTimeout bounds how long a closed connection waits for the peer to take what is still to be sent, the close frame
@@ -243,7 +245,8 @@ func appendFrameHeader(b []byte, op ws.OpCode, length int) []byte {
 // through an io.Reader and allocates a scratch buffer for every frame, which, run once per received frame, was the
 // biggest source of garbage under pipelined load.
 // Like ws.ReadHeader it checks nothing but the encoding: a 64-bit length with its most significant bit set is
-// rejected, and only once the whole header is there. The rest of the validation is ws.CheckHeader's.
+// rejected, and so is a length sent in more bytes than it needs (RFC 6455 5.2), both only once the whole header is
+// there. The rest of the validation is ws.CheckHeader's.
 func parseHeader(data []byte) (h ws.Header, n int, err error) {
 	if len(data) < 2 {
 		return h, 0, nil
@@ -268,12 +271,16 @@ func parseHeader(data []byte) (h ws.Header, n int, err error) {
 	}
 	switch length {
 	case 126:
-		h.Length = int64(binary.BigEndian.Uint16(data[2:]))
+		if h.Length = int64(binary.BigEndian.Uint16(data[2:])); h.Length < 126 {
+			return h, 0, errLengthNotMinimal
+		}
 	case 127:
 		if data[2]&0x80 != 0 {
 			return h, 0, ws.ErrHeaderLengthMSB
 		}
-		h.Length = int64(binary.BigEndian.Uint64(data[2:]))
+		if h.Length = int64(binary.BigEndian.Uint64(data[2:])); h.Length <= math.MaxUint16 {
+			return h, 0, errLengthNotMinimal
+		}
 	default:
 		h.Length = int64(length)
 	}

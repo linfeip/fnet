@@ -122,6 +122,10 @@ func (l *loop) collectConns(keep func(c *conn) bool) []*conn {
 		}
 	}
 	clear(l.conns[len(live):]) // let the connections that were dropped be collected
+	// The loop held many more connections once: give the memory back.
+	if cap(live) > 4*len(live)+1024 {
+		live = slices.Clone(live)
+	}
 	l.conns = live
 	return kept
 }
