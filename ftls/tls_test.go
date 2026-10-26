@@ -319,9 +319,13 @@ func TestPanic(t *testing.T) {
 			}
 			srv := serve(t, h, 0)
 			c := dial(t, srv)
+			serverConn := wait(t, h.opened)
 			c.Write([]byte("x"))
 			if err := wait(t, h.closed); err != fnet.ErrHandlerPanic {
 				t.Fatalf("OnClose err = %v, want ErrHandlerPanic", err)
+			}
+			if serverConn.ciphertext != nil {
+				t.Error("ciphertext still references the engine's read buffer after a callback panic")
 			}
 			c = dial(t, srv) // the server keeps serving
 			c.Write([]byte("ok"))
