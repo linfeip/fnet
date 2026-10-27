@@ -30,7 +30,6 @@ type conn struct {
 	readPaused atomic.Bool   // reading has been paused
 	backlogged atomic.Bool   // out holds data; written while holding mu, read lock-free by the task (see handle)
 	closing    bool          // a close has been requested, see requestClose; accessed while holding mu
-	closeNow   bool          // close immediately, without draining the send buffer (error or deadline); accessed while holding mu
 	closed     bool          // written only by the task while holding the lock, so the task itself can read it lock-free
 	peerClosed bool          // the peer closed or an error occurred (see evHup), accessed only by the task
 	readClosed bool          // EOF has been read and a HalfCloseHandler kept the connection open, so it is not read again; accessed only by the task
@@ -40,12 +39,13 @@ type conn struct {
 	ctx        any
 	in         bytepool.Buffer // unconsumed inbound data, accessed only by the task
 
-	mu       sync.Mutex
-	out      bytepool.Buffer // send buffer, the data to send is out.Bytes()[outPos:]; empty when nothing is backed up
-	deadline atomic.Int64    // close deadline (UnixNano), 0 means no deadline, negative while lingering (see beginLinger); written by any goroutine, checked by the event loop
+	mu        sync.Mutex
+	out       bytepool.Buffer // send buffer, the data to send is out.Bytes()[outPos:]; empty when nothing is backed up
+	deadline  atomic.Int64    // close deadline (UnixNano), 0 means no deadline; written by any goroutine, checked by the event loop
+	lingerEnd atomic.Int64    // when the linger of a connection closed locally ends (UnixNano), 0 while it does not linger; see beginLinger
 
 	outPos   int
-	closeErr error          // close reason: nil means an explicit close, io.EOF means the peer closed its write direction; both drain the send buffer before closing
+	closeErr error          // close reason: nil means an explicit close, io.EOF means the peer closed its write direction; both drain the send buffer before closing, any other reason closes at once (see closesNow)
 	remote   netip.AddrPort // kept by value, net.Addr is built on RemoteAddr: two fewer small objects resident per connection
 }
 
@@ -182,12 +182,12 @@ func (c *conn) ResumeRead() {
 	c.notify(evRead | evResume)
 }
 
-// Detach first takes over the connection's task: once state goes from 0 (no task queued or running) to scheduledBit,
-// notify never submits the task again, so this goroutine owns everything the task owns, the inbound buffer included.
+// Detach first takes over the connection's task (see takeOver), and with it everything the task owns, the inbound
+// buffer included.
 func (c *conn) Detach() (net.Conn, error) {
-	for !c.state.CompareAndSwap(0, scheduledBit) {
+	for !c.takeOver() {
 		c.mu.Lock()
-		// A closed connection keeps scheduledBit set for good (see run), unless it lingers. One that is closing may not become
+		// A closed connection keeps its task for good (see run), unless it lingers. One that is closing may not become
 		// idle for minutes: its peer takes none of the send buffer, and the events it keeps getting each run a task.
 		closed := c.closed || c.closing
 		c.mu.Unlock()
@@ -199,9 +199,7 @@ func (c *conn) Detach() (net.Conn, error) {
 	c.mu.Lock()
 	if c.closing {
 		c.mu.Unlock()
-		if !c.state.CompareAndSwap(scheduledBit, 0) { // give the task back to carry out the close
-			c.schedule()
-		}
+		c.release() // the task carries out the close
 		return nil, net.ErrClosed
 	}
 	c.closed = true // writes now fail; close does nothing, so OnClose is never called
@@ -239,25 +237,20 @@ func (c *conn) Detach() (net.Conn, error) {
 	return &detachedConn{TCPConn: nc.(*net.TCPConn), in: in}, nil
 }
 
-// SetDeadline only records the deadline, which the event loop checks once per second (see
-// loop.checkDeadlines). It leaves the deadline of a lingering connection alone, see beginLinger.
+// SetDeadline only records the deadline, which the event loop checks once per second (see loop.checkDeadlines). A
+// lingering connection goes by the end of its linger instead, see expiredBy.
 func (c *conn) SetDeadline(t time.Time) {
 	var d int64
 	switch {
 	case t.IsZero():
 	case t.Unix() >= math.MaxInt64/int64(time.Second): // past 2262, beyond UnixNano: as good as never
 		d = math.MaxInt64
-	case t.Unix() < 0: // before 1970, and before 1678 beyond UnixNano: expired, and must not pass for a linger's
+	case t.Unix() < 0: // before 1970, and before 1678 beyond UnixNano: expired
 		d = 1
 	default:
 		d = max(t.UnixNano(), 1)
 	}
-	for {
-		old := c.deadline.Load()
-		if old < 0 || c.deadline.CompareAndSwap(old, d) {
-			return
-		}
-	}
+	c.deadline.Store(d)
 }
 
 // sockaddrToAddrPort converts a TCP socket address; it returns the zero value for unsupported address types.

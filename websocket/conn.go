@@ -10,6 +10,7 @@ import (
 
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/internal/bytepool"
+	"github.com/linfeip/fnet/internal/httpx"
 	"github.com/linfeip/fnet/internal/units"
 
 	"github.com/gobwas/ws"
@@ -270,10 +271,10 @@ func (c *Conn) updateDeadline(pending bool) {
 	switch {
 	case !pending: // set every time: this also overrides a deadline fhttp may have set before the upgrade (see fhttp.Upgrade)
 		c.receiving = false
-		c.connection.SetDeadline(deadlineAfter(c.idleTimeout))
+		c.connection.SetDeadline(httpx.DeadlineAfter(c.idleTimeout))
 	case !c.receiving || finished:
 		c.receiving = true
-		c.connection.SetDeadline(deadlineAfter(c.messageTimeout))
+		c.connection.SetDeadline(httpx.DeadlineAfter(c.messageTimeout))
 	}
 	// closeWith may have run on another goroutine since OnData last looked, and its closeTimeout must stand: fnet waits for
 	// the send buffer to drain with no other limit. It sets closing before its deadline, so whichever of the two deadlines
@@ -281,14 +282,6 @@ func (c *Conn) updateDeadline(pending bool) {
 	if c.closing.Load() {
 		c.connection.SetDeadline(time.Now().Add(closeTimeout))
 	}
-}
-
-// deadlineAfter returns the instant timeout from now; timeout<=0 means no limit and the zero value is returned.
-func deadlineAfter(timeout time.Duration) time.Time {
-	if timeout <= 0 {
-		return time.Time{}
-	}
-	return time.Now().Add(timeout)
 }
 
 // readFrame processes the one frame at the start of data and returns the frame's length; it returns 0 when the frame

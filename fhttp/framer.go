@@ -3,6 +3,7 @@ package fhttp
 import (
 	"bytes"
 	"errors"
+	"net/http"
 	"strconv"
 )
 
@@ -47,10 +48,67 @@ type framer struct {
 	size   int32 // the length of a message with a Content-Length body, -1 while a chunked body arrives
 }
 
+// split frames the request messages at the start of data, within the limits of opts, and hands push the items of the
+// request queue they make, in order: a complete message (status 0, msg being the message and m its framing), the 100
+// Continue a client waits for before it sends the body, the status code answering a request that cannot be framed, or
+// statusHandoff. It returns how much of data it took, the messages and the empty lines before them, and end, the status of
+// the item that stopped it: an error status, after which it takes all of data, or statusHandoff, the request that goes
+// to net/http being left in data. What else is left is a message still to arrive, to be passed again, with what arrives
+// next, from its start.
+func (f *framer) split(data []byte, opts *Options, push func(msg []byte, m message, status int16)) (consumed int, end int16) {
+	for consumed < len(data) {
+		rest := data[consumed:]
+		if *f == (framer{}) {
+			// An empty line before a request, CRLF or a bare LF, is ignored, as some clients send one after a body (RFC
+			// 9112 2.2); a bare CR is not one, and is left to make the request line invalid.
+			if rest[0] == '\n' {
+				consumed++
+				continue
+			} else if rest[0] == '\r' && len(rest) == 1 {
+				return consumed, 0 // its LF may be on its way
+			} else if bytes.HasPrefix(rest, []byte("\r\n")) {
+				consumed += 2
+				continue
+			}
+		}
+		m, expectContinue, err := f.next(rest, opts)
+		switch {
+		case err == errHandoff:
+			push(nil, message{}, statusHandoff)
+			return consumed, statusHandoff
+		case err != nil:
+			status := errorStatus(err)
+			push(nil, message{}, status)
+			return len(data), status
+		case m.size == 0:
+			// The header is complete and the client waits for 100 Continue before sending the body. It goes through the
+			// queue as well, so it is not written in the middle of earlier responses.
+			if expectContinue {
+				push(nil, message{}, http.StatusContinue)
+			}
+			return consumed, 0
+		}
+		push(rest[:m.size], m, 0)
+		consumed += m.size
+	}
+	return consumed, 0
+}
+
+// errorStatus returns the status code answering a request the framer rejects with err.
+func errorStatus(err error) int16 {
+	switch err {
+	case errHeaderTooLarge:
+		return http.StatusRequestHeaderFieldsTooLarge
+	case errURITooLong:
+		return http.StatusRequestURITooLong
+	}
+	return http.StatusBadRequest
+}
+
 // next looks for the end of the message starting at the beginning of data, within the limits of opts: m.size>0 means
 // data[:m.size] is a complete message, m.size==0 means there is not enough data and next must be called again with
 // the same message start once more data arrives. expectContinue is reported once, when the header is complete and the
-// client waits for 100 Continue before sending the body. Errors leave the framer at the start of that message.
+// client waits for 100 Continue before sending the body. After an error the framer is not used again.
 func (f *framer) next(data []byte, opts *Options) (m message, expectContinue bool, err error) {
 	if f.header == 0 {
 		h, err := f.findHeader(data, opts.MaxHeaderBytes)

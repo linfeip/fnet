@@ -468,6 +468,48 @@ func TestResumeRedeliversUnconsumed(t *testing.T) {
 	}
 }
 
+// halfCloseHandler is a testHandler that keeps the connections open for a peer that closed its write direction, and
+// counts how often it is asked to.
+type halfCloseHandler struct {
+	*testHandler
+	asked atomic.Int32
+}
+
+func (h *halfCloseHandler) OnHalfClose(fnet.Conn) bool { h.asked.Add(1); return true }
+
+// TestHalfCloseAskedOnce has the peer send close_notify, go on sending at the TCP level, which no longer reaches the
+// handler, and then close its write direction: the handler is asked to keep the connection open once, however much
+// follows, as fnet asks once on a FIN.
+func TestHalfCloseAskedOnce(t *testing.T) {
+	h := &halfCloseHandler{testHandler: newTestHandler()}
+	srv := serve(t, h, 0)
+	raw, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	c := tls.Client(raw, &tls.Config{InsecureSkipVerify: true})
+	if err := c.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, h.opened)
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	raw.SetWriteDeadline(time.Time{}) // CloseWrite sets it to now
+	for range 20 {
+		if _, err := raw.Write([]byte{23, 3, 3, 0, 1, 0}); err != nil { // a record header, each a segment of its own
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	raw.(*net.TCPConn).CloseWrite()
+	time.Sleep(100 * time.Millisecond)
+	if n := h.asked.Load(); n != 1 {
+		t.Fatalf("OnHalfClose was called %d times, want 1", n)
+	}
+}
+
 // TestWriteAfterPeerClose checks that a Write after the engine closed the connection on its own (the peer closed it
 // without close_notify, and OnClosing sent one) returns net.ErrClosed, as on fnet, rather than crypto/tls's own error.
 func TestWriteAfterPeerClose(t *testing.T) {

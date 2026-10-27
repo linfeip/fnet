@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"sync"
+
+	"github.com/linfeip/fnet/internal/httpx"
 )
 
 // A request fhttp cannot handle on its buffered path (see errHandoff) is served by net/http: the worker detaches the
@@ -18,7 +20,7 @@ import (
 func (c *conn) handoff() {
 	// Detach writes out what the engine still holds of those responses, which IdleTimeout bounds, as it does on the fnet
 	// path: the client may not be reading.
-	c.connection.SetDeadline(deadlineAfter(c.srv.opts.IdleTimeout))
+	c.connection.SetDeadline(httpx.DeadlineAfter(c.srv.opts.IdleTimeout))
 	nc, err := c.connection.Detach()
 	if err != nil {
 		return // the connection is closed or closing

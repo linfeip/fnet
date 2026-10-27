@@ -71,7 +71,7 @@ func (l *loop) acceptAll() {
 // listener.
 func (l *loop) accept(listenerFd int) {
 	for c := l.srv.acceptConn(listenerFd, l); c != nil; c = l.srv.acceptConn(listenerFd, l) {
-		c.schedule()
+		c.notify(evOpen)
 	}
 }
 

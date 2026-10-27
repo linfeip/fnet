@@ -205,8 +205,9 @@ func TestClose(t *testing.T) {
 	p.Close() // may be repeated
 
 	wg.Add(3)
-	p.Submit(wg.Done)
-	p.SubmitBatch([]func(){wg.Done, wg.Done})
+	for range 3 {
+		p.Submit(wg.Done)
+	}
 	waitGroup(t, &wg)
 	close(release) // the worker that was running a task leaves as soon as it is done
 	waitGoroutines(t, before)
@@ -293,52 +294,6 @@ func TestSubmitNoAlloc(t *testing.T) {
 	waitGroup(t, &wg)
 }
 
-// TestSubmitBatchEveryTaskRunsOnce covers concurrent batch submission and overflow, with every task running once.
-func TestSubmitBatchEveryTaskRunsOnce(t *testing.T) {
-	const submitters, batches, batchSize = 8, 100, 32
-	p := New(4, 4, 64)
-	runs := make([]atomic.Int32, submitters*batches*batchSize)
-	var wg sync.WaitGroup
-	wg.Add(len(runs))
-	for producer := range submitters {
-		go func() {
-			tasks := make([]func(), batchSize)
-			for batch := range batches {
-				for i := range tasks {
-					index := (producer*batches+batch)*batchSize + i
-					tasks[i] = func() { runs[index].Add(1); wg.Done() }
-				}
-				p.SubmitBatch(tasks)
-				clear(tasks) // the slice must not be referenced after submission.
-			}
-		}()
-	}
-	waitGroup(t, &wg)
-	for i := range runs {
-		if n := runs[i].Load(); n != 1 {
-			t.Fatalf("task %d ran %d times", i, n)
-		}
-	}
-}
-
-// TestSubmitBatchNoAlloc verifies that after warm-up submitting a batch allocates no temporary slice or wrapper.
-func TestSubmitBatchNoAlloc(t *testing.T) {
-	p := New(4, 1, 8192)
-	var wg sync.WaitGroup
-	tasks := make([]func(), 128)
-	for i := range tasks {
-		tasks[i] = wg.Done
-	}
-	wg.Add(len(tasks))
-	p.SubmitBatch(tasks)
-	waitGroup(t, &wg)
-	wg.Add(101 * len(tasks))
-	if allocs := testing.AllocsPerRun(100, func() { p.SubmitBatch(tasks) }); allocs != 0 {
-		t.Fatalf("SubmitBatch allocated %v times per batch", allocs)
-	}
-	waitGroup(t, &wg)
-}
-
 // TestBlockedCallbacksUpToLimit verifies that the number of callbacks blocking at the same time is limited only by
 // shards * maxWorkers: each callback holds one worker, and all of them must start running at the same time instead of
 // queuing behind one of them returning.
@@ -365,11 +320,9 @@ func TestBlockedWorkerIsolation(t *testing.T) {
 	<-started
 	var wg sync.WaitGroup
 	wg.Add(32)
-	tasks := make([]func(), 32)
-	for i := range tasks {
-		tasks[i] = wg.Done
+	for range 32 {
+		p.Submit(wg.Done)
 	}
-	p.SubmitBatch(tasks)
 	waitGroup(t, &wg)
 	if workers := p.shards[0].liveWorkers.Load(); workers != 2 {
 		t.Fatalf("blocking isolation started %d workers, want 2", workers)
@@ -553,11 +506,10 @@ func TestShardCacheLineSeparation(t *testing.T) {
 	}
 }
 
-// BenchmarkSubmitRounds simulates readiness rounds and compares random submission, even individual submission, and even
-// batch submission.
+// BenchmarkSubmitRounds simulates readiness rounds and compares random submission with even individual submission.
 func BenchmarkSubmitRounds(b *testing.B) {
 	for _, size := range []int{1, 32, 256} {
-		for _, mode := range []string{"random", "round_robin", "batch"} {
+		for _, mode := range []string{"random", "round_robin"} {
 			b.Run(fmt.Sprintf("size=%d/mode=%s", size, mode), func(b *testing.B) {
 				p := New(runtime.GOMAXPROCS(0), 4, 8192)
 				var wg sync.WaitGroup
@@ -570,8 +522,6 @@ func BenchmarkSubmitRounds(b *testing.B) {
 				for range b.N {
 					wg.Add(len(tasks))
 					switch mode {
-					case "batch":
-						p.SubmitBatch(tasks)
 					case "round_robin":
 						for i, task := range tasks {
 							s := &p.shards[i%len(p.shards)]

@@ -4,9 +4,9 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"strings"
 
 	"github.com/linfeip/fnet"
+	"github.com/linfeip/fnet/internal/httpx"
 )
 
 // errEarlyRequest means the client sent a follow-up request without waiting for the upgrade response.
@@ -89,26 +89,15 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 	if c.partial {
 		// Data the client sent without waiting for the upgrade response is handed to the new protocol only when
 		// data next arrives; until then the request-header timeout applies.
-		c.connection.SetDeadline(deadlineAfter(c.srv.opts.ReadHeaderTimeout))
+		c.connection.SetDeadline(httpx.DeadlineAfter(c.srv.opts.ReadHeaderTimeout))
 	}
 	c.mu.Unlock()
 
 	b := &w.out
 	b.AppendString("HTTP/1.1 101 Switching Protocols\r\n")
-	accept := w.header.Get("Sec-WebSocket-Accept")
-	// The usual WebSocket response goes out in one piece. Anything else goes through appendHeader, an accept value with a
-	// CR or LF included, which appendHeader turns into a space so that a Handler cannot inject fields.
-	if len(w.header) == 3 && accept != "" && validValue(accept) &&
-		strings.EqualFold(w.header.Get("Upgrade"), "websocket") &&
-		strings.EqualFold(w.header.Get("Connection"), "Upgrade") {
-		b.AppendString("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
-		b.AppendString(accept)
-		b.AppendString("\r\n\r\n")
-	} else {
-		delete(w.header, "Content-Length") // a 1xx response has neither (RFC 9110 8.6, RFC 9112 6.1)
-		delete(w.header, "Transfer-Encoding")
-		appendHeader(b, w.header)
-		b.AppendString("\r\n")
-	}
+	delete(w.header, "Content-Length") // a 1xx response has neither (RFC 9110 8.6, RFC 9112 6.1)
+	delete(w.header, "Transfer-Encoding")
+	appendHeader(b, w.header) // turns a CR or LF in a value into a space, so that a Handler cannot inject fields
+	b.AppendString("\r\n")
 	return w.flush() // the responses before it and the 101 go out before the new protocol writes anything
 }

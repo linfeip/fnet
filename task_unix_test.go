@@ -289,7 +289,7 @@ func TestSetDeadlineOutOfRange(t *testing.T) {
 	// Before 1678 UnixNano overflows, which must not turn a time long past into one far ahead.
 	for _, past := range []time.Time{time.Date(1000, 1, 1, 0, 0, 0, 0, time.UTC), time.Unix(-1, 0)} {
 		c.SetDeadline(past)
-		if !c.expiredBy(time.Now().UnixNano()) || c.lingering() {
+		if !c.expiredBy(time.Now().UnixNano()) {
 			t.Fatalf("a deadline of %v has not expired", past)
 		}
 	}

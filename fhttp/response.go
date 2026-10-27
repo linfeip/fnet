@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linfeip/fnet/internal/bytepool"
+	"github.com/linfeip/fnet/internal/httpx"
 	"github.com/linfeip/fnet/internal/units"
 )
 
@@ -46,30 +47,39 @@ var (
 // response for the requests it takes from a connection's queue in turn, and its output collects their responses (see
 // conn.serve).
 type response struct {
-	conn            *conn
-	req             *http.Request
-	header          http.Header
-	status          int
-	wroteHeader     bool
-	upgraded        bool // Upgrade has been called, so finish no longer writes the response
-	streamed        bool // the header has gone out, the body following in pieces as the Handler writes it (see stream)
-	chunked         bool // the streamed body goes out in chunks
-	discardBody     bool // the response has no content (HEAD, 205, a tunnel): what is written of the body is dropped
-	keepAlive       bool // whether to keep the connection alive, decided with the header (see writeHeader)
-	remainingLength int  // what the Handler may still write of the Content-Length it declared, -1 for none
-	declaredLength  int  // that Content-Length
-	writeErr        error
-	body            bytepool.Buffer
-	out             bytepool.Buffer // the responses serialized and not written out yet, see flush
+	conn        *conn
+	req         *http.Request
+	header      http.Header
+	status      int
+	writeErr    error
+	body        bytepool.Buffer
+	out         bytepool.Buffer // the responses serialized and not written out yet, see flush
+	fields      bytepool.Buffer // the fields commitHeader serialized, but for Connection
+	remaining   int             // what the Handler may still write of the Content-Length it declared, -1 for none
+	committed   committedHeader // what commitHeader took of the Handler's header
+	bodyWriting bodyWriting     // how the body goes out, decided with the header by writeHeader
+	wroteHeader bool
+	upgraded    bool // Upgrade has been called, so finish no longer writes the response
+	streamed    bool // the header has gone out, the body following in pieces as the Handler writes it (see stream)
+}
 
-	// What commitHeader takes of the Handler's header when the status is written; later changes to the header do not count.
-	fields     bytepool.Buffer // the fields, serialized, but for Connection
-	connection []string        // the values of the Connection field, which goes out only if the body leaves the connection open
-	hasLength  bool            // the header has a Content-Length
-	hasType    bool            // the header has a Content-Type
-	hasDate    bool            // the header has a Date
-	encoded    bool            // the header has a Content-Encoding
-	closing    bool            // the Connection field says close
+// committedHeader is what commitHeader takes of the Handler's header when the status is written; later changes to the
+// header do not count.
+type committedHeader struct {
+	connection     []string // the values of the Connection field, which goes out only if the body leaves the connection open
+	declaredLength int      // the Content-Length the Handler declared, -1 for none
+	hasLength      bool     // the header has a Content-Length
+	hasType        bool     // the header has a Content-Type
+	hasDate        bool     // the header has a Date
+	encoded        bool     // the header has a Content-Encoding
+	closing        bool     // the Connection field says close
+}
+
+// bodyWriting is how writeHeader decides the body goes out.
+type bodyWriting struct {
+	chunked     bool // the streamed body goes out in chunks
+	discardBody bool // the response has no content (HEAD, 205, a tunnel): what is written of the body is dropped
+	keepAlive   bool // whether to keep the connection alive
 }
 
 var responsePool = sync.Pool{New: func() any { return &response{header: make(http.Header)} }}
@@ -165,11 +175,11 @@ func (w *response) beforeWrite(n int) error {
 	if !bodyAllowedForStatus(w.status) {
 		return http.ErrBodyNotAllowed
 	}
-	if w.remainingLength >= 0 {
-		if n > w.remainingLength {
+	if w.remaining >= 0 {
+		if n > w.remaining {
 			return http.ErrContentLength
 		}
-		w.remainingLength -= n
+		w.remaining -= n
 	}
 	return nil
 }
@@ -188,9 +198,7 @@ func (w *response) stream(p []byte) (int, error) {
 			w.body.Append(p[:fill])
 			piece, p = w.body.Bytes(), p[fill:]
 		}
-		err := w.send(piece)
-		w.body.Reset()
-		if err != nil {
+		if err := w.sendPiece(piece); err != nil {
 			return n - len(p), err
 		}
 	}
@@ -199,21 +207,27 @@ func (w *response) stream(p []byte) (int, error) {
 }
 
 // streamString is stream for a string, which cannot be sent from as it is: it is copied into the buffer a piece at a
-// time, so that however long it is no more than a piece of it is held in addition.
+// time, so that however long it is no more than a piece of it is held in addition. It is not generic with stream: a
+// generic instance has no escape information, which would have every string written to a response escape.
 func (w *response) streamString(s string) (int, error) {
 	n := len(s)
 	for w.body.Len()+len(s) > maxBufferedBody {
 		fill := maxBufferedBody - w.body.Len()
 		w.body.AppendString(s[:fill])
 		s = s[fill:]
-		err := w.send(w.body.Bytes())
-		w.body.Reset()
-		if err != nil {
+		if err := w.sendPiece(w.body.Bytes()); err != nil {
 			return n - len(s), err
 		}
 	}
 	w.body.AppendString(s)
 	return n, nil
+}
+
+// sendPiece sends a piece of the streamed body (see send) and empties the buffer, which the piece may be.
+func (w *response) sendPiece(piece []byte) error {
+	err := w.send(piece)
+	w.body.Reset()
+	return err
 }
 
 // send writes out a piece of the streamed body, after the header when it is the first piece, once the client has taken
@@ -222,7 +236,7 @@ func (w *response) send(piece []byte) error {
 	if !w.streamed {
 		w.writeHeader(piece, true) // into the output, after the responses collected before it
 	}
-	if w.discardBody {
+	if w.bodyWriting.discardBody {
 		return nil
 	}
 	if err := w.conn.waitWritable(); err != nil {
@@ -230,7 +244,7 @@ func (w *response) send(piece []byte) error {
 		return err
 	}
 	var end []byte
-	if w.chunked {
+	if w.bodyWriting.chunked {
 		appendChunkSize(&w.out, len(piece))
 		end = crlf
 	}
@@ -251,14 +265,14 @@ func (w *response) finish() bool {
 	if !w.streamed {
 		w.writeHeader(w.body.Bytes(), false)
 	}
-	body, end, keepAlive := w.body.Bytes(), []byte(nil), w.keepAlive
+	body, end, keepAlive := w.body.Bytes(), []byte(nil), w.bodyWriting.keepAlive
 	switch {
-	case w.discardBody:
+	case w.bodyWriting.discardBody:
 		body = nil
-	case w.streamed && w.remainingLength > 0:
+	case w.streamed && w.remaining > 0:
 		// The Handler wrote less than the Content-Length it declared: what goes out ends there, and so does the connection.
 		keepAlive = false
-	case w.chunked: // body holds at least a byte, see stream
+	case w.bodyWriting.chunked: // body holds at least a byte, see stream
 		appendChunkSize(&w.out, len(body))
 		end = lastChunk
 	}
@@ -292,34 +306,33 @@ func (w *response) commitHeader() {
 	keepLength := w.req.Method == http.MethodHead && w.bodyAllowed() && w.status != http.StatusResetContent // HEAD keeps the Content-Length declared by the Handler
 	var stack [16]field
 	fields := stack[:0]
-	w.remainingLength, w.connection = -1, nil
-	w.hasLength, w.hasType, w.hasDate, w.encoded, w.closing = false, false, false, false, false
+	committed := committedHeader{declaredLength: -1}
 	for name, values := range w.header {
 		switch name {
 		case "Transfer-Encoding":
 			continue
 		case "Content-Length":
-			w.remainingLength = declaredLength(values)
-			if w.hasLength = true; !keepLength {
+			committed.declaredLength = declaredLength(values)
+			if committed.hasLength = true; !keepLength {
 				continue
 			}
 		case "Content-Type":
-			if w.hasType = true; w.status == http.StatusNotModified {
+			if committed.hasType = true; w.status == http.StatusNotModified {
 				continue
 			}
 		case "Content-Encoding":
-			w.encoded = len(values) > 0 && values[0] != ""
+			committed.encoded = len(values) > 0 && values[0] != ""
 		case "Date":
-			w.hasDate = true
+			committed.hasDate = true
 		case "Connection":
-			w.closing, w.connection = hasToken(values, "close"), slices.Clone(values)
+			committed.closing, committed.connection = httpx.HasToken(values, "close"), slices.Clone(values)
 			continue
 		}
 		if validName(name) {
 			fields = append(fields, field{name, values})
 		}
 	}
-	w.declaredLength = w.remainingLength
+	w.committed, w.remaining = committed, committed.declaredLength
 	w.fields.Reset()
 	appendFields(&w.fields, fields)
 }
@@ -341,21 +354,22 @@ func (w *response) writeHeader(content []byte, streamed bool) {
 		content = nil
 	}
 	keepLength := isHEAD && bodyAllowed && w.status != http.StatusResetContent // HEAD keeps the Content-Length declared by the Handler
-	w.streamed, w.chunked = streamed, false
-	w.discardBody = isHEAD || !bodyAllowed || w.status == http.StatusResetContent
+	committed := &w.committed
+	writing := bodyWriting{discardBody: isHEAD || !bodyAllowed || w.status == http.StatusResetContent}
 	closeDelimited := false
-	if streamed && !w.discardBody {
-		w.chunked = w.declaredLength < 0 && http11
-		closeDelimited = w.declaredLength < 0 && !http11 // HTTP/1.0 has no chunks
+	if streamed && !writing.discardBody {
+		writing.chunked = committed.declaredLength < 0 && http11
+		closeDelimited = committed.declaredLength < 0 && !http11 // HTTP/1.0 has no chunks
 	}
 	// Whatever its status, the response to a CONNECT closes the connection: after a rejection, a client or an intermediary
 	// that takes the request for one that opens a tunnel goes on sending the data of that tunnel, which the server would
 	// read as requests of their own.
 	mustClose := req.Close || req.Method == http.MethodConnect || closeDelimited
-	w.keepAlive = !mustClose && !w.closing
+	writing.keepAlive = !mustClose && !committed.closing
+	w.streamed, w.bodyWriting = streamed, writing
 	// The Handler's Connection field goes out unless the request, the tunnel or the end of the body closes the connection
 	// and it does not say so: "Connection: close" goes out in its place.
-	handlerConnection := w.connection != nil && (w.closing || !mustClose)
+	handlerConnection := committed.connection != nil && (committed.closing || !mustClose)
 
 	b := &w.out
 	if cap(b.Bytes()) == 0 {
@@ -369,25 +383,24 @@ func (w *response) writeHeader(content []byte, streamed bool) {
 	switch {
 	case !bodyAllowed:
 	case !streamed || w.status == http.StatusResetContent: // the whole body is at hand
-		if !keepLength || !w.hasLength && w.body.Len() > 0 {
+		if !keepLength || !committed.hasLength && w.body.Len() > 0 {
 			appendContentLength(b, w.body.Len())
 		}
-	case w.declaredLength >= 0:
-		appendContentLength(b, w.declaredLength)
-	case w.chunked:
+	case committed.declaredLength >= 0:
+		appendContentLength(b, committed.declaredLength)
+	case writing.chunked:
 		b.AppendString("Transfer-Encoding: chunked\r\n")
 	}
-	hasType := w.hasType
-	if !hasType && bodyAllowed && len(content) > 0 && !w.encoded {
+	if !committed.hasType && bodyAllowed && len(content) > 0 && !committed.encoded {
 		b.AppendString("Content-Type: ")
 		b.AppendString(http.DetectContentType(content))
 		b.AppendString("\r\n")
 	}
-	if !w.hasDate {
+	if !committed.hasDate {
 		appendDate(b)
 	}
 	if !handlerConnection {
-		if !w.keepAlive {
+		if !writing.keepAlive {
 			b.AppendString("Connection: close\r\n")
 		} else if !http11 {
 			b.AppendString("Connection: keep-alive\r\n")
@@ -395,7 +408,7 @@ func (w *response) writeHeader(content []byte, streamed bool) {
 	}
 	b.Append(w.fields.Bytes())
 	if handlerConnection {
-		appendFields(b, []field{{"Connection", w.connection}})
+		appendFields(b, []field{{"Connection", committed.connection}})
 	}
 	b.AppendString("\r\n")
 }
@@ -497,20 +510,6 @@ func appendInt(b *bytepool.Buffer, n int) {
 
 func bodyAllowedForStatus(status int) bool {
 	return status >= 200 && status != http.StatusNoContent && status != http.StatusNotModified
-}
-
-// hasToken reports whether the comma-separated header values contain token (case-insensitive).
-func hasToken(values []string, token string) bool {
-	for _, v := range values {
-		for v != "" {
-			var t string
-			t, v, _ = strings.Cut(v, ",")
-			if strings.EqualFold(strings.TrimSpace(t), token) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // The Date field line, "Date: ...\r\n", is formatted at the start of every second by a goroutine started with the first

@@ -241,9 +241,10 @@ func (s *Server) closeListeners() {
 	s.listenerFds = nil
 }
 
-// acceptConn accepts a connection on listenerFd, a listener of loop l, with its open task pending (see loop.watch), and
-// counts it in openConnsWg; it returns nil when there is none left to accept or the server is draining. The connection
-// belongs to l, or, when the loops share the listener (see listenerPerLoop), to a loop chosen in round-robin order.
+// acceptConn accepts a connection on listenerFd, a listener of loop l, and counts it in openConnsWg; it returns nil when
+// there is none left to accept or the server is draining. The connection belongs to l, or, when the loops share the
+// listener (see listenerPerLoop), to a loop chosen in round-robin order. Its first task, which the caller notifies with
+// evOpen, watches it (see loop.watch).
 func (s *Server) acceptConn(listenerFd int, l *loop) *conn {
 	s.acceptMu.RLock()
 	defer s.acceptMu.RUnlock()
@@ -255,7 +256,6 @@ func (s *Server) acceptConn(listenerFd int, l *loop) *conn {
 			}
 			c := &conn{fd: fd, loop: l, remote: remote}
 			c.task = c.run
-			c.state.Store(scheduledBit | evOpen)
 			s.openConnsWg.Add(1) // decremented again once OnClose has returned and the fd is closed
 			return c
 		}

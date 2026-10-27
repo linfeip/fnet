@@ -70,9 +70,13 @@ func (h *Handler) OnOpen(c fnet.Conn) {
 }
 
 // OnData hands data to the handshake until it has succeeded, and from then on decrypts data and passes the plaintext on
-// to the handler.
+// to the handler. What arrives after a close_notify the handler kept the connection open for is dropped: crypto/tls
+// reads nothing past it.
 func (h *Handler) OnData(c fnet.Conn, data []byte) int {
 	tc := c.Context().(*Conn)
+	if tc.readClosed {
+		return len(data)
+	}
 	tc.ciphertext = data
 	defer func() { tc.ciphertext = nil }()
 	if !tc.handshaking || tc.open() {
@@ -97,10 +101,11 @@ func (h *Handler) OnClosing(c fnet.Conn, err error) {
 
 // OnHalfClose lets the handler keep the connection open for what the peer awaits after it closed its write direction, if
 // it is an fnet.HalfCloseHandler; the engine closes the connection otherwise, close_notify included (see OnClosing), as it
-// does before the handshake has succeeded.
+// does before the handshake has succeeded. A peer whose close_notify the handler already kept the connection open for has
+// been asked about once.
 func (h *Handler) OnHalfClose(c fnet.Conn) bool {
 	tc := c.Context().(*Conn)
-	return !tc.handshaking && tc.halfClose()
+	return tc.readClosed || !tc.handshaking && tc.halfClose()
 }
 
 // OnWritable passes the engine's OnWritable on to the handler, if it is an fnet.WritableHandler: what waits in the send
@@ -165,6 +170,7 @@ type Conn struct {
 	detached   atomic.Bool
 
 	handshaking bool // the handshake has not succeeded yet, so the handler has not seen the connection
+	readClosed  bool // the peer's close_notify was read and the handler kept the connection open, so nothing more is read
 }
 
 // Context returns the user data bound to the connection.
@@ -289,6 +295,7 @@ func (c *Conn) drain() {
 			return
 		}
 		if err == io.EOF && c.halfClose() {
+			c.readClosed = true
 			return
 		}
 		if err != nil {

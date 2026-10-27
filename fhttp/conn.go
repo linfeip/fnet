@@ -1,8 +1,6 @@
 package fhttp
 
 import (
-	"bytes"
-	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -10,6 +8,7 @@ import (
 
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/internal/bytepool"
+	"github.com/linfeip/fnet/internal/httpx"
 	"github.com/linfeip/fnet/internal/units"
 	"github.com/linfeip/fnet/taskpool"
 )
@@ -99,15 +98,7 @@ func (c *conn) setDeadline() {
 	default:
 		timeout = c.srv.opts.IdleTimeout
 	}
-	c.connection.SetDeadline(deadlineAfter(timeout))
-}
-
-// deadlineAfter returns the instant timeout from now; timeout<=0 means no limit and the zero value is returned.
-func deadlineAfter(timeout time.Duration) time.Time {
-	if timeout <= 0 {
-		return time.Time{}
-	}
-	return time.Now().Add(timeout)
+	c.connection.SetDeadline(httpx.DeadlineAfter(timeout))
 }
 
 // onData splits out the complete request messages and enqueues them all at once, returning the number of consumed
@@ -131,55 +122,15 @@ func (c *conn) onData(data []byte) int {
 		c.connection.Close()
 		return len(data)
 	}
-	consumed := 0
 	queued := len(c.queue)
-	for consumed < len(data) {
-		if c.framer == (framer{}) {
-			// An empty line before a request, CRLF or a bare LF, is ignored, as some clients send one after a body (RFC
-			// 9112 2.2); a bare CR is not one, and is left to make the request line invalid.
-			if rest := data[consumed:]; rest[0] == '\n' {
-				consumed++
-				continue
-			} else if rest[0] == '\r' && len(rest) == 1 {
-				break // its LF may be on its way
-			} else if bytes.HasPrefix(rest, []byte("\r\n")) {
-				consumed += 2
-				continue
-			}
-		}
-		m, expectContinue, err := c.framer.next(data[consumed:], &c.srv.opts)
-		if err == errHandoff {
-			// The rest of the connection goes to net/http once the earlier requests are answered. Reading stops, so the
-			// request stays unconsumed for it.
-			c.connection.PauseRead()
-			c.push(nil, message{}, statusHandoff)
-			break
-		}
-		if err != nil {
-			// The error response also goes out through the queue, which guarantees it comes after the responses of
-			// earlier requests.
-			status := int16(http.StatusBadRequest)
-			switch err {
-			case errHeaderTooLarge:
-				status = http.StatusRequestHeaderFieldsTooLarge
-			case errURITooLong:
-				status = http.StatusRequestURITooLong
-			}
-			c.broken = true
-			c.push(nil, message{}, status)
-			consumed = len(data)
-			break
-		}
-		if m.size == 0 {
-			// The header is complete and the client waits for 100 Continue before sending the body. It goes through
-			// the queue as well, so it is not written in the middle of earlier responses.
-			if expectContinue {
-				c.push(nil, message{}, http.StatusContinue)
-			}
-			break
-		}
-		c.push(data[consumed:consumed+m.size], m, 0)
-		consumed += m.size
+	consumed, end := c.framer.split(data, &c.srv.opts, c.push)
+	switch {
+	case end == statusHandoff:
+		// The rest of the connection goes to net/http once the earlier requests are answered. Reading stops, so the
+		// request stays unconsumed for it.
+		c.connection.PauseRead()
+	case end != 0: // the error response goes out through the queue, after the responses of earlier requests
+		c.broken = true
 	}
 	if len(c.queue) >= maxPipeline || c.queuedBytes >= maxQueuedBytes {
 		// Paused only once every complete request at hand is queued: the engine does not pass the unconsumed data on again
@@ -216,7 +167,8 @@ func (c *conn) push(data []byte, m message, status int16) {
 // all that the client sent, so the requests sent in full are queued. Those not answered yet still are, as on net/http,
 // and the connection closes behind the last of them (see statusClose); the requests' context ends, as it does on
 // net/http, since the client is leaving. It reports whether the connection stays open: it does not when there is no
-// request left to answer, or a protocol that took the connection over is in charge of it.
+// request left to answer, or a protocol that took the connection over is in charge of it. It is called once per
+// connection, as fnet and package ftls ask once.
 func (c *conn) halfClose() bool {
 	c.mu.Lock()
 	if c.protocol.Load() != nil || c.worker != workerServing && c.worker != workerWaiting {
@@ -340,7 +292,7 @@ func (c *conn) closeFromWorker() {
 	c.mu.Lock()
 	c.worker = workerClosing // what the client sends meanwhile neither submits a worker nor changes the deadline
 	c.mu.Unlock()
-	c.connection.SetDeadline(deadlineAfter(c.srv.opts.IdleTimeout))
+	c.connection.SetDeadline(httpx.DeadlineAfter(c.srv.opts.IdleTimeout))
 	c.connection.Close()
 }
 

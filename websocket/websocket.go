@@ -19,11 +19,11 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/fhttp"
+	"github.com/linfeip/fnet/internal/httpx"
 	"github.com/linfeip/fnet/internal/units"
 
 	"github.com/gobwas/ws"
@@ -112,8 +112,8 @@ func Upgrade(w http.ResponseWriter, r *http.Request, h Handler, opts Options) er
 	c.phase.Store(phaseOpening)
 	err = fhttp.Upgrade(w, func(nc fnet.Conn) fhttp.Protocol {
 		c.connection = nc
-		nc.PauseRead()                               // no reads until OnOpen returns: peer data sent after the 101 waits in the kernel
-		nc.SetDeadline(deadlineAfter(c.idleTimeout)) // set before the protocol switch; cannot race with OnData in a callback
+		nc.PauseRead()                                     // no reads until OnOpen returns: peer data sent after the 101 waits in the kernel
+		nc.SetDeadline(httpx.DeadlineAfter(c.idleTimeout)) // set before the protocol switch; cannot race with OnData in a callback
 		return c
 	})
 	if err != nil {
@@ -149,9 +149,9 @@ func checkHandshake(r *http.Request) (key string, err error) {
 		return "", ws.ErrHandshakeBadMethod
 	case !r.ProtoAtLeast(1, 1):
 		return "", ws.ErrHandshakeBadProtocol
-	case !hasToken(r.Header["Upgrade"], "websocket"):
+	case !httpx.HasToken(r.Header["Upgrade"], "websocket"):
 		return "", ws.ErrHandshakeBadUpgrade
-	case !hasToken(r.Header["Connection"], "upgrade"):
+	case !httpx.HasToken(r.Header["Connection"], "upgrade"):
 		return "", ws.ErrHandshakeBadConnection
 	}
 	// Neither of these may be repeated (RFC 6455 11.3.1, 11.3.5): the parties on the way could take different ones.
@@ -186,18 +186,4 @@ func acceptKey(key string) string {
 	var buf [24 + len(acceptGUID)]byte
 	sum := sha1.Sum(append(append(buf[:0], key...), acceptGUID...))
 	return base64.StdEncoding.EncodeToString(sum[:])
-}
-
-// hasToken reports whether the comma-separated header values contain token (case-insensitive).
-func hasToken(values []string, token string) bool {
-	for _, v := range values {
-		for v != "" {
-			var t string
-			t, v, _ = strings.Cut(v, ",")
-			if strings.EqualFold(strings.TrimSpace(t), token) {
-				return true
-			}
-		}
-	}
-	return false
 }

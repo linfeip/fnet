@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/linfeip/fnet/internal/httpx"
 	"github.com/linfeip/fnet/internal/units"
 )
 
@@ -258,9 +259,9 @@ func parseRequest(msg []byte, m message, last *lastRequest) *parsedRequest {
 	r.Method, r.RequestURI, r.Proto, r.ProtoMajor, r.ProtoMinor = method, uri, protos[minor], 1, minor
 	r.URL, r.Host = &p.url, host
 	p.url.Path, p.url.RawQuery, p.url.ForceQuery = path, query, hasQuery && query == ""
-	r.Close = hasToken(header["Connection"], "close")
+	r.Close = httpx.HasToken(header["Connection"], "close")
 	if minor == 0 {
-		r.Close = r.Close || !hasToken(header["Connection"], "keep-alive")
+		r.Close = r.Close || !httpx.HasToken(header["Connection"], "keep-alive")
 	}
 	body := msg[m.header:m.size]
 	switch {

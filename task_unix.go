@@ -33,26 +33,29 @@ const (
 //
 // state records both the pending events and the status of the task: setting an event also sets scheduledBit, and if
 // that bit was clear there is no task queued or running, so this call submits one; otherwise a task already exists
-// and it will notice the new events at the end of its round and run another one (see run).
+// and it will notice the new events at the end of its round and run another one (see release).
 // A connection therefore has at most one task at a time, with reading, callbacks, flushing and closing all done
-// serially inside it, and no events are lost. It reports whether this call submitted the task.
-func (c *conn) notify(ev uint32) bool {
-	if c.markEvents(ev) {
+// serially inside it, and no events are lost. The state word is used only here, in run, release and takeOver.
+func (c *conn) notify(ev uint32) {
+	if c.state.Or(ev|scheduledBit)&scheduledBit == 0 {
 		c.schedule()
-		return true
 	}
-	return false
 }
 
-// schedule submits the connection's task to the Executor (a private taskpool.NewDefault().SubmitTo by default), keyed by the
-// connection's loop-affine key. The caller must hold the task, see markEvents.
+// schedule submits the connection's task to the Executor (a private taskpool.NewDefault().SubmitTo by default), keyed by
+// the connection's loop-affine key.
 func (c *conn) schedule() { c.loop.srv.opts.Executor(c.loop.taskKey(c.fd), c.task) }
 
-// markEvents merges events and takes the right to submit the connection's single task; a caller it returns true for
-// must submit it, never drop it.
-func (c *conn) markEvents(ev uint32) bool {
-	return c.state.Or(ev|scheduledBit)&scheduledBit == 0
+// release gives up the task held by the caller: when events arrived meanwhile, it submits the task again for them.
+func (c *conn) release() {
+	if !c.state.CompareAndSwap(scheduledBit, 0) {
+		c.schedule()
+	}
 }
+
+// takeOver takes the task while no task is queued or running, and reports whether it did: from then on notify never
+// submits it, so the caller owns everything the task owns, until it calls release.
+func (c *conn) takeOver() bool { return c.state.CompareAndSwap(0, scheduledBit) }
 
 // run is the connection's task: it takes the pending events and processes one round. When more events arrive while
 // it is processing, it does not continue on the spot but submits itself again, going to the end of the executor's
@@ -65,7 +68,7 @@ func (c *conn) run() {
 	done := false
 	defer func() {
 		if !done {
-			c.close(ErrHandlerPanic) // scheduledBit stays set, so there will be no further task
+			c.close(ErrHandlerPanic) // the task is not released, so there will be no further one
 			if c.lingering() {       // OnClose itself panicked, the linger having begun
 				c.endLinger()
 			}
@@ -73,9 +76,9 @@ func (c *conn) run() {
 	}()
 	c.handle(ev)
 	done = true
-	// A closed connection keeps scheduledBit set, so there is no further task, unless it lingers.
-	if (!c.closed || c.lingering()) && !c.state.CompareAndSwap(scheduledBit, 0) {
-		c.schedule()
+	// A closed connection keeps its task for good, so there is no further one, unless it lingers.
+	if !c.closed || c.lingering() {
+		c.release()
 	}
 }
 
@@ -87,6 +90,9 @@ func (c *conn) run() {
 // already sent but that has not been read yet is read away first, so that the socket holds no unread data at close
 // time, which would make the peer receive an RST instead of a FIN.
 func (c *conn) handle(ev uint32) {
+	if ev&evHup != 0 {
+		c.peerClosed = true
+	}
 	if c.closed { // events left over after the connection was closed, or for its linger
 		if c.lingering() {
 			c.linger(ev)
@@ -116,9 +122,6 @@ func (c *conn) handle(ev uint32) {
 			h.OnWritable(c)
 		}
 	}
-	if ev&evHup != 0 {
-		c.peerClosed = true
-	}
 	if ev&evResume != 0 && !c.readPaused.Load() {
 		if h, ok := c.loop.srv.handler.(ResumeHandler); ok {
 			h.OnResume(c) // what it kept goes before what the socket holds
@@ -146,11 +149,6 @@ func (c *conn) handle(ev uint32) {
 
 // read reads from the socket once and invokes OnData; the read buffer is borrowed from the pool and returned after the
 // callback returns.
-//
-// Edge-triggered mode does not notify again for data that has already arrived: filling the buffer means the socket may
-// still hold data, so the connection notifies itself to run another round; not filling it means the socket is drained.
-// The exception is a closed peer: the FIN may have been merged into the same notification as the data, or have arrived
-// while reading was paused, so once the data is read there will be no further notification and we must read until EOF.
 func (c *conn) read() {
 	srv := c.loop.srv
 	size := srv.opts.ReadBufferSize
@@ -166,26 +164,18 @@ func (c *conn) read() {
 		pending = c.in.Len()
 	}
 	n, err := sysRead(c.fd, b[pending:])
-	if n <= 0 {
-		switch err {
-		case unix.EAGAIN: // already drained, wait for the next edge-triggered event
-			// The peer has not closed after all: the evHup was left over from a previous connection with this fd (see
-			// loop.handleEvent), and would otherwise cost every read from now on another round.
-			c.peerClosed = false
-		case unix.EINTR: // interrupted by a signal: this edge-triggered event was used up without reading data, read again
-			c.notify(evRead)
-		case nil: // EOF: the peer closed its write direction
-			if !c.halfClose() {
-				c.onClosing(io.EOF)
-				c.requestCloseOnEOF()
-			}
-		default:
-			c.requestClose(err)
+	switch err = c.afterRead(n, size-pending, err); {
+	case err == io.EOF: // the peer closed its write direction
+		if !c.halfClose() {
+			c.onClosing(io.EOF)
+			c.requestCloseOnEOF()
 		}
 		return
-	}
-	if pending+n == size || c.peerClosed {
-		c.notify(evRead)
+	case err != nil:
+		c.requestClose(err)
+		return
+	case n <= 0:
+		return
 	}
 	data := b[:pending+n]
 	switch {
@@ -207,6 +197,34 @@ func (c *conn) read() {
 	default: // data lives in the borrowed buffer, copy the unconsumed part out
 		c.in.Append(data[consumed:])
 	}
+}
+
+// afterRead takes in the result of a read of n bytes into room bytes, the one read of a round, and returns io.EOF once
+// the peer has closed its write direction, the error when the read failed, and nil otherwise. When there may be more to
+// read, it notifies the connection to run another round: edge-triggered mode does not notify again for data that has
+// already arrived, so a read that fills the room may have left some, and a read interrupted by a signal used the event
+// up without reading. The FIN of a closed peer may have been merged into the same notification as the data, or have
+// arrived while reading was paused, so once the data is read there will be no further notification and we must read
+// until EOF.
+func (c *conn) afterRead(n, room int, err error) error {
+	switch {
+	case n > 0:
+		if n == room || c.peerClosed {
+			c.notify(evRead)
+		}
+		return nil
+	case err == nil:
+		return io.EOF
+	case err == unix.EAGAIN: // already drained, wait for the next edge-triggered event
+		// The peer has not closed after all: the evHup was left over from a previous connection with this fd (see
+		// loop.handleEvent), and would otherwise cost every read from now on another round.
+		c.peerClosed = false
+		return nil
+	case err == unix.EINTR:
+		c.notify(evRead)
+		return nil
+	}
+	return err
 }
 
 // maxBacklog is how much data may wait in a connection's send buffer before the connection stops being read: what it

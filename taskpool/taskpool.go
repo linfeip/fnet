@@ -1,9 +1,8 @@
 // Package taskpool is a goroutine pool organized into shards that reuses the goroutines running short tasks, saving the
 // cost of creating and destroying a goroutine per task.
 //
-// Each shard uses a bounded lock-free queue and keeps at most maxWorkers workers. Large batches are spread evenly
-// across the shards; small batches keep their random placement and merge notifications, and each shard decides once
-// whether to wake a worker after enqueuing (when one is already on its way there is no second wakeup).
+// Each shard uses a bounded lock-free queue and keeps at most maxWorkers workers; after enqueuing a task the shard wakes
+// a worker only when none is already on its way to the queue.
 // The number of running workers is bounded only by maxWorkers; there is no GOMAXPROCS soft budget any more: a worker
 // whose callback blocks still counts as running, and a soft budget keeps the pool from growing enough to absorb the
 // blocking while leaving ready tasks waiting in the queue, which in measurements only raised tail latency without
@@ -117,60 +116,6 @@ func (s *shard) submit(task func()) {
 		return
 	}
 	s.notify()
-}
-
-// SubmitBatch submits a batch asynchronously; it keeps no reference to the tasks slice after returning, so the caller
-// may immediately clear and reuse it.
-// Within a shard the tasks still run one by one, a batch never reserves tasks that have not run yet, and it shares
-// the same overflow-helping policy as Submit.
-func (p *Pool) SubmitBatch(tasks []func()) {
-	if len(tasks) == 0 {
-		return
-	}
-	if len(tasks) == 1 || p.closed.Load() {
-		for _, task := range tasks {
-			p.Submit(task)
-		}
-		return
-	}
-	count := len(p.shards)
-	// Small batches keep their random placement: force-spreading them across shards would only increase the number of
-	// wakeups for queued work.
-	// The common case of <=64 shards merges notifications with a stack bitmap; wider pools fall back to the
-	// one-task-at-a-time path.
-	if len(tasks) < count {
-		if count > 64 {
-			for _, task := range tasks {
-				p.Submit(task)
-			}
-			return
-		}
-		var ready uint64
-		for _, task := range tasks {
-			index := cheaprandn(uint32(count))
-			s := &p.shards[index]
-			if !s.push(task) {
-				go s.help(task)
-			} else {
-				ready |= 1 << index
-			}
-		}
-		for ready != 0 {
-			p.shards[bits.TrailingZeros64(ready)].notify()
-			ready &= ready - 1
-		}
-		return
-	}
-	start := int(cheaprandn(uint32(count)))
-	for i := range min(count, len(tasks)) {
-		s := &p.shards[(start+i)%count]
-		for j := i; j < len(tasks); j += count {
-			if !s.push(tasks[j]) {
-				go s.help(tasks[j])
-			}
-		}
-		s.notify()
-	}
 }
 
 // cheaprandn returns a random number in [0, n): it is the runtime's own fast random number generator, whose state

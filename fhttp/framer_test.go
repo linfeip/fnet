@@ -2,6 +2,7 @@ package fhttp
 
 import (
 	"errors"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -9,35 +10,41 @@ import (
 	"github.com/linfeip/fnet/internal/units"
 )
 
-// frameAll simulates the engine: data arrives step bytes at a time. It returns the messages that were
-// split out, the error it ran into, and whether a 100 Continue was asked for.
+// frameAll simulates the engine: data arrives step bytes at a time, and what split leaves is passed again with what
+// arrives next, the way conn.onData has it. It returns the messages that were split out, the error a status item stands
+// for, and whether a 100 Continue was asked for.
 func frameAll(in string, step int) ([]string, error, bool) {
 	var f framer
 	opts := Options{MaxHeaderBytes: units.KB, MaxBufferedBodyBytes: 32}
 	var msgs []string
 	var buf []byte
-	expectContinue := false
-	for i := 0; i < len(in); i += step {
-		buf = append(buf, in[i:min(i+step, len(in))]...)
-		for {
-			m, expect, err := f.next(buf, &opts)
-			if err != nil {
-				return msgs, err, expectContinue
-			}
-			if expect {
-				if expectContinue {
-					return msgs, errors.New("100 Continue was requested twice"), true
-				}
-				expectContinue = true
-			}
-			if m.size == 0 {
-				break
-			}
-			msgs = append(msgs, string(buf[:m.size]))
-			buf = buf[m.size:]
+	continues := 0
+	var stopped error
+	push := func(msg []byte, _ message, status int16) {
+		switch status {
+		case 0:
+			msgs = append(msgs, string(msg))
+		case http.StatusContinue:
+			continues++
+		case statusHandoff:
+			stopped = errHandoff
+		case http.StatusRequestHeaderFieldsTooLarge:
+			stopped = errHeaderTooLarge
+		case http.StatusRequestURITooLong:
+			stopped = errURITooLong
+		default:
+			stopped = errBadRequest
 		}
 	}
-	return msgs, nil, expectContinue
+	for i := 0; i < len(in) && stopped == nil; i += step {
+		buf = append(buf, in[i:min(i+step, len(in))]...)
+		consumed, _ := f.split(buf, &opts, push)
+		buf = buf[consumed:]
+	}
+	if continues > 1 {
+		return msgs, errors.New("100 Continue was requested twice"), true
+	}
+	return msgs, stopped, continues == 1
 }
 
 func TestFramer(t *testing.T) {
