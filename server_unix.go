@@ -245,12 +245,12 @@ func (s *Server) acceptConn(listenerFd int, l *loop) *conn {
 	s.acceptMu.RLock()
 	defer s.acceptMu.RUnlock()
 	for !s.draining.Load() {
-		fd, remote, err := accept(listenerFd)
+		fd, remoteAddr, err := accept(listenerFd)
 		if err == nil {
 			if !s.listenerPerLoop {
 				l = s.loops[s.nextLoop.Add(1)%uint32(len(s.loops))]
 			}
-			c := &conn{fd: fd, loop: l, remote: remote}
+			c := &conn{fd: fd, loop: l, remoteAddr: remoteAddr}
 			c.task = c.run
 			s.openConnsWg.Add(1) // decremented again once OnClose has returned and the fd is closed
 			return c
@@ -289,6 +289,9 @@ func (s *Server) retryAccept() {
 	}
 	time.AfterFunc(acceptRetryDelay, func() {
 		s.acceptRetrying.Store(false)
+		if s.draining.Load() {
+			return
+		}
 		for _, l := range s.loops {
 			l.acceptAll()
 		}

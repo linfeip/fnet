@@ -58,6 +58,7 @@ type response struct {
 	writeErr       error
 	body           bytepool.Buffer
 	out            bytepool.Buffer // the responses serialized and not written out yet, see flush
+	writeBuffers   [3][]byte       // scratch slice backing for Writev in send and finish, avoiding an allocation per call
 	outStart       int             // the length of out before the current response
 	remaining      int             // what the Handler may still write of the Content-Length it declared, -1 for none
 	committed      committedHeader // what commitHeader took of the Handler's header
@@ -72,7 +73,6 @@ type response struct {
 type committedHeader struct {
 	connection     []string // the values of the Connection field, which goes out only if the body leaves the connection open
 	declaredLength int      // the Content-Length the Handler declared, -1 for none
-	hasLength      bool     // the header has a Content-Length
 	hasType        bool     // the header has a Content-Type
 	hasDate        bool     // the header has a Date
 	encoded        bool     // the header has a Content-Encoding
@@ -277,11 +277,19 @@ func (w *response) send(piece []byte) error {
 		appendChunkSize(&w.out, len(piece))
 		end = crlf
 	}
-	_, err := w.conn.connection.Writev([][]byte{w.out.Bytes(), piece, end})
+	err := w.writev(w.out.Bytes(), piece, end)
 	w.out.Release()
 	if err != nil {
 		w.writeErr = err
 	}
+	return err
+}
+
+// writev sends the segments in order with a single Writev, reusing w.writeBuffers so no slice is allocated.
+func (w *response) writev(first, second, third []byte) error {
+	w.writeBuffers = [3][]byte{first, second, third}
+	_, err := w.conn.connection.Writev(w.writeBuffers[:])
+	w.writeBuffers = [3][]byte{}
 	return err
 }
 
@@ -307,7 +315,7 @@ func (w *response) finish() bool {
 	}
 	b := &w.out
 	if len(body) > maxCopiedBody { // written right away after the output so far, without being copied
-		if _, err := w.conn.connection.Writev([][]byte{b.Bytes(), body, end}); err != nil {
+		if err := w.writev(b.Bytes(), body, end); err != nil {
 			w.writeErr = err
 		}
 		b.Release()
@@ -337,17 +345,13 @@ func (w *response) commitHeader() {
 	appendStatusLine(b, w.status)
 	committed := committedHeader{declaredLength: -1}
 	if len(w.header) > 0 {
-		keepLength := w.req.Method == http.MethodHead && w.bodyAllowed() && w.status != http.StatusResetContent
 		for name, values := range w.header {
 			switch name {
 			case "Transfer-Encoding":
 				continue
 			case "Content-Length":
-				committed.hasLength = true
 				committed.declaredLength = declaredLength(values)
-				if !keepLength {
-					continue
-				}
+				continue
 			case "Content-Type":
 				if w.status == http.StatusNotModified {
 					continue
@@ -404,7 +408,6 @@ func (w *response) writeHeader(content []byte, streamed bool) {
 		w.body.Reset() // a 205 has no content (RFC 9110 15.3.6), so it goes out with Content-Length: 0
 		content = nil
 	}
-	keepLength := isHEAD && bodyAllowed && w.status != http.StatusResetContent
 	committed := &w.committed
 	writing := bodyWriting{discardBody: isHEAD || !bodyAllowed || w.status == http.StatusResetContent}
 	closeDelimited := false
@@ -423,12 +426,14 @@ func (w *response) writeHeader(content []byte, streamed bool) {
 	b := &w.out
 	switch {
 	case !bodyAllowed:
-	case !streamed || w.status == http.StatusResetContent:
-		if !keepLength || !committed.hasLength && w.body.Len() > 0 {
+	case w.status == http.StatusResetContent:
+		appendContentLength(b, 0)
+	case committed.declaredLength >= 0 && (isHEAD || streamed):
+		appendContentLength(b, committed.declaredLength)
+	case !streamed:
+		if !isHEAD || w.body.Len() > 0 {
 			appendContentLength(b, w.body.Len())
 		}
-	case committed.declaredLength >= 0:
-		appendContentLength(b, committed.declaredLength)
 	case writing.chunked:
 		b.WriteString("Transfer-Encoding: chunked\r\n")
 	}

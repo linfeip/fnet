@@ -67,7 +67,7 @@ func New(shards, maxWorkers, capacity int) *Pool {
 		s.pool = p
 		s.slots = make([]slot, size)
 		for j := range s.slots {
-			s.slots[j].seq.Store(uint64(j))
+			s.slots[j].sequence.Store(uint64(j))
 		}
 		s.mask = uint64(size - 1)
 		s.wakeups = make([]chan *shard, maxWorkers)
@@ -135,12 +135,12 @@ func run(task func()) {
 	task()
 }
 
-// slot is one cell of the queue. For task number pos (at position pos&mask): seq equal to pos means it can be written,
-// equal to pos+1 means it has been written and can be taken out, and after it is taken out seq is set to pos+capacity,
-// left for the next lap.
+// slot is one cell of the queue. For task number pos (at position pos&mask): sequence equal to pos means it can be
+// written, equal to pos+1 means it has been written and can be taken out, and after it is taken out sequence is set to
+// pos+capacity, left for the next lap.
 type slot struct {
-	seq  atomic.Uint64
-	task func()
+	sequence atomic.Uint64
+	task     func()
 }
 
 // shard is one shard of the pool. Submitters write tail, workers write head, and the worker state occupies yet another
@@ -172,11 +172,11 @@ func (s *shard) push(task func()) bool {
 	pos := s.tail.Load()
 	for {
 		sl := &s.slots[pos&s.mask]
-		switch seq := sl.seq.Load(); {
+		switch seq := sl.sequence.Load(); {
 		case seq == pos:
 			if s.tail.CompareAndSwap(pos, pos+1) {
 				sl.task = task
-				sl.seq.Store(pos + 1)
+				sl.sequence.Store(pos + 1)
 				return true
 			}
 			pos = s.tail.Load()
@@ -193,12 +193,12 @@ func (s *shard) pop() func() {
 	pos := s.head.Load()
 	for {
 		sl := &s.slots[pos&s.mask]
-		switch seq := sl.seq.Load(); {
+		switch seq := sl.sequence.Load(); {
 		case seq == pos+1:
 			if s.head.CompareAndSwap(pos, pos+1) {
 				task := sl.task
 				sl.task = nil // stop referencing the task that was taken out
-				sl.seq.Store(pos + s.mask + 1)
+				sl.sequence.Store(pos + s.mask + 1)
 				return task
 			}
 			pos = s.head.Load()
@@ -213,7 +213,7 @@ func (s *shard) pop() func() {
 // hasTask reports whether a task is available at the head of the queue.
 func (s *shard) hasTask() bool {
 	pos := s.head.Load()
-	return s.slots[pos&s.mask].seq.Load() == pos+1
+	return s.slots[pos&s.mask].sequence.Load() == pos+1
 }
 
 // notify makes sure a worker comes for the tasks in the queue: when a worker is already on its way (holding

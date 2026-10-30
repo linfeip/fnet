@@ -46,27 +46,21 @@ type tlsConnection interface {
 }
 
 // request is one item in the request queue: either a complete request message, or a status code to reply with
-// (100 Continue, or an error that closes the connection), or statusHandoff or statusClose.
+// (100 Continue, or an error that closes the connection), or statusHandoff.
 type request struct {
 	msg     bytepool.Buffer
 	header  int32 // the length of the message's request line and headers (see maxLimit)
-	status  int16 // 0 for a message, otherwise the status code to reply with, or statusHandoff or statusClose
+	status  int16 // 0 for a message, otherwise the status code to reply with, or statusHandoff
 	chunked bool  // the message's body is chunked
 }
 
-const (
-	// statusHandoff is the queue item that hands the connection to net/http, see conn.handoff.
-	statusHandoff = -1
-	// statusClose is the queue item that closes the connection once the requests before it are answered, see
-	// conn.halfClose.
-	statusClose = -2
-)
+// statusHandoff is the queue item that hands the connection to net/http, see conn.handoff.
+const statusHandoff = -1
 
 // conn is the state of one HTTP connection.
 type conn struct {
 	srv        *Server
 	connection fnet.Conn
-	remoteAddr string     // produced on the first request, accessed only by the worker (workers of one connection run serially)
 	state      *connState // what a connection's requests share, made on the first one; accessed only by the worker, except for its ctx
 	serveTask  func()     // serve, bound once, so that handing it to a worker does not allocate each time
 
@@ -81,6 +75,7 @@ type conn struct {
 	worker     workerState   // what the connection's worker is doing
 	partial    bool          // the connection buffer holds an incomplete request; written only by fnet's callbacks
 	readPaused bool          // too much is queued, so reading is paused until the worker has emptied the queue (see maxPipeline)
+	halfClosed bool          // the client has closed its write direction while requests were still to be answered; guarded by mu
 	broken     bool          // a protocol error has occurred, all subsequent data is discarded; accessed only by fnet's callbacks
 	closed     atomic.Bool   // set by onClose while holding mu; read without it by the response's writes
 }
@@ -198,7 +193,7 @@ func (c *conn) releaseQueue() {
 
 // halfClose is called when the client has closed its write direction, which the engine finds out only after it has read
 // all that the client sent, so the requests sent in full are queued. Those not answered yet still are, as on net/http,
-// and the connection closes behind the last of them (see statusClose); the requests' context ends, as it does on
+// and the connection closes once the queue is empty (see serveQueue); the requests' context ends, as it does on
 // net/http, since the client is leaving. It reports whether the connection stays open: it does not when there is no
 // request left to answer, or a protocol that took the connection over is in charge of it. It is called once per
 // connection, as fnet and package ftls ask once.
@@ -208,20 +203,13 @@ func (c *conn) halfClose() bool {
 		c.mu.Unlock()
 		return false
 	}
-	c.push(nil, message{}, statusClose)
+	c.halfClosed = true
 	cancel := c.contextCancel()
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	return true
-}
-
-// halfClosed reports whether the client has closed its write direction while requests were still to be answered, which is
-// when the queue ends with statusClose; the caller holds mu.
-func (c *conn) halfClosed() bool {
-	n := len(c.queue)
-	return n > 0 && c.queue[n-1].status == statusClose
 }
 
 func (c *conn) onClose(err error) {
@@ -282,6 +270,11 @@ func (c *conn) serveQueue(w *response) {
 		}
 		switch {
 		case c.closed.Load() || len(c.queue) == 0:
+			if c.halfClosed && !c.closed.Load() {
+				c.mu.Unlock()
+				c.closeFromWorker()
+				return
+			}
 			if !c.closed.Load() && cap(c.queue) > 0 && cap(retained.Bytes()) > 0 {
 				slot := &c.queue[:1][0]
 				if cap(slot.msg.Bytes()) == 0 {
@@ -324,19 +317,11 @@ func (c *conn) serveQueue(w *response) {
 			}
 			continue
 		}
-		n := len(c.queue)
-		if c.halfClosed() {
-			n-- // leave statusClose in c.queue so halfClosed reports true while the batch runs
-		}
 		base := w.batch[:0]
-		w.batch = append(base, c.queue[:n]...)
+		w.batch = append(base, c.queue...)
 		base = w.batch[:0]
-		clear(c.queue[:n])
-		if n < len(c.queue) {
-			c.queue[0] = c.queue[n]
-			c.queue[n] = request{}
-			c.queue = c.queue[:1]
-		} else if cap(c.queue) > maxRetainedQueueCapacity {
+		clear(c.queue)
+		if cap(c.queue) > maxRetainedQueueCapacity {
 			c.releaseQueue()
 		} else {
 			c.queue = c.queue[:0]
@@ -401,8 +386,6 @@ func (c *conn) handle(w *response, r request) bool {
 		}
 		c.handoff()
 		return false // closing the detached connection does nothing
-	case statusClose:
-		return false
 	default:
 		w.writeError(int(r.status))
 		return false
@@ -419,10 +402,10 @@ func (c *conn) handle(w *response, r request) bool {
 		return false
 	}
 	req := &w.req
-	if c.remoteAddr == "" {
-		c.remoteAddr = c.connection.RemoteAddr().String()
+	if c.state.remoteAddr == "" {
+		c.state.remoteAddr = c.connection.RemoteAddr().String()
 	}
-	req.RemoteAddr = c.remoteAddr
+	req.RemoteAddr = c.state.remoteAddr
 	if tc, ok := c.connection.(tlsConnection); ok {
 		if c.state.tls == nil { // the requests of a connection share it, as on net/http
 			state := tc.ConnectionState()
@@ -461,7 +444,7 @@ func (c *conn) serveHTTP(w *response, req *http.Request) (ok bool) {
 		if err := recover(); err != nil {
 			if err != http.ErrAbortHandler {
 				buf := make([]byte, 64<<10)
-				slog.Error("fhttp: panic serving request", "remoteAddr", c.remoteAddr, "panic", err,
+				slog.Error("fhttp: panic serving request", "remoteAddr", c.state.remoteAddr, "panic", err,
 					"stack", string(buf[:runtime.Stack(buf, false)]))
 			}
 			ok = false
@@ -541,11 +524,12 @@ func (c *conn) wakeWriter() {
 	}
 }
 
-// connState holds what a connection's requests share, made on its first request: the TLS state and the lazy
-// connection context. It implements context.Context by forwarding to that context, so a Handler that does not use
-// Request.Context pays neither for context.WithCancel nor for the LocalAddr syscall.
+// connState holds what a connection's requests share, made on its first request: the peer address, the TLS state and
+// the lazy connection context. It implements context.Context by forwarding to that context, so a Handler that does not
+// use Request.Context pays neither for context.WithCancel nor for the LocalAddr syscall.
 type connState struct {
 	connection *conn
+	remoteAddr string                      // Request.RemoteAddr, formatted on the connection's first request
 	tls        *tls.ConnectionState        // Request.TLS, made on the first request of a TLS connection
 	ctx        atomic.Pointer[connContext] // made when a Handler first asks for the request's context
 }
@@ -578,7 +562,7 @@ func (s *connState) context() context.Context {
 	if s.ctx.Load() == nil {
 		ctx, cancel := context.WithCancel(values)
 		s.ctx.Store(&connContext{Context: ctx, cancel: cancel})
-		if c.closed.Load() || c.halfClosed() || c.protocol.Load() != nil {
+		if c.closed.Load() || c.halfClosed || c.protocol.Load() != nil {
 			cancel()
 		}
 	}
@@ -596,12 +580,16 @@ func (c *conn) contextCancel() context.CancelFunc {
 	return nil
 }
 
-// endContext cancels the context of the connection's requests once the connection has gone to a new protocol or to
-// net/http, as on net/http, where a request's context ends with its Handler. It is called by the worker.
+// endContext cancels the context of the connection's requests and releases the shared request state once the
+// connection has gone to a new protocol or to net/http, as on net/http, where a request's context ends with its
+// Handler. It is called by the worker.
 func (c *conn) endContext() {
-	if c.state != nil {
-		if ctx := c.state.ctx.Load(); ctx != nil {
-			ctx.cancel()
-		}
+	c.mu.Lock()
+	cancel := c.contextCancel()
+	c.state = nil
+	c.writable = nil
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }

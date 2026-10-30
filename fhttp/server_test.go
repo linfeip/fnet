@@ -630,6 +630,8 @@ func TestStreamedResponse(t *testing.T) {
 		{name: "HEAD", request: head, handle: write, absent: []string{"Content-Length", "Transfer-Encoding"}},
 		{name: "HEAD declared length", request: head, handle: declare("102400"), fields: []string{"Content-Length: 102400"},
 			absent: []string{"Transfer-Encoding"}},
+		{name: "HEAD invalid declared length", request: head, handle: declare("invalid"),
+			absent: []string{"Content-Length", "Transfer-Encoding"}},
 		{name: "205", request: get, handle: func(w http.ResponseWriter) error {
 			w.WriteHeader(http.StatusResetContent)
 			return write(w)
@@ -652,8 +654,8 @@ func TestStreamedResponse(t *testing.T) {
 		wire := strings.Join(rc.writes, "")
 		header, _, _ := strings.Cut(wire, "\r\n\r\n")
 		for _, field := range tt.fields {
-			if !strings.Contains(header+"\r\n", "\r\n"+field+"\r\n") {
-				t.Errorf("%s: no %q in the header %q", tt.name, field, header)
+			if got := strings.Count(header+"\r\n", "\r\n"+field+"\r\n"); got != 1 {
+				t.Errorf("%s: %q appears %d times in the header %q, want 1", tt.name, field, got, header)
 			}
 		}
 		for _, name := range tt.absent {
@@ -824,23 +826,29 @@ func TestStreamIdleTimeout(t *testing.T) {
 	}
 }
 
-// TestStreamClientGone checks that a Handler writing a large body learns soon that its client went away.
+// TestStreamClientGone checks that a Handler writing a large body learns soon that its client went away, including when
+// the client had already half-closed its write direction.
 func TestStreamClientGone(t *testing.T) {
-	errs := make(chan error, 1)
-	s := serve(t, endlessBody(errs), Options{})
-	c, err := net.Dial("tcp", s.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	io.WriteString(c, "GET / HTTP/1.1\r\nHost: a\r\n\r\n")
-	if _, err := io.CopyN(io.Discard, c, 1<<20); err != nil {
-		t.Fatal(err)
-	}
-	c.Close()
-	select {
-	case <-errs:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Write still goes on after the client closed")
+	for _, halfClose := range []bool{false, true} {
+		errs := make(chan error, 1)
+		s := serve(t, endlessBody(errs), Options{})
+		c, err := net.Dial("tcp", s.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.WriteString(c, "GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+		if halfClose {
+			c.(*net.TCPConn).CloseWrite()
+		}
+		if _, err := io.CopyN(io.Discard, c, 1<<20); err != nil {
+			t.Fatal(err)
+		}
+		c.Close()
+		select {
+		case <-errs:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("halfClose=%v: Write still goes on after the client closed", halfClose)
+		}
 	}
 }
 
@@ -1514,8 +1522,8 @@ func TestHalfCloseQueue(t *testing.T) {
 		io.WriteString(w, "ok")
 	})
 	c.onData([]byte(get + get))
-	if !c.halfClose() || !c.halfClosed() || len(c.queue) != 3 {
-		t.Fatalf("with a worker on two requests: queue of %d, want those two and the close", len(c.queue))
+	if !c.halfClose() || !c.halfClosed || len(c.queue) != 2 {
+		t.Fatalf("with a worker on two requests: halfClosed=%v, queue of %d, want true and 2", c.halfClosed, len(c.queue))
 	}
 	c.serve() // the worker queueConn stands for
 	if got := strings.Count(strings.Join(rc.writes, ""), "HTTP/1.1 200 OK"); got != 2 || !rc.closed || c.worker != workerClosing {
@@ -1523,5 +1531,22 @@ func TestHalfCloseQueue(t *testing.T) {
 	}
 	if ctxErr == nil {
 		t.Fatal("the context of a request answered after the client closed its write direction has not ended")
+	}
+
+	// Even when the last response fills the send buffer past Writable, halfClose still closes the connection
+	// once the queue is empty instead of waiting for the client in workerWaiting.
+	rc = &recordConn{}
+	c = queueConn(rc)
+	c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok")
+		rc.full = true
+	})
+	c.onData([]byte(get))
+	if !c.halfClose() {
+		t.Fatal("halfClose did not keep the connection open while a request was queued")
+	}
+	c.serve()
+	if !rc.closed || c.worker != workerClosing {
+		t.Fatalf("after answering a half-closed connection with a full send buffer: closed=%v, worker=%d; want true, closing", rc.closed, c.worker)
 	}
 }

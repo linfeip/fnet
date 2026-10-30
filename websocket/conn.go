@@ -53,8 +53,9 @@ type Conn struct {
 	messageFinished bool      // a data message was received in full during this OnData
 	corking         bool      // this OnData has taken the cork buffer and has not written it out yet, see cork
 
-	frameBuffer [maxSmallFrameSize]byte // encodes the frame header, and payloads that fit alongside it, while holding writeMu
-	writeMu     sync.Mutex              // guarantees that no frame is sent after the close frame
+	frameBuffer  [maxSmallFrameSize]byte // encodes the frame header, and payloads that fit alongside it, while holding writeMu
+	writeBuffers [3][]byte               // scratch slice backing for Writev while holding writeMu, avoiding an allocation per call
+	writeMu      sync.Mutex              // guarantees that no frame is sent after the close frame
 	connection  fnet.Conn
 	handler     Handler
 	// The cork buffer is embedded in the connection to avoid allocating a wrapper per batch; it is accessed only while
@@ -163,8 +164,9 @@ func (c *Conn) writeFrame(op ws.OpCode, payload []byte) error {
 		frame.Release()
 		return err
 	}
-	// The slice takes an allocation, which a frame this large makes up for, rather than a field on every connection.
-	_, err := c.connection.Writev([][]byte{header, payload})
+	c.writeBuffers = [3][]byte{header, payload}
+	_, err := c.connection.Writev(c.writeBuffers[:2])
+	c.writeBuffers = [3][]byte{}
 	return err
 }
 
@@ -185,7 +187,9 @@ func (c *Conn) writeCorked(op ws.OpCode, payload []byte) error {
 		b.Write(payload)
 		return nil
 	}
-	_, err := c.connection.Writev([][]byte{b.Bytes(), header, payload})
+	c.writeBuffers = [3][]byte{b.Bytes(), header, payload}
+	_, err := c.connection.Writev(c.writeBuffers[:])
+	c.writeBuffers = [3][]byte{}
 	b.Reset()
 	return err
 }

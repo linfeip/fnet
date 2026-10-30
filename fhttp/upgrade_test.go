@@ -139,21 +139,14 @@ func TestUpgradeHeaderInjection(t *testing.T) {
 }
 
 // TestUpgradeReleasesHTTPState verifies that HTTP requests are no longer handled after an upgrade: the
-// request queue and the cached peer address are released right away, so a large number of upgraded
-// connections no longer keep that memory resident.
+// request queue and the shared request state are released once the upgrade Handler finishes, so a large
+// number of upgraded connections no longer keep that memory resident.
 func TestUpgradeReleasesHTTPState(t *testing.T) {
-	type state struct {
-		queue      []request
-		remoteAddr string
-	}
-	got := make(chan state, 1)
+	upgraded := make(chan *conn, 1)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/upgrade", func(w http.ResponseWriter, r *http.Request) {
 		Upgrade(w, func(c fnet.Conn) Protocol { return &echoProtocol{connection: c, closed: make(chan error, 1)} })
-		c := w.(*response).conn
-		c.mu.Lock()
-		got <- state{c.queue, c.remoteAddr} // remoteAddr is only accessed by the worker, which this is
-		c.mu.Unlock()
+		upgraded <- w.(*response).conn
 	})
 	s := serve(t, mux, Options{})
 	c, err := net.Dial("tcp", s.Addr().String())
@@ -161,11 +154,18 @@ func TestUpgradeReleasesHTTPState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
 	io.WriteString(c, "GET /upgrade HTTP/1.1\r\nHost: a\r\n\r\n")
+	if resp, _ := readResp(t, bufio.NewReader(c)); resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade response %d", resp.StatusCode)
+	}
 	select {
-	case st := <-got:
-		if st.queue != nil || st.remoteAddr != "" {
-			t.Fatalf("queue(cap=%d) and remoteAddr=%q are still retained after the upgrade", cap(st.queue), st.remoteAddr)
+	case hc := <-upgraded:
+		hc.mu.Lock()
+		queue, state := hc.queue, hc.state
+		hc.mu.Unlock()
+		if queue != nil || state != nil {
+			t.Fatalf("queue(cap=%d) and state=%v are still retained after the upgrade", cap(queue), state)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("upgrade was not performed")

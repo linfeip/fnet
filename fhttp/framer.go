@@ -65,7 +65,7 @@ func (f *framer) split(data []byte, opts *Options, push func(msg []byte, m messa
 				continue
 			} else if rest[0] == '\r' && len(rest) == 1 {
 				return consumed, 0 // its LF may be on its way
-			} else if bytes.HasPrefix(rest, []byte("\r\n")) {
+			} else if rest[0] == '\r' && rest[1] == '\n' {
 				consumed += 2
 				continue
 			}

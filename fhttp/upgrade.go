@@ -68,7 +68,7 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 	}
 	p := newProtocol(c.connection)
 	c.mu.Lock()
-	if c.closed.Load() {
+	if c.closed.Load() || c.halfClosed {
 		c.mu.Unlock()
 		return net.ErrClosed
 	}
@@ -80,9 +80,8 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 		return errEarlyRequest
 	}
 	c.protocol.Store(&p)
-	// No HTTP requests are handled from now on: release the request queue and cached peer address.
+	// Once the Handler returns, endContext cancels the request's context and releases c.state.
 	c.releaseQueue()
-	c.remoteAddr = ""
 	if c.partial {
 		// Data the client sent without waiting for the upgrade response is handed to the new protocol only when
 		// data next arrives; until then the request-header timeout applies.

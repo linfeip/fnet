@@ -21,11 +21,12 @@ type Server struct {
 	listeners []net.Listener
 	nextFd    atomic.Int32
 
-	mu     sync.Mutex
-	conns  map[*stdConn]struct{}
-	closed bool
-	err    error          // the fatal accept error that made the server exit
-	wg     sync.WaitGroup // connection goroutines
+	mu      sync.Mutex
+	conns   map[*stdConn]struct{}
+	serving bool
+	closed  bool
+	err     error          // the fatal accept error that made the server exit
+	wg      sync.WaitGroup // connection goroutines
 }
 
 // NewServer creates a listener on addr; connections start being handled once Serve is called. To listen on several
@@ -70,6 +71,18 @@ func (s *Server) Addrs() []net.Addr {
 // Serve accepts on every listener and starts one goroutine per connection, blocking until Close is called (it then
 // returns ErrServerClosed).
 func (s *Server) Serve() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrServerClosed
+	}
+	if s.serving {
+		s.mu.Unlock()
+		return errors.New("fnet: Serve called more than once")
+	}
+	s.serving = true
+	s.mu.Unlock()
+
 	var accepting sync.WaitGroup
 	for _, ln := range s.listeners {
 		accepting.Add(1)
@@ -184,15 +197,18 @@ func (s *Server) serveConn(c *stdConn) {
 	s.mu.Unlock()
 }
 
+// readBufferSize is the buffer size of a single Read in readLoop.
+const readBufferSize = 4 << 10
+
 // readLoop calls OnOpen, then reads and passes what it reads on to OnData until the connection is closed or detached,
 // and calls OnClosing when it closes on its own. It returns the error that ended it, ErrHandlerPanic when a callback
 // panicked (see recoverPanic), and the data OnData left unconsumed.
 func (s *Server) readLoop(c *stdConn) (in []byte, err error) {
 	defer recoverPanic(&err)
 	s.handler.OnOpen(c)
-	buf := make([]byte, 4<<10)
+	buf := make([]byte, readBufferSize)
 	for err == nil {
-		if s.waitRead(c) {
+		if s.waitRead(c) || c.closedBy.Load() != 0 {
 			return in, nil
 		}
 		var n int

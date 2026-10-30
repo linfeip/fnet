@@ -110,9 +110,10 @@ func (c *conn) handle(ev uint32) {
 		c.loop.srv.handler.OnOpen(c)
 	}
 	// The poller reports a writable socket along with every event, so evWrite is nearly always set: only a backlog
-	// needs the lock and a write.
+	// needs the lock and a write. A peer close or reset on a socket whose send buffer is full may report only evHup
+	// (such as EVFILT_READ with EV_EOF on kqueue), and flushing then learns of the error at once.
 	drained, writable := false, false
-	if ev&evWrite != 0 && c.backlogged.Load() {
+	if ev&(evWrite|evHup) != 0 && c.backlogged.Load() {
 		drained, writable = c.flush()
 	}
 	if writable { // the backlog is back down to maxBacklog: reading resumes, and a WritableHandler hears of it

@@ -44,12 +44,12 @@ type conn struct {
 	deadline  atomic.Int64    // close deadline (UnixNano), 0 means no deadline; written by any goroutine, checked by the event loop
 	lingerEnd atomic.Int64    // when the linger of a connection closed locally ends (UnixNano), 0 while it does not linger; see beginLinger
 
-	outPos   int
-	closeErr error          // close reason: nil means an explicit close, io.EOF means the peer closed its write direction; both drain the send buffer before closing, any other reason closes at once (see closesNow)
-	remote   netip.AddrPort // kept by value, net.Addr is built on RemoteAddr: two fewer small objects resident per connection
+	outPos     int
+	closeErr   error          // close reason: nil means an explicit close, io.EOF means the peer closed its write direction; both drain the send buffer before closing, any other reason closes at once (see closesNow)
+	remoteAddr netip.AddrPort // kept by value, net.Addr is built on RemoteAddr: two fewer small objects resident per connection
 }
 
-func (c *conn) RemoteAddr() net.Addr { return addrPortToTCPAddr(c.remote) }
+func (c *conn) RemoteAddr() net.Addr { return addrPortToTCPAddr(c.remoteAddr) }
 func (c *conn) Fd() int              { return c.fd }
 func (c *conn) Context() any         { return c.ctx }
 func (c *conn) SetContext(ctx any)   { c.ctx = ctx }

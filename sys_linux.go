@@ -88,6 +88,9 @@ func sysWrite(fd int, b []byte) (int, error) {
 func sysWritev(fd int, bs [][]byte) (int, error) {
 	iovecs := make([]unix.Iovec, 0, 8)
 	for _, b := range bs {
+		if len(b) == 0 {
+			continue
+		}
 		v := unix.Iovec{Base: unsafe.SliceData(b)}
 		v.SetLen(len(b))
 		iovecs = append(iovecs, v)

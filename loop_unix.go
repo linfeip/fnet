@@ -25,7 +25,7 @@ type loop struct {
 	collectMu sync.Mutex // serializes collectConns, which goes over conns without holding mu
 	conns     []*conn    // the connections registered with this loop, see collectConns; guarded by collectMu
 
-	blocked atomic.Int32 // the workers waiting in poller.Block; other loops' workers skip this loop meanwhile (see help)
+	active atomic.Bool // the last poll retrieved events; other loops' workers help only while it is set (see help)
 }
 
 func newLoop(s *Server) (*loop, error) {
@@ -165,20 +165,15 @@ func (w *worker) run() {
 			continue
 		}
 		// Serve wakes every loop after setting stopping: a wakeup that comes after the check below ends Block.
-		l.blocked.Add(1)
 		if l.srv.stopping.Load() {
-			l.blocked.Add(-1)
 			break
 		}
 		l.poller.Block(&w.batch)
-		l.blocked.Add(-1)
 		w.runBatch(l)
 	}
 	// The wakeups for stopping may have been taken by workers of other loops: pass them on.
 	for _, other := range l.srv.loops {
-		if other.blocked.Load() > 0 {
-			other.poller.Wake()
-		}
+		other.poller.Wake()
 	}
 }
 
@@ -186,18 +181,21 @@ func (w *worker) run() {
 // anything to do. A wakeup (sent only when the server stops) counts as something to do, so that run looks at stopping.
 func (w *worker) serve(l *loop) bool {
 	woken := l.poller.Poll(&w.batch)
+	if w.batch.Len() == 0 {
+		l.active.Store(false)
+		return woken
+	}
 	w.runBatch(l)
-	return w.batch.Len() > 0 || woken
+	return true
 }
 
-// help serves each of the other loops once, until one has something to do; it reports whether one had. A loop with a
-// worker waiting in its Poller is skipped: it has a worker to spare, which the kernel wakes when an event comes, so
-// polling it would only cost an idle worker a syscall.
+// help serves the other loops that had events on their last poll, until one has something to do; it reports whether one
+// had. A loop whose last poll found nothing is skipped, so idle workers do not contend on its Poller.
 func (w *worker) help() bool {
 	loops := w.home.srv.loops
 	w.next++
 	for i := range loops {
-		if l := loops[(w.next+i)%len(loops)]; l != w.home && l.blocked.Load() == 0 && w.serve(l) {
+		if l := loops[(w.next+i)%len(loops)]; l != w.home && l.active.Load() && w.serve(l) {
 			return true
 		}
 	}
@@ -208,6 +206,10 @@ func (w *worker) help() bool {
 // batch reported a listening socket: accepting until none is left takes a while during a burst of connections, and the
 // connections already reported ready need not wait for it.
 func (w *worker) runBatch(l *loop) {
+	if w.batch.Len() == 0 {
+		return
+	}
+	l.active.Store(true)
 	accepting := false
 	for i := range w.batch.Len() {
 		fd, ev := w.batch.Event(i)
