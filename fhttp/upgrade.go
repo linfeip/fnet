@@ -74,18 +74,15 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 	}
 	// There are already requests queued after the upgrade request: the client did not wait for the upgrade
 	// response, so these requests must no longer be executed as HTTP.
-	if len(c.queue) > 0 {
+	if len(w.batch) > 0 || len(c.queue) > 0 {
 		c.mu.Unlock()
 		w.writeError(http.StatusBadRequest)
 		return errEarlyRequest
 	}
 	c.protocol.Store(&p)
-	// No HTTP requests are handled from now on: release the request queue and cached peer address. Keep the small
-	// lastRequest object because it holds the context of the request currently running the upgrade.
-	c.queue, c.remoteAddr = nil, ""
-	if c.last != nil {
-		c.last.target, c.last.fields = "", ""
-	}
+	// No HTTP requests are handled from now on: release the request queue and cached peer address.
+	c.releaseQueue()
+	c.remoteAddr = ""
 	if c.partial {
 		// Data the client sent without waiting for the upgrade response is handed to the new protocol only when
 		// data next arrives; until then the request-header timeout applies.
@@ -94,10 +91,11 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 	c.mu.Unlock()
 
 	b := &w.out
-	b.AppendString("HTTP/1.1 101 Switching Protocols\r\n")
+	b.Truncate(w.outStart)
+	b.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
 	delete(w.header, "Content-Length") // a 1xx response has neither (RFC 9110 8.6, RFC 9112 6.1)
 	delete(w.header, "Transfer-Encoding")
-	appendHeader(b, w.header) // turns a CR or LF in a value into a space, so that a Handler cannot inject fields
-	b.AppendString("\r\n")
+	w.header.Write(b)
+	b.WriteString("\r\n")
 	return w.flush() // the responses before it and the 101 go out before the new protocol writes anything
 }

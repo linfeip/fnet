@@ -31,7 +31,6 @@ import (
 
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/fhttp"
-	"github.com/linfeip/fnet/internal/units"
 	"github.com/linfeip/fnet/taskpool"
 
 	"github.com/gobwas/ws"
@@ -197,7 +196,7 @@ func TestEcho(t *testing.T) {
 	c.expectMessage(t, ws.OpText, []byte("hello"))
 	wsutil.WriteClientMessage(c, ws.OpBinary, nil)
 	c.expectMessage(t, ws.OpBinary, nil)
-	big := bytes.Repeat([]byte("0123456789abcdef"), 32*units.KB) // 512KB, spans multiple reads
+	big := bytes.Repeat([]byte("0123456789abcdef"), 32*(1<<10)) // 512KB, spans multiple reads
 	wsutil.WriteClientMessage(c, ws.OpBinary, big)
 	c.expectMessage(t, ws.OpBinary, big)
 
@@ -216,7 +215,7 @@ func TestEcho(t *testing.T) {
 // TestEchoPipelined verifies a real WebSocket connection sending and receiving multi-frame batches back to back,
 // covering Echo ordering across read rounds.
 func TestEchoPipelined(t *testing.T) {
-	for _, size := range []int{7, units.KB} {
+	for _, size := range []int{7, (1 << 10)} {
 		t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
 			s := newTestServer(t, &testHandler{}, Options{})
 			c := dial(t, s)
@@ -273,7 +272,7 @@ func TestApplyMaskMatchesCipher(t *testing.T) {
 // RFC 6455 requires the shortest encoding for the payload length, which the peer does not necessarily check
 // when parsing.
 func TestAppendFrameHeader(t *testing.T) {
-	for _, n := range []int{0, 125, 126, 64*units.KB - 1, 64 * units.KB, units.MB} {
+	for _, n := range []int{0, 125, 126, 64*(1<<10) - 1, 64 * (1 << 10), (1 << 20)} {
 		var want bytes.Buffer
 		ws.WriteHeader(&want, ws.Header{Fin: true, OpCode: ws.OpText, Length: int64(n)})
 		if got := appendFrameHeader(nil, ws.OpText, n); !bytes.Equal(got, want.Bytes()) {
@@ -411,10 +410,10 @@ func maskedFrames(count, payload int) []byte {
 func BenchmarkOnData(b *testing.B) {
 	for _, frames := range []int{1, 2, 10, 16} {
 		b.Run(fmt.Sprintf("frames=%d", frames), func(b *testing.B) {
-			batch := maskedFrames(frames, units.KB)
-			c := &Conn{connection: stubConnection{}, handler: echoHandler{}, maxMessageSize: units.MB}
+			batch := maskedFrames(frames, (1 << 10))
+			c := &Conn{connection: stubConnection{}, handler: echoHandler{}, maxMessageSize: (1 << 20)}
 			data := make([]byte, len(batch))
-			b.SetBytes(int64(frames * units.KB))
+			b.SetBytes(int64(frames * (1 << 10)))
 			b.ReportAllocs()
 			for range b.N {
 				copy(data, batch) // OnData unmasks in place
@@ -430,10 +429,10 @@ func BenchmarkOnData(b *testing.B) {
 // covering the escape regression of the cork wrapper.
 func TestOnDataAllocs(t *testing.T) {
 	for _, frames := range []int{1, 2, 10, 16} {
-		for _, size := range []int{7, units.KB} {
+		for _, size := range []int{7, (1 << 10)} {
 			t.Run(fmt.Sprintf("frames=%d/size=%d", frames, size), func(t *testing.T) {
 				batch := maskedFrames(frames, size)
-				c := &Conn{connection: stubConnection{}, handler: echoHandler{}, maxMessageSize: units.MB}
+				c := &Conn{connection: stubConnection{}, handler: echoHandler{}, maxMessageSize: (1 << 20)}
 				data := make([]byte, len(batch))
 				if allocs := testing.AllocsPerRun(1000, func() {
 					copy(data, batch)
@@ -643,7 +642,7 @@ func TestClose(t *testing.T) {
 
 func TestProtocolErrors(t *testing.T) {
 	h := &testHandler{}
-	s := newTestServer(t, h, Options{MaxMessageSize: units.KB})
+	s := newTestServer(t, h, Options{MaxMessageSize: (1 << 10)})
 	long := string(bytes.Repeat([]byte("a"), 600))
 	tests := []struct {
 		name     string
@@ -854,7 +853,7 @@ func TestSlowHandler(t *testing.T) {
 
 	// Later data stays in the kernel buffer; once that is full the peer is blocked.
 	stream := bytes.NewBuffer(rest)
-	payload := bytes.Repeat([]byte("x"), 64*units.KB)
+	payload := bytes.Repeat([]byte("x"), 64*(1<<10))
 	for range 512 { // 32MB, far beyond the kernel buffer
 		wsutil.WriteClientMessage(stream, ws.OpBinary, payload)
 	}
@@ -964,7 +963,7 @@ func (r *raceDeadlineConn) SetDeadline(t time.Time) {
 // lands: closeTimeout must stand, or a peer that reads nothing keeps the closing connection and its send buffer for good.
 func TestCloseTimeoutStands(t *testing.T) {
 	rc := &raceDeadlineConn{}
-	c := &Conn{connection: rc, handler: nopHandler{}, maxMessageSize: units.MB}
+	c := &Conn{connection: rc, handler: nopHandler{}, maxMessageSize: (1 << 20)}
 	rc.conn = c
 	c.OnData(clientFrames(ws.OpText, []byte("hi")))
 	if until := time.Until(rc.deadline); until < closeTimeout/2 {
@@ -975,7 +974,7 @@ func TestCloseTimeoutStands(t *testing.T) {
 // newCorkConn returns a connection whose writes are recorded; OnData's callbacks run directly in the test.
 func newCorkConn() (*Conn, *recordConn) {
 	rc := &recordConn{}
-	c := &Conn{connection: rc, handler: &testHandler{closed: make(chan error, 1)}, maxMessageSize: units.MB}
+	c := &Conn{connection: rc, handler: &testHandler{closed: make(chan error, 1)}, maxMessageSize: (1 << 20)}
 	c.SetContext("opened")
 	return c, rc
 }
@@ -1056,7 +1055,7 @@ func TestWriteFrame(t *testing.T) {
 	for _, tc := range []struct {
 		size     int
 		vectored bool
-	}{{0, false}, {125, false}, {maxCopiedPayload, false}, {maxCopiedPayload + 1, true}, {units.MB, true}} {
+	}{{0, false}, {125, false}, {maxCopiedPayload, false}, {maxCopiedPayload + 1, true}, {(1 << 20), true}} {
 		rc := &recordConn{}
 		c := &Conn{connection: rc}
 		payload := bytes.Repeat([]byte("x"), tc.size)

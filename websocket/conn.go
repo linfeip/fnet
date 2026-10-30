@@ -11,17 +11,16 @@ import (
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/internal/bytepool"
 	"github.com/linfeip/fnet/internal/httpx"
-	"github.com/linfeip/fnet/internal/units"
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
 )
 
 // maxCorkBytes is the upper bound of the cork buffer (see Conn.cork).
-const maxCorkBytes = 64 * units.KB
+const maxCorkBytes = 64 << 10
 
 // maxCopiedPayload is the largest payload writeFrame copies next to its header to write the frame in one piece.
-const maxCopiedPayload = 4 * units.KB
+const maxCopiedPayload = 4 << 10
 
 // The values of Conn.phase: OnOpen runs on the goroutine of the upgrade request, while OnData and OnClose are
 // invoked from fnet's tasks; they must not be invoked before OnOpen returns, and they must not block a goroutine of
@@ -54,8 +53,8 @@ type Conn struct {
 	messageFinished bool      // a data message was received in full during this OnData
 	corking         bool      // this OnData has taken the cork buffer and has not written it out yet, see cork
 
-	frameHeader [maxFrameHeaderSize]byte // the frame-header encoding buffer, used while holding writeMu
-	writeMu     sync.Mutex               // guarantees that no frame is sent after the close frame
+	frameBuffer [maxSmallFrameSize]byte // encodes the frame header, and payloads that fit alongside it, while holding writeMu
+	writeMu     sync.Mutex              // guarantees that no frame is sent after the close frame
 	connection  fnet.Conn
 	handler     Handler
 	// The cork buffer is embedded in the connection to avoid allocating a wrapper per batch; it is accessed only while
@@ -101,14 +100,17 @@ func (c *Conn) WriteMessage(op ws.OpCode, data []byte) error {
 		return errInvalidMessage
 	}
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.closing.Load() {
-		return net.ErrClosed
+	var err error
+	switch {
+	case c.closing.Load():
+		err = net.ErrClosed
+	case c.corkBuffer.Bytes() != nil:
+		err = c.writeCorked(op, data)
+	default:
+		err = c.writeFrame(op, data)
 	}
-	if c.corkBuffer.Bytes() != nil {
-		return c.writeCorked(op, data)
-	}
-	return c.writeFrame(op, data)
+	c.writeMu.Unlock()
+	return err
 }
 
 // Close sends a close frame (1000) and then closes the connection. After Close returns, OnMessage is no longer
@@ -148,11 +150,15 @@ func (c *Conn) closeWith(code ws.StatusCode, err error) {
 // copy costs less than the kernel taking in the iovec array of a writev. A larger frame is written with a single
 // writev of the header and the payload, so the payload is not copied.
 func (c *Conn) writeFrame(op ws.OpCode, payload []byte) error {
-	header := appendFrameHeader(c.frameHeader[:0], op, len(payload))
+	header := appendFrameHeader(c.frameBuffer[:0], op, len(payload))
+	if len(header)+len(payload) <= len(c.frameBuffer) {
+		_, err := c.connection.Write(append(header, payload...))
+		return err
+	}
 	if len(payload) <= maxCopiedPayload {
 		frame := bytepool.Get(len(header) + len(payload))
-		frame.Append(header)
-		frame.Append(payload)
+		frame.Write(header)
+		frame.Write(payload)
 		_, err := c.connection.Write(frame.Bytes())
 		frame.Release()
 		return err
@@ -173,10 +179,10 @@ func (c *Conn) writeFrame(op ws.OpCode, payload []byte) error {
 //go:noinline
 func (c *Conn) writeCorked(op ws.OpCode, payload []byte) error {
 	b := &c.corkBuffer
-	header := appendFrameHeader(c.frameHeader[:0], op, len(payload))
+	header := appendFrameHeader(c.frameBuffer[:0], op, len(payload))
 	if b.Len()+len(header)+len(payload) <= maxCorkBytes {
-		b.Append(header)
-		b.Append(payload)
+		b.Write(header)
+		b.Write(payload)
 		return nil
 	}
 	_, err := c.connection.Writev([][]byte{b.Bytes(), header, payload})
@@ -332,7 +338,7 @@ func (c *Conn) readFrame(data []byte) int {
 		if h.OpCode != ws.OpContinuation {
 			c.messageOpCode = h.OpCode
 		}
-		c.message.Append(payload)
+		c.message.Write(payload)
 		if h.Fin { // the last fragment has arrived, deliver the reassembled message
 			c.deliver(c.messageOpCode, c.message.Bytes())
 			c.message.Release()

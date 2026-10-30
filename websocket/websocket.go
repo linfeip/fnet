@@ -24,7 +24,6 @@ import (
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/internal/httpx"
-	"github.com/linfeip/fnet/internal/units"
 
 	"github.com/gobwas/ws"
 )
@@ -74,7 +73,7 @@ type Options struct {
 
 func (o Options) withDefaults() Options {
 	if o.MaxMessageSize <= 0 {
-		o.MaxMessageSize = units.MB
+		o.MaxMessageSize = 1 << 20
 	}
 	if o.MessageTimeout == 0 {
 		o.MessageTimeout = 30 * time.Second

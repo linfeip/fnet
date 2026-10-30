@@ -27,8 +27,6 @@ import (
 	"runtime"
 	"sync/atomic"
 	_ "unsafe"
-
-	"github.com/linfeip/fnet/internal/units"
 )
 
 // MaxWorkers is the upper bound on the number of workers per shard: suspended workers are recorded in a bitmap of
@@ -130,7 +128,7 @@ func cheaprandn(n uint32) uint32
 func run(task func()) {
 	defer func() {
 		if err := recover(); err != nil {
-			buf := make([]byte, 64*units.KB)
+			buf := make([]byte, 64<<10)
 			slog.Error("taskpool: panic in task", "panic", err, "stack", string(buf[:runtime.Stack(buf, false)]))
 		}
 	}()

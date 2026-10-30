@@ -1,7 +1,13 @@
 package fhttp
 
 import (
+	"context"
+	"crypto/tls"
+	"log/slog"
+	"net/http"
 	"os"
+	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -9,8 +15,6 @@ import (
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/internal/bytepool"
 	"github.com/linfeip/fnet/internal/httpx"
-	"github.com/linfeip/fnet/internal/units"
-	"github.com/linfeip/fnet/taskpool"
 )
 
 // maxPipeline and maxQueuedBytes bound the requests queued for processing on a connection, by number and by size: once
@@ -20,7 +24,7 @@ import (
 // them by what one read brings (see conn.onData).
 const (
 	maxPipeline    = 128
-	maxQueuedBytes = 64 * units.KB
+	maxQueuedBytes = 64 << 10
 )
 
 // maxRetainedQueueCapacity is the maximum capacity retained once the request queue has been drained: a connection
@@ -28,6 +32,18 @@ const (
 // them one by one keeps only one item, and the large capacity left behind by a pipelining burst is released, so a
 // large number of connections do not hold on to memory for long.
 const maxRetainedQueueCapacity = 16
+
+// continueResponse is the interim response that asks the client to send the request body.
+var continueResponse = []byte("HTTP/1.1 100 Continue\r\n\r\n")
+
+// serverOptions answers "OPTIONS *", which asks about the server as a whole rather than a resource (RFC 9110 9.3.7), the
+// way the net/http server does: 200 with no content, where http.ServeMux would answer 400.
+var serverOptions = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+
+// tlsConnection is implemented by connections that carry a TLS session (such as *ftls.Conn).
+type tlsConnection interface {
+	ConnectionState() tls.ConnectionState
+}
 
 // request is one item in the request queue: either a complete request message, or a status code to reply with
 // (100 Continue, or an error that closes the connection), or statusHandoff or statusClose.
@@ -50,9 +66,9 @@ const (
 type conn struct {
 	srv        *Server
 	connection fnet.Conn
-	remoteAddr string       // produced on the first request, accessed only by the worker (workers of one connection run serially)
-	last       *lastRequest // what parseRequest shares with the next request, made on the first one; accessed only by the worker, except for its ctx (see context)
-	serveTask  func()       // serve, bound once, so that handing it to a worker does not allocate each time
+	remoteAddr string     // produced on the first request, accessed only by the worker (workers of one connection run serially)
+	state      *connState // what a connection's requests share, made on the first one; accessed only by the worker, except for its ctx
+	serveTask  func()     // serve, bound once, so that handing it to a worker does not allocate each time
 
 	framer      framer // accessed only by fnet's callbacks (callbacks of one connection run serially)
 	queuedBytes int32  // the total size of the messages in the queue, below maxLimit; guarded by mu, placed here to fill the room framer leaves
@@ -149,18 +165,35 @@ func (c *conn) onData(data []byte) int {
 	}
 	c.mu.Unlock()
 	if submit {
-		c.srv.opts.Executor(taskpool.RandomKey(), c.serveTask)
+		c.srv.opts.Executor(c.connection.Fd(), c.serveTask)
 	}
 	return consumed
 }
 
+// maxRetainedMessageBytes is the largest request message buffer retained in the connection's queue slot across requests.
+const maxRetainedMessageBytes = 4 << 10
+
 // push puts a copy of the request message data framed as m (or, when data is nil, the status code status) into the
 // queue; the caller holds mu.
 func (c *conn) push(data []byte, m message, status int16) {
-	r := request{header: int32(m.header), status: status, chunked: m.chunked}
-	r.msg.Append(data) // handle owns a dequeued buffer; onClose releases those still queued
-	c.queue = append(c.queue, r)
+	var msg bytepool.Buffer
+	if i := len(c.queue); i < cap(c.queue) {
+		slot := &c.queue[:i+1][i]
+		msg = slot.msg
+		slot.msg = bytepool.Buffer{}
+	}
+	msg.Write(data) // handle owns a dequeued buffer; releaseQueue releases those still in the queue
+	c.queue = append(c.queue, request{msg: msg, header: int32(m.header), status: status, chunked: m.chunked})
 	c.queuedBytes += int32(len(data))
+}
+
+// releaseQueue releases every buffer held in c.queue, including any retained in its spare capacity; the caller holds mu.
+func (c *conn) releaseQueue() {
+	full := c.queue[:cap(c.queue)]
+	for i := range full {
+		full[i].msg.Release()
+	}
+	c.queue, c.queuedBytes = nil, 0
 }
 
 // halfClose is called when the client has closed its write direction, which the engine finds out only after it has read
@@ -195,10 +228,7 @@ func (c *conn) onClose(err error) {
 	c.mu.Lock()
 	c.closed.Store(true)
 	cancel := c.contextCancel()
-	for i := range c.queue {
-		c.queue[i].msg.Release()
-	}
-	c.queue, c.queuedBytes = nil, 0
+	c.releaseQueue()
 	c.wakeWriter() // a Handler waiting in Write gives up, see waitWritable
 	c.mu.Unlock()
 	if cancel != nil {
@@ -234,6 +264,8 @@ func (c *conn) serve() {
 
 // serveQueue is the loop of serve.
 func (c *conn) serveQueue(w *response) {
+	var retained bytepool.Buffer
+	defer func() { retained.Release() }()
 	for {
 		c.mu.Lock()
 		// The client is not taking the responses: answering more would only pile them up in fnet's send buffer.
@@ -250,6 +282,12 @@ func (c *conn) serveQueue(w *response) {
 		}
 		switch {
 		case c.closed.Load() || len(c.queue) == 0:
+			if !c.closed.Load() && cap(c.queue) > 0 && cap(retained.Bytes()) > 0 {
+				slot := &c.queue[:1][0]
+				if cap(slot.msg.Bytes()) == 0 {
+					slot.msg, retained = retained, bytepool.Buffer{}
+				}
+			}
 			c.worker = workerIdle
 			resume := c.readPaused // everything queued has been answered, see maxPipeline
 			c.readPaused = false
@@ -266,23 +304,175 @@ func (c *conn) serveQueue(w *response) {
 			c.setDeadline()
 			c.mu.Unlock()
 			return
+		case len(c.queue) == 1:
+			r := c.queue[0]
+			c.queue[0] = request{}
+			c.queue = c.queue[:0]
+			c.queuedBytes = 0
+			c.mu.Unlock()
+			keepAlive := c.handle(w, r)
+			if keepAlive && cap(retained.Bytes()) == 0 && cap(r.msg.Bytes()) <= maxRetainedMessageBytes {
+				r.msg.Reset()
+				retained = r.msg
+			} else {
+				r.msg.Release()
+			}
+			if !keepAlive {
+				w.flush()
+				c.closeFromWorker()
+				return
+			}
+			continue
 		}
-		r := c.queue[0]
-		n := copy(c.queue, c.queue[1:])
-		c.queue[n] = request{}
-		c.queue = c.queue[:n]
-		c.queuedBytes -= int32(r.msg.Len())
-		if n == 0 && cap(c.queue) > maxRetainedQueueCapacity {
-			c.queue = nil
+		n := len(c.queue)
+		if c.halfClosed() {
+			n-- // leave statusClose in c.queue so halfClosed reports true while the batch runs
 		}
+		base := w.batch[:0]
+		w.batch = append(base, c.queue[:n]...)
+		base = w.batch[:0]
+		clear(c.queue[:n])
+		if n < len(c.queue) {
+			c.queue[0] = c.queue[n]
+			c.queue[n] = request{}
+			c.queue = c.queue[:1]
+		} else if cap(c.queue) > maxRetainedQueueCapacity {
+			c.releaseQueue()
+		} else {
+			c.queue = c.queue[:0]
+		}
+		c.queuedBytes = 0
 		c.mu.Unlock()
 
-		if !c.handle(w, r) {
-			w.flush()
-			c.closeFromWorker()
-			return
+		for len(w.batch) > 0 {
+			r := w.batch[0]
+			w.batch[0] = request{}
+			w.batch = w.batch[1:]
+			keepAlive := c.handle(w, r)
+			r.msg.Release()
+			if !keepAlive {
+				for i := range w.batch {
+					w.batch[i].msg.Release()
+				}
+				w.batch = base
+				w.flush()
+				c.closeFromWorker()
+				return
+			}
+			if len(w.batch) > 0 && (c.closed.Load() || !c.connection.Writable()) {
+				c.restoreBatch(w)
+				break
+			}
 		}
+		w.batch = base
 	}
+}
+
+// restoreBatch puts the unserved requests of w.batch back at the front of c.queue when the connection stalls mid-batch,
+// or releases them if the connection has closed.
+func (c *conn) restoreBatch(w *response) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed.Load() {
+		for i := range w.batch {
+			w.batch[i].msg.Release()
+		}
+		return
+	}
+	for i := range w.batch {
+		c.queuedBytes += int32(w.batch[i].msg.Len())
+	}
+	c.queue = append(slices.Clone(w.batch), c.queue...)
+	clear(w.batch)
+}
+
+// handle parses and processes one request, its response going into w's output, and reports whether to keep the
+// connection alive.
+func (c *conn) handle(w *response, r request) bool {
+	switch r.status {
+	case 0:
+	case http.StatusContinue:
+		w.out.Write(continueResponse)
+		return true
+	case statusHandoff:
+		if w.flush() != nil {
+			c.connection.Close()
+			return false
+		}
+		c.handoff()
+		return false // closing the detached connection does nothing
+	case statusClose:
+		return false
+	default:
+		w.writeError(int(r.status))
+		return false
+	}
+
+	if c.state == nil {
+		state := &connState{connection: c}
+		c.mu.Lock() // onClose reads it while holding mu
+		c.state = state
+		c.mu.Unlock()
+	}
+	if status := c.readRequest(w, r); status != 0 {
+		w.writeError(status)
+		return false
+	}
+	req := &w.req
+	if c.remoteAddr == "" {
+		c.remoteAddr = c.connection.RemoteAddr().String()
+	}
+	req.RemoteAddr = c.remoteAddr
+	if tc, ok := c.connection.(tlsConnection); ok {
+		if c.state.tls == nil { // the requests of a connection share it, as on net/http
+			state := tc.ConnectionState()
+			c.state.tls = &state
+		}
+		req.TLS = c.state.tls
+	}
+
+	w.start()
+	ok := c.serveHTTP(w, req)
+	keepAlive := false
+	switch {
+	case !ok:
+	case w.upgraded: // Upgrade already wrote the response: on success the connection goes to the new protocol, on failure it closes
+		keepAlive = c.protocol.Load() != nil && w.writeErr == nil
+		c.endContext()
+	default:
+		keepAlive = w.finish()
+	}
+	return keepAlive
+}
+
+// serveHTTP runs the Handler; when the Handler panics it logs the panic (except for http.ErrAbortHandler) and
+// returns false.
+func (c *conn) serveHTTP(w *response, req *http.Request) (ok bool) {
+	reqBody := req.Body
+	defer func() {
+		reqBody.Close()
+		w.bytesReader.Reset(nil)
+		if req.MultipartForm != nil {
+			req.MultipartForm.RemoveAll()
+		}
+		if !ok && !w.streamed {
+			w.out.Truncate(w.outStart)
+		}
+		if err := recover(); err != nil {
+			if err != http.ErrAbortHandler {
+				buf := make([]byte, 64<<10)
+				slog.Error("fhttp: panic serving request", "remoteAddr", c.remoteAddr, "panic", err,
+					"stack", string(buf[:runtime.Stack(buf, false)]))
+			}
+			ok = false
+		}
+	}()
+	handler := c.srv.handler
+	if req.RequestURI == "*" && req.Method == http.MethodOptions {
+		handler = serverOptions
+	}
+	handler.ServeHTTP(w, req)
+	return true
 }
 
 // closeFromWorker closes the connection from its worker, which then stops. fnet sends what is left before closing, which
@@ -308,7 +498,7 @@ func (c *conn) onWritable() {
 	}
 	c.mu.Unlock()
 	if resume {
-		c.srv.opts.Executor(taskpool.RandomKey(), c.serveTask)
+		c.srv.opts.Executor(c.connection.Fd(), c.serveTask)
 	}
 }
 
@@ -348,5 +538,70 @@ func (c *conn) wakeWriter() {
 	select {
 	case c.writable <- struct{}{}: // never ready while writable is nil
 	default:
+	}
+}
+
+// connState holds what a connection's requests share, made on its first request: the TLS state and the lazy
+// connection context. It implements context.Context by forwarding to that context, so a Handler that does not use
+// Request.Context pays neither for context.WithCancel nor for the LocalAddr syscall.
+type connState struct {
+	connection *conn
+	tls        *tls.ConnectionState        // Request.TLS, made on the first request of a TLS connection
+	ctx        atomic.Pointer[connContext] // made when a Handler first asks for the request's context
+}
+
+// connContext is the cancelable context of a connection's requests.
+type connContext struct {
+	context.Context
+	cancel context.CancelFunc
+}
+
+func (s *connState) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (s *connState) Done() <-chan struct{}       { return s.context().Done() }
+func (s *connState) Err() error                  { return s.context().Err() }
+
+// Value passes on to the connection's context: that is how context.WithCancel, WithTimeout and AfterFunc find the
+// cancelable context in it and register with it, instead of starting a goroutine for each derived context.
+func (s *connState) Value(key any) any { return s.context().Value(key) }
+
+// context returns the context of the connection's requests, making it when a Handler first asks for it. It holds the
+// values the net/http server puts in a request's context: the local address and an *http.Server.
+func (s *connState) context() context.Context {
+	if ctx := s.ctx.Load(); ctx != nil {
+		return ctx.Context
+	}
+	c := s.connection
+	values := context.WithValue(context.Background(), http.ServerContextKey, c.srv.streams)
+	values = context.WithValue(values, http.LocalAddrContextKey, c.connection.LocalAddr()) // outside mu: a syscall
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s.ctx.Load() == nil {
+		ctx, cancel := context.WithCancel(values)
+		s.ctx.Store(&connContext{Context: ctx, cancel: cancel})
+		if c.closed.Load() || c.halfClosed() || c.protocol.Load() != nil {
+			cancel()
+		}
+	}
+	return s.ctx.Load().Context
+}
+
+// contextCancel returns the function that cancels the context of the connection's requests, nil while no Handler has asked
+// for it yet; the caller holds mu.
+func (c *conn) contextCancel() context.CancelFunc {
+	if c.state != nil {
+		if ctx := c.state.ctx.Load(); ctx != nil {
+			return ctx.cancel
+		}
+	}
+	return nil
+}
+
+// endContext cancels the context of the connection's requests once the connection has gone to a new protocol or to
+// net/http, as on net/http, where a request's context ends with its Handler. It is called by the worker.
+func (c *conn) endContext() {
+	if c.state != nil {
+		if ctx := c.state.ctx.Load(); ctx != nil {
+			ctx.cancel()
+		}
 	}
 }

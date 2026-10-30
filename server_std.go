@@ -10,9 +10,8 @@ import (
 	"os"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/linfeip/fnet/internal/units"
 )
 
 // Server is a simple implementation on top of the standard library net package (for platforms such as Windows):
@@ -20,6 +19,7 @@ import (
 type Server struct {
 	handler   Handler
 	listeners []net.Listener
+	nextFd    atomic.Int32
 
 	mu     sync.Mutex
 	conns  map[*stdConn]struct{}
@@ -114,7 +114,7 @@ func (s *Server) accept(ln net.Listener) error {
 			return err
 		}
 		tempDelay = 0
-		c := &stdConn{netConnection: nc}
+		c := &stdConn{netConnection: nc, fd: int(s.nextFd.Add(1))}
 		c.readResumed.L = &c.mu
 		s.mu.Lock()
 		if s.closed {
@@ -190,7 +190,7 @@ func (s *Server) serveConn(c *stdConn) {
 func (s *Server) readLoop(c *stdConn) (in []byte, err error) {
 	defer recoverPanic(&err)
 	s.handler.OnOpen(c)
-	buf := make([]byte, 4*units.KB)
+	buf := make([]byte, 4<<10)
 	for err == nil {
 		if s.waitRead(c) {
 			return in, nil

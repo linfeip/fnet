@@ -48,7 +48,7 @@ type tlsStateKey struct{}
 // ftls.Conn.Detach): before Go 1.25, net/http only does so for a *tls.Conn itself.
 func serveTLSState(s *http.Server) {
 	s.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
-		state := c.(interface{ ConnectionState() tls.ConnectionState }).ConnectionState()
+		state := c.(tlsConnection).ConnectionState()
 		return context.WithValue(ctx, tlsStateKey{}, &state)
 	}
 	handler := s.Handler

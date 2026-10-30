@@ -2,13 +2,12 @@
 //
 // The division of labor:
 //   - fnet's OnData callback (on a goroutine of the executor) only finds where each request message ends: the
-//     header terminator "\r\n\r\n", then a small body, with Content-Length or in chunks. It copies the complete
+//     header terminator "\r\n\r\n", then a small body, with Content-Length or in plain chunks. It copies the complete
 //     messages into the connection's request queue without parsing them;
 //   - a worker goroutine of Options.Executor (a private taskpool.NewDefault() by default; the Handlers may block, so
-//     they are not run in OnData's task, which returns at once) takes the messages out in order, parses each (a
-//     request in the plain forms of HTTP/1.x by fhttp itself, field for field the way the standard library's
-//     http.ReadRequest would, any other through http.ReadRequest), runs the http.Handler, and writes the responses
-//     out together whenever it finds the queue empty. The request body is read from memory.
+//     they are not run in OnData's task, which returns at once) takes the messages out in order, parses each with
+//     the standard library's http.ReadRequest, runs the http.Handler, and writes the responses out together whenever
+//     it finds the queue empty. The request body is read from memory.
 //
 // At most one worker processes a given connection at a time, so with pipelining the responses come in the same
 // order as the requests. Written out together, a response also waits for the Handlers of the requests already queued
@@ -25,14 +24,8 @@
 // http.Flusher and http.Hijacker are not supported, except for the requests served by net/http (see below). Protocol
 // upgrades (such as WebSocket) are done through Upgrade.
 //
-// The request handed to a Handler is pooled, which saves it its allocations: it is valid only within that ServeHTTP
-// call. A Handler, and anything it starts, must not keep the request (its header, URL and body included) past
-// ServeHTTP: neither in a field or a cache, nor in a goroutine that is still running when ServeHTTP returns, nor
-// through a wrapper that goes on running it after ServeHTTP returns, such as http.TimeoutHandler. The request object
-// and the buffers behind its body are reused by later requests, so using them afterwards reads another request's
-// data (a data race). The strings of a request, header values included, are copies and stay valid. On the fnet path,
-// Request.Context is backed by the pooled request and is canceled when the client connection closes, or once Upgrade
-// or net/http has taken the connection over (see below); a response Write after the close returns an error.
+// On the fnet path, Request.Context is canceled when the client connection closes, or once Upgrade or net/http has
+// taken the connection over (see below); a response Write after the close returns an error.
 //
 // A request whose body is not buffered (larger than MaxBufferedBodyBytes, or framed in an unusual way) is served by
 // net/http instead: the connection is detached from fnet and handed to an internal http.Server running the same
@@ -60,7 +53,6 @@ import (
 
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/ftls"
-	"github.com/linfeip/fnet/internal/units"
 	"github.com/linfeip/fnet/taskpool"
 )
 
@@ -93,8 +85,8 @@ type Options struct {
 	// (reading and splitting the requests), which never block; the Handlers run on Executor.
 	Engine fnet.Options
 	// Executor runs the Handlers: it is called when a connection has requests queued and no such task of it is
-	// running, with a task that processes the connection's queue and ends once the queue is empty. The key is a random
-	// one (see taskpool.RandomKey), which spreads the Handlers over the queues of an executor that picks its queue by
+	// running, with a task that processes the connection's queue and ends once the queue is empty. The key is the
+	// connection's Fd(), which keeps a connection's Handlers on the same queue in an executor that picks its queue by
 	// key. It may be called from any goroutine, must not block, must run the task asynchronously (not directly on the
 	// caller's stack) and must not drop it; a Handler panic is recovered by fhttp. Unlike the connections' tasks the
 	// Handlers may block, so it has to cope with tasks that block: one running them on a few goroutines would stall
@@ -112,10 +104,10 @@ type Options struct {
 
 func (o Options) withDefaults() Options {
 	if o.MaxHeaderBytes <= 0 {
-		o.MaxHeaderBytes = 16 * units.KB
+		o.MaxHeaderBytes = 16 << 10
 	}
 	if o.MaxBufferedBodyBytes <= 0 {
-		o.MaxBufferedBodyBytes = units.MB
+		o.MaxBufferedBodyBytes = 1 << 20
 	}
 	o.MaxHeaderBytes, o.MaxBufferedBodyBytes = min(o.MaxHeaderBytes, maxLimit), min(o.MaxBufferedBodyBytes, maxLimit)
 	if o.ReadHeaderTimeout == 0 {
@@ -137,8 +129,7 @@ type Server struct {
 	handoffs *handoffListener // what streams accepts from
 }
 
-// NewServer creates an HTTP server on addr; when handler is nil, http.DefaultServeMux is used. The Handler must not
-// keep the request past ServeHTTP: it is pooled and reused (see the package documentation). To listen on several
+// NewServer creates an HTTP server on addr; when handler is nil, http.DefaultServeMux is used. To listen on several
 // addresses with the one server, see NewServerAddrs.
 func NewServer(addr string, handler http.Handler, opts Options) (*Server, error) {
 	return NewServerAddrs([]string{addr}, handler, opts)
@@ -146,7 +137,6 @@ func NewServer(addr string, handler http.Handler, opts Options) (*Server, error)
 
 // NewServerAddrs creates an HTTP server on each of addrs; when handler is nil, http.DefaultServeMux is used. At
 // least one address is required, and all of them share the one underlying fnet engine (see fnet.NewServerAddrs).
-// The Handler must not keep the request past ServeHTTP: it is pooled and reused (see the package documentation).
 func NewServerAddrs(addrs []string, handler http.Handler, opts Options) (*Server, error) {
 	if handler == nil {
 		handler = http.DefaultServeMux
@@ -181,9 +171,6 @@ func NewServerAddrs(addrs []string, handler http.Handler, opts Options) (*Server
 // http1Config returns a copy of config offering HTTP/1.1 through ALPN in place of h2, which a client would otherwise
 // pick when config offers it (as autocert's does); its other protocols, such as acme-tls/1, are kept. So does the config
 // GetConfigForClient returns, which crypto/tls uses in place of this one.
-//
-// Dynamic record sizing is off as well: it cuts the first responses of a connection into records of about 1KB, each of
-// which ftls writes to the socket on its own, a syscall each, and a small one may wait for an ACK (Nagle's algorithm).
 func http1Config(config *tls.Config) *tls.Config {
 	config = config.Clone()
 	protos := []string{"http/1.1"}
@@ -193,7 +180,6 @@ func http1Config(config *tls.Config) *tls.Config {
 		}
 	}
 	config.NextProtos = protos
-	config.DynamicRecordSizingDisabled = true
 	if get := config.GetConfigForClient; get != nil {
 		config.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			c, err := get(hello)

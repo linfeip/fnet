@@ -13,8 +13,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/linfeip/fnet/internal/units"
 )
 
 // funcHandler assembles a Handler from function fields; callbacks that are not set are no-ops.
@@ -149,7 +147,7 @@ func TestPartialConsume(t *testing.T) {
 // TestLargeWriteThenClose writes far more data than the kernel buffer holds in OnOpen and then closes
 // immediately: the data must be delivered in full before the connection is closed.
 func TestLargeWriteThenClose(t *testing.T) {
-	payload := make([]byte, 16*units.MB)
+	payload := make([]byte, 16*(1<<20))
 	for i := range payload {
 		payload[i] = byte(i * 7)
 	}
@@ -200,7 +198,7 @@ func TestLargeWritevThenClose(t *testing.T) {
 	var segments [][]byte
 	var want []byte
 	for i := range 40 {
-		segment := bytes.Repeat([]byte{byte(i)}, i%7*100*units.KB) // empty segment when i%7 == 0
+		segment := bytes.Repeat([]byte{byte(i)}, i%7*100*(1<<10)) // empty segment when i%7 == 0
 		segments = append(segments, segment)
 		want = append(want, segment...)
 	}
@@ -251,8 +249,8 @@ func TestPauseRead(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("a Windows TCP send does not block while the peer does not read, so the peer cannot be blocked")
 	}
-	out := bytes.Repeat([]byte("0123456789abcdef"), units.MB) // 16MB, far beyond the kernel buffer; written out via the send buffer while reading is paused
-	in := make([]byte, 32*units.MB)
+	out := bytes.Repeat([]byte("0123456789abcdef"), (1 << 20)) // 16MB, far beyond the kernel buffer; written out via the send buffer while reading is paused
+	in := make([]byte, 32*(1<<20))
 	var received atomic.Int64
 	done := make(chan struct{})
 	opened := make(chan Conn, 1)
@@ -812,7 +810,7 @@ func TestSerialCallbacks(t *testing.T) {
 func TestReadBufferSmaller(t *testing.T) {
 	srv := startServerWith(t, &funcHandler{data: echo}, Options{NumLoops: 1, ReadBufferSize: 512})
 	c := dial(t, srv)
-	msg := make([]byte, 4*units.MB)
+	msg := make([]byte, 4*(1<<20))
 	for i := range msg {
 		msg[i] = byte(i * 31)
 	}
@@ -911,7 +909,7 @@ func TestCloseWhilePaused(t *testing.T) {
 // being sent after EOF is read and only then is the connection closed; OnClose's err is io.EOF, and the
 // data must not be discarded because of the EOF.
 func TestPeerCloseKeepsBacklog(t *testing.T) {
-	payload := make([]byte, 8*units.MB) // far beyond the kernel buffer, so the send buffer must have a backlog
+	payload := make([]byte, 8*(1<<20)) // far beyond the kernel buffer, so the send buffer must have a backlog
 	for i := range payload {
 		payload[i] = byte(i * 7)
 	}
@@ -945,7 +943,7 @@ func TestPeerCloseKeepsBacklog(t *testing.T) {
 // TestCloseThenPeerClose reads the peer's EOF only after a local Close: the data in the send buffer must
 // still be sent in full, the EOF does not override the pending close request, and OnClose's err stays nil.
 func TestCloseThenPeerClose(t *testing.T) {
-	payload := make([]byte, 16*units.MB)
+	payload := make([]byte, 16*(1<<20))
 	for i := range payload {
 		payload[i] = byte(i * 7)
 	}
@@ -1004,7 +1002,7 @@ func TestBackloggedLeftoverIsSmall(t *testing.T) {
 			}
 			return consumed
 		},
-	}, Options{NumLoops: 2, ReadBufferSize: 16 * units.KB})
+	}, Options{NumLoops: 2, ReadBufferSize: 16 * (1 << 10)})
 
 	clients := make([]net.Conn, conns)
 	for i := range clients {
@@ -1026,7 +1024,7 @@ func TestBackloggedLeftoverIsSmall(t *testing.T) {
 	stalled.Wait()
 	runtime.GC()
 	runtime.ReadMemStats(&after)
-	if perConn := (int64(after.HeapInuse) - int64(before.HeapInuse)) / conns; perConn > 8*units.KB {
+	if perConn := (int64(after.HeapInuse) - int64(before.HeapInuse)) / conns; perConn > 8*(1<<10) {
 		t.Fatalf("each backed-up connection uses %dB, want memory only for the leftover half frame", perConn)
 	}
 }
@@ -1036,7 +1034,7 @@ func TestBackloggedLeftoverIsSmall(t *testing.T) {
 // the old Conn behaves as a closed one, OnClose is never called, and the server shuts down without waiting for the
 // detached connection.
 func TestDetach(t *testing.T) {
-	backlog := bytes.Repeat([]byte("0123456789abcdef"), units.MB) // 16MB, far beyond the kernel buffer
+	backlog := bytes.Repeat([]byte("0123456789abcdef"), (1 << 20)) // 16MB, far beyond the kernel buffer
 	type result struct {
 		sc  Conn
 		nc  net.Conn
@@ -1263,7 +1261,7 @@ func TestDeadlineWhileWriting(t *testing.T) {
 	srv := startServer(t, &funcHandler{
 		data: func(c Conn, b []byte) int {
 			c.SetDeadline(time.Now().Add(200 * time.Millisecond))
-			chunk := make([]byte, units.MB)
+			chunk := make([]byte, (1 << 20))
 			for range 64 {
 				if _, err := c.Write(chunk); err != nil {
 					break
@@ -1336,7 +1334,7 @@ func TestLingeringClose(t *testing.T) {
 		close: func(c Conn, err error) { reasons <- err },
 	})
 	c := dial(t, srv)
-	go c.Write(make([]byte, 4*units.MB)) // far more than the server reads before it closes
+	go c.Write(make([]byte, 4*(1<<20))) // far more than the server reads before it closes
 	c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if got, err := io.ReadAll(c); err != nil || string(got) != "answer" {
 		t.Fatalf("received %q, err=%v, want the answer and EOF", got, err)

@@ -20,14 +20,13 @@ import (
 
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/internal/bytepool"
-	"github.com/linfeip/fnet/internal/units"
 )
 
 // defaultHandshakeTimeout limits the handshake when NewHandler is given 0.
 const defaultHandshakeTimeout = 10 * time.Second
 
 // recordSize is the largest plaintext a TLS record carries, the size of the buffer drain decrypts into.
-const recordSize = 16 * units.KB
+const recordSize = 16 << 10
 
 // errWouldBlock is what a read returns once the handshake is done and the ciphertext at hand is used up: crypto/tls
 // hands a temporary net.Error back without failing the connection, keeping a record cut short for the next read.
@@ -55,7 +54,28 @@ func NewHandler(handler fnet.Handler, config *tls.Config, handshakeTimeout time.
 	if handshakeTimeout == 0 {
 		handshakeTimeout = defaultHandshakeTimeout
 	}
-	return &Handler{handler: handler, config: config, handshakeTimeout: handshakeTimeout}
+	return &Handler{handler: handler, config: serverConfig(config), handshakeTimeout: handshakeTimeout}
+}
+
+// serverConfig returns a copy of config with dynamic record sizing turned off: otherwise crypto/tls cuts the first
+// responses of a connection into records of about 1KB, each written to the socket on its own, a syscall each, and a
+// small one may wait for an ACK (Nagle's algorithm).
+func serverConfig(config *tls.Config) *tls.Config {
+	if config == nil {
+		return nil
+	}
+	config = config.Clone()
+	config.DynamicRecordSizingDisabled = true
+	if get := config.GetConfigForClient; get != nil {
+		config.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			c, err := get(hello)
+			if c == nil || err != nil {
+				return c, err
+			}
+			return serverConfig(c), nil
+		}
+	}
+	return config
 }
 
 // OnOpen sets up the handshake, which OnData runs.
@@ -206,7 +226,7 @@ func (c *Conn) Writev(bs [][]byte) (int, error) {
 	}
 	buf := bytepool.Get(size)
 	for _, b := range bs {
-		buf.Append(b)
+		buf.Write(b)
 	}
 	n, err := c.Write(buf.Bytes())
 	buf.Release()
@@ -284,10 +304,6 @@ func (c *Conn) open() bool {
 // record cut short stays in TLS for the next call. A TLS error, or the peer's close_notify (io.EOF), closes the
 // connection and becomes the close reason, unless the handler keeps the connection open for the peer that has closed its
 // write direction (see halfClose).
-//
-// As on the engine's reads, the plaintext goes into a buffer borrowed for the call, after what the handler left
-// unconsumed when that is small (a large leftover has the new plaintext appended to it instead), and only what the
-// handler leaves unconsumed is kept.
 func (c *Conn) drain() {
 	for {
 		err := c.readPlaintext()
@@ -340,26 +356,92 @@ func (c *Conn) halfClose() bool {
 // deliver passes the plaintext on to the handler, unless reading is paused; data holds the new plaintext after room for
 // the pending bytes the handler left unconsumed (see drain), and is nil when only those are passed on again.
 func (c *Conn) deliver(data []byte, pending int) {
-	switch {
-	case pending > 0:
-		copy(data, c.plaintext.Bytes())
-		c.plaintext.Release()
-	case c.plaintext.Len() > 0:
-		c.plaintext.Append(data)
-		data = c.plaintext.Bytes()
-	}
+	data = c.plaintext.Join(data, pending)
 	consumed := 0
 	if !c.readPaused.Load() {
-		consumed = min(max(c.handler.OnData(c, data), 0), len(data))
+		consumed = c.handler.OnData(c, data)
 	}
-	switch {
-	case consumed == len(data):
-		c.plaintext.Release()
-	case c.plaintext.Len() > 0: // data is plaintext itself
-		if consumed > 0 {
-			c.plaintext.Discard(consumed)
+	c.plaintext.Keep(data, consumed)
+}
+
+// rawConn is the connection crypto/tls runs on: it reads the ciphertext the engine received and writes to the engine.
+// It is the Conn itself under another method set, so it takes no allocation of its own.
+type rawConn Conn
+
+// Read hands TLS the ciphertext OnData received. Once that is used up, the handshake waits for OnData to resume it with
+// more, and afterwards Read returns errWouldBlock, or reads the detached connection.
+func (r *rawConn) Read(b []byte) (int, error) {
+	for len(r.ciphertext) == 0 {
+		switch {
+		case r.yield != nil:
+			if !r.yield(struct{}{}) {
+				return 0, net.ErrClosed // stopped by OnClose
+			}
+		case r.netConn != nil:
+			return r.netConn.Read(b)
+		default:
+			return 0, errWouldBlock
 		}
-	default:
-		c.plaintext.Append(data[consumed:])
 	}
+	n := copy(b, r.ciphertext)
+	r.ciphertext = r.ciphertext[n:]
+	return n, nil
+}
+
+func (r *rawConn) Write(b []byte) (int, error) {
+	if r.netConn != nil {
+		return r.netConn.Write(b)
+	}
+	return r.Conn.Write(b)
+}
+
+func (r *rawConn) Close() error {
+	if r.netConn != nil {
+		return r.netConn.Close()
+	}
+	return r.Conn.Close()
+}
+
+func (r *rawConn) LocalAddr() net.Addr {
+	if r.netConn != nil {
+		return r.netConn.LocalAddr()
+	}
+	return r.Conn.LocalAddr()
+}
+
+// The engine's writes never block and its reads are fed by OnData, so deadlines only apply to the detached connection.
+func (r *rawConn) SetDeadline(t time.Time) error {
+	return r.setDeadline(t, net.Conn.SetDeadline)
+}
+
+func (r *rawConn) SetReadDeadline(t time.Time) error {
+	return r.setDeadline(t, net.Conn.SetReadDeadline)
+}
+
+func (r *rawConn) SetWriteDeadline(t time.Time) error {
+	return r.setDeadline(t, net.Conn.SetWriteDeadline)
+}
+
+func (r *rawConn) setDeadline(t time.Time, set func(net.Conn, time.Time) error) error {
+	if r.netConn == nil {
+		return nil
+	}
+	return set(r.netConn, t)
+}
+
+// detachedConn is the connection Detach returns: Read first returns the plaintext OnData left unconsumed.
+type detachedConn struct {
+	*tls.Conn
+	in []byte
+}
+
+func (c *detachedConn) Read(b []byte) (int, error) {
+	if len(c.in) == 0 {
+		return c.Conn.Read(b)
+	}
+	n := copy(b, c.in)
+	if c.in = c.in[n:]; len(c.in) == 0 {
+		c.in = nil
+	}
+	return n, nil
 }

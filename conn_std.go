@@ -20,6 +20,7 @@ const (
 
 type stdConn struct {
 	netConnection net.Conn
+	fd            int
 	ctx           any
 	closedBy      atomic.Int32 // who initiated the close, which decides the err reported to OnClose
 
@@ -33,6 +34,7 @@ type stdConn struct {
 
 func (c *stdConn) LocalAddr() net.Addr  { return c.netConnection.LocalAddr() }
 func (c *stdConn) RemoteAddr() net.Addr { return c.netConnection.RemoteAddr() }
+func (c *stdConn) Fd() int              { return c.fd }
 func (c *stdConn) Context() any         { return c.ctx }
 func (c *stdConn) SetContext(ctx any)   { c.ctx = ctx }
 

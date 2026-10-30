@@ -23,4 +23,9 @@ go.work.sum
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Local review and AI agent workspace
 review/
+.agent/
+.agents/
+skills-lock.json

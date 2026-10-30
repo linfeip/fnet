@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linfeip/fnet/internal/units"
-
 	"golang.org/x/sys/unix"
 )
 
@@ -58,7 +56,7 @@ func TestBacklogStopsReading(t *testing.T) {
 	c := dial(t, srv)
 	sc := <-opened
 	c.SetWriteDeadline(time.Now().Add(time.Second))
-	if n, err := c.Write(make([]byte, 64*units.MB)); !errors.Is(err, os.ErrDeadlineExceeded) {
+	if n, err := c.Write(make([]byte, 64<<20)); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("peer write should block, wrote %d bytes, err=%v", n, err)
 	}
 	if backlog, limit := sc.backlog(), maxBacklog+4*sc.loop.srv.opts.ReadBufferSize; backlog > limit {

@@ -54,3 +54,9 @@ func setKeepAlive(fd int) {
 	unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, 15)
 	unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPCNT, 9)
 }
+
+// darwin's system calls go through libc, so the unix wrappers are kept.
+
+func sysRead(fd int, b []byte) (int, error)      { return unix.Read(fd, b) }
+func sysWrite(fd int, b []byte) (int, error)     { return unix.Write(fd, b) }
+func sysWritev(fd int, bs [][]byte) (int, error) { return unix.Writev(fd, bs) }

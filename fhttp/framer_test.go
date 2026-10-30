@@ -6,8 +6,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-
-	"github.com/linfeip/fnet/internal/units"
 )
 
 // frameAll simulates the engine: data arrives step bytes at a time, and what split leaves is passed again with what
@@ -15,7 +13,7 @@ import (
 // for, and whether a 100 Continue was asked for.
 func frameAll(in string, step int) ([]string, error, bool) {
 	var f framer
-	opts := Options{MaxHeaderBytes: units.KB, MaxBufferedBodyBytes: 32}
+	opts := Options{MaxHeaderBytes: 1 << 10, MaxBufferedBodyBytes: 32}
 	var msgs []string
 	var buf []byte
 	continues := 0
@@ -81,11 +79,10 @@ func TestFramer(t *testing.T) {
 		// Earlier messages are split out before the one that goes to net/http, which judges the body itself.
 		{"chunked too large", get + chunked + "21\r\n", []string{get}, errHandoff},
 		{"chunked too large in total", chunked + "10\r\n0123456789abcdef\r\n10\r\n0123456789abcdef\r\n", nil, errHandoff},
-		// Chunk extensions are read by fhttp, blanks around the ';' and the '=' included (RFC 9112 7.1.1), which net/http's
-		// reader does not take; see TestChunkHeader for the forms.
-		{"chunk extension", chunked + "5;a=b\r\nhello\r\n0\r\n\r\n", []string{chunked + "5;a=b\r\nhello\r\n0\r\n\r\n"}, nil},
-		{"chunk extension with blanks", chunked + "5 ; a = b\r\nhello\r\n0\r\n\r\n", []string{chunked + "5 ; a = b\r\nhello\r\n0\r\n\r\n"}, nil},
-		{"chunk extension on the last chunk", chunked + "5\r\nhello\r\n0;x\r\n\r\n", []string{chunked + "5\r\nhello\r\n0;x\r\n\r\n"}, nil},
+		// Chunk extensions are handed to net/http.
+		{"chunk extension", chunked + "5;a=b\r\nhello\r\n0\r\n\r\n", nil, errHandoff},
+		{"chunk extension with blanks", chunked + "5 ; a = b\r\nhello\r\n0\r\n\r\n", nil, errHandoff},
+		{"chunk extension on the last chunk", chunked + "5\r\nhello\r\n0;x\r\n\r\n", nil, errHandoff},
 		{"chunk extension of no end", chunked + "5;" + strings.Repeat("a", 300) + "\r\nhello\r\n0\r\n\r\n", nil, errHandoff},
 		{"chunk size with spaces", chunked + "5 \r\nhello\r\n0\r\n\r\n", nil, errHandoff},
 		{"chunk without CRLF", chunked + "5\r\nhelloX\r\n0\r\n\r\n", nil, errHandoff},
@@ -139,13 +136,9 @@ func TestFramer(t *testing.T) {
 	}
 }
 
-// TestChunkHeader checks the size line of a chunk: the extensions that may follow the size are *( BWS ";" BWS name [ BWS
-// "=" BWS value ] ), a value being a token or a quoted string, and nothing may stand between them and the CRLF.
+// TestChunkHeader checks the size line of a plain chunk.
 func TestChunkHeader(t *testing.T) {
-	for _, line := range []string{
-		"5\r\n", "a\r\n", "A0\r\n", "5;a\r\n", "5;a=b\r\n", "5 ; a = b\r\n", "5\t;\ta\t=\tb\r\n", "5;a;b=c;d\r\n", "5;a=b ;c=d\r\n",
-		"5;a=\"b c\"\r\n", "5;a=\"b;\\\"\"\r\n", "5;a=\"\"\r\n", "0;last=1\r\n", "5;a=\xff\r\n"[:0] + "5;!#$%&'*+-.^_`|~=0\r\n",
-	} {
+	for _, line := range []string{"5\r\n", "a\r\n", "A0\r\n", "0\r\n"} {
 		size, n, ok := chunkHeader([]byte(line + "data"))
 		if wantSize := map[byte]int{'5': 5, 'a': 10, 'A': 160, '0': 0}[line[0]]; !ok || n != len(line) || size != wantSize {
 			t.Errorf("%q: size %d, length %d, ok=%v; want %d, %d, true", line, size, n, ok, wantSize, len(line))
@@ -156,40 +149,11 @@ func TestChunkHeader(t *testing.T) {
 			}
 		}
 	}
-	for _, line := range []string{
-		"\r\n", ";a\r\n", "x\r\n", "5x\r\n", "5 \r\n", "5\t\r\n", "5;\r\n", "5; \r\n", "5;=b\r\n", "5;a=\r\n", "5;a= \r\n", "5;a \r\n", "5;a=b \r\n",
-		"5;a b\r\n", "5 a\r\n", "5;a=b=c\r\n", "5;a=\"b\r\n", "5;a=\"b\"c\r\n", "5;a=\"\x00\"\r\n", "5;a=\"\\\x00\"\r\n", "5;a=b\n", "5;a=b\rx",
-		"5;a=\"b\r\n\"\r\n", "5;(=b\r\n", "000000005\r\n", "5;" + strings.Repeat("a", maxChunkLine+1) + "\r\n",
-	} {
+	for _, line := range []string{"\r\n", ";a\r\n", "x\r\n", "5x\r\n", "5 \r\n", "5\t\r\n", "5;a=b\r\n", "000000005\r\n"} {
 		if _, n, ok := chunkHeader([]byte(line)); ok && n != 0 {
 			t.Errorf("%q: read as a line of %d bytes, want it refused", line, n)
 		}
 	}
-}
-
-// FuzzChunkHeader checks what the framer relies on, as the data of a size line arrives in pieces: a line that is read ends
-// at the one CRLF in it, no shorter prefix of it counts as a line, and what follows it does not change how it is read.
-func FuzzChunkHeader(f *testing.F) {
-	for _, line := range []string{"5\r\n", "a;b=c\r\n", "5 ; a = \"b\\\"\"\r\n", "0;x\r\n", "5;a=b \r\n", "5;a=\"b\r\n"} {
-		f.Add(line)
-	}
-	f.Fuzz(func(t *testing.T, line string) {
-		size, n, ok := chunkHeader([]byte(line))
-		if !ok || n == 0 {
-			return
-		}
-		if n > len(line) || line[n-2:n] != "\r\n" || strings.ContainsAny(line[:n-2], "\r\n") || size < 0 || n > 8+maxChunkLine {
-			t.Fatalf("%q: size %d, length %d", line, size, n)
-		}
-		for i := range n - 1 {
-			if _, prefixLength, prefixOK := chunkHeader([]byte(line[:i])); prefixLength != 0 || !prefixOK {
-				t.Fatalf("%q: its prefix %q is read as a line of %d bytes, ok=%v", line[:n], line[:i], prefixLength, prefixOK)
-			}
-		}
-		if sameSize, sameLength, sameOK := chunkHeader([]byte(line[:n] + "\r\ntail;")); sameSize != size || sameLength != n || !sameOK {
-			t.Fatalf("%q: read differently with more data after it", line[:n])
-		}
-	})
 }
 
 // TestFramerExpectContinue checks that 100 Continue is asked for only while the body has not arrived, and never for

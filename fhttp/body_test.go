@@ -19,8 +19,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/linfeip/fnet/internal/units"
 )
 
 // TestBufferedBody covers request bodies up to MaxBufferedBodyBytes, which stay on fnet: the connection is kept alive
@@ -175,7 +173,7 @@ func TestHandoff(t *testing.T) {
 	mux := testMux()
 	started := make(chan struct{}, 1)
 	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
-		if _, err := io.ReadFull(r.Body, make([]byte, units.KB)); err != nil {
+		if _, err := io.ReadFull(r.Body, make([]byte, 1<<10)); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -185,7 +183,7 @@ func TestHandoff(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		fmt.Fprint(w, units.KB+n)
+		fmt.Fprint(w, (1<<10)+n)
 	})
 	mux.HandleFunc("/sha256", func(w http.ResponseWriter, r *http.Request) {
 		mr, err := r.MultipartReader()
@@ -202,7 +200,7 @@ func TestHandoff(t *testing.T) {
 		io.Copy(h, part)
 		fmt.Fprintf(w, "%s %x", part.FileName(), h.Sum(nil))
 	})
-	s := serve(t, mux, Options{MaxBufferedBodyBytes: units.KB})
+	s := serve(t, mux, Options{MaxBufferedBodyBytes: 1 << 10})
 	base := "http://" + s.Addr().String()
 	client := &http.Client{Transport: &http.Transport{}}
 	defer client.CloseIdleConnections()
@@ -221,17 +219,17 @@ func TestHandoff(t *testing.T) {
 	}
 
 	t.Run("Handler starts before the request body arrives", func(t *testing.T) {
-		const size = 8 * units.MB
+		const size = 8 << 20
 		pr, pw := io.Pipe()
 		go func() {
-			pw.Write(make([]byte, 64*units.KB))
+			pw.Write(make([]byte, 64<<10))
 			select { // a server buffering the body would never start the Handler here
 			case <-started:
 			case <-time.After(5 * time.Second):
 				pw.CloseWithError(errors.New("Handler did not start before the request body arrived"))
 				return
 			}
-			pw.Write(make([]byte, size-64*units.KB))
+			pw.Write(make([]byte, size-64<<10))
 			pw.Close()
 		}()
 		req, _ := http.NewRequest("POST", base+"/stream", pr)
@@ -246,7 +244,7 @@ func TestHandoff(t *testing.T) {
 	})
 
 	t.Run("streaming multipart upload of a large file", func(t *testing.T) {
-		data := make([]byte, 32*units.MB)
+		data := make([]byte, 32<<20)
 		for i := range data {
 			data[i] = byte(rand.Uint32())
 		}
@@ -265,7 +263,7 @@ func TestHandoff(t *testing.T) {
 	})
 
 	t.Run("reply to the earlier request first", func(t *testing.T) {
-		body := strings.Repeat("y", 2*units.KB)
+		body := strings.Repeat("y", 2<<10)
 		br := dialRaw(t, s, "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"+
 			"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 2048\r\n\r\n"+body)
 		if resp, got := readResp(t, br); resp.StatusCode != 200 || got != "hello world" || resp.Close {
@@ -286,7 +284,7 @@ func TestHandoffClose(t *testing.T) {
 		close(reading)
 		_, err := io.Copy(io.Discard, r.Body)
 		done <- err
-	}), Options{MaxBufferedBodyBytes: units.KB})
+	}), Options{MaxBufferedBodyBytes: 1 << 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,29 +410,97 @@ func TestCloseDuringFirstRequest(t *testing.T) {
 }
 
 // TestDerivedRequestContext checks that the contexts a Handler derives from a request's register with the connection's
-// context, which cancels them when the connection closes, even after the request was released: had each started a
-// goroutine watching the pooled context, that goroutine could read it after the release.
+// context, which cancels them when the connection closes, without starting a goroutine per derived context.
 func TestDerivedRequestContext(t *testing.T) {
 	c := queueConn(&recordConn{})
-	c.last = new(lastRequest)
-	p := parsedPool.Get().(*parsedRequest)
-	p.bind(c)
+	c.state = &connState{connection: c}
 	const count = 100
 	before := runtime.NumGoroutine()
 	var derived []context.Context
 	for range count {
-		ctx, cancel := context.WithTimeout(p.request.Context(), time.Hour)
+		ctx, cancel := context.WithTimeout(c.state, time.Hour)
 		defer cancel()
 		derived = append(derived, ctx)
 	}
 	if started := runtime.NumGoroutine() - before; started >= count/2 {
 		t.Fatalf("%d goroutines started for %d derived contexts", started, count)
 	}
-	p.release()
 	c.onClose(nil)
 	for i, ctx := range derived {
 		if ctx.Err() == nil {
 			t.Fatalf("derived context %d not canceled when the connection closed", i)
+		}
+	}
+}
+
+func TestRequestCleanup(t *testing.T) {
+	for _, method := range []string{http.MethodPost, "CUSTOM"} {
+		for _, exit := range []string{"return", "panic", "goexit"} {
+			t.Run(method+"/"+exit, func(t *testing.T) {
+				var form bytes.Buffer
+				writer := multipart.NewWriter(&form)
+				part, err := writer.CreateFormFile("file", "a.txt")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.WriteString(part, "file content"); err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.Close(); err != nil {
+					t.Fatal(err)
+				}
+
+				var requestBody io.ReadCloser
+				var filename string
+				var handlerErr error
+				c := queueConn(&recordConn{})
+				c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					requestBody = r.Body
+					if handlerErr = r.ParseMultipartForm(0); handlerErr != nil {
+						return
+					}
+					file, _, err := r.FormFile("file")
+					if handlerErr = err; err != nil {
+						return
+					}
+					filename = file.(*os.File).Name()
+					file.Close()
+					switch exit {
+					case "panic":
+						panic(http.ErrAbortHandler)
+					case "goexit":
+						runtime.Goexit()
+					}
+				})
+				data := fmt.Sprintf("%s /upload HTTP/1.1\r\nHost: a\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n%s",
+					method, writer.FormDataContentType(), form.Len(), form.String())
+				if n := c.onData([]byte(data)); n != len(data) {
+					t.Fatalf("consumed %d of %d bytes", n, len(data))
+				}
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					c.serve()
+				}()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Fatal("request worker did not exit")
+				}
+				if handlerErr != nil {
+					t.Fatal(handlerErr)
+				}
+				if filename == "" {
+					t.Fatal("multipart upload did not create a temporary file")
+				}
+				defer os.Remove(filename)
+				if _, err := os.Stat(filename); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("temporary upload file was not removed: %v", err)
+				}
+				if _, err := requestBody.Read(make([]byte, 1)); !errors.Is(err, http.ErrBodyReadAfterClose) {
+					t.Errorf("request body after handler exit: %v", err)
+				}
+			})
 		}
 	}
 }

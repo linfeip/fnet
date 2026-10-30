@@ -73,26 +73,27 @@ func (b *Buffer) Len() int { return len(b.data) }
 // Reset clears the data while keeping the capacity.
 func (b *Buffer) Reset() { b.data = b.data[:0] }
 
+// Truncate shrinks the buffer to its first n bytes.
+func (b *Buffer) Truncate(n int) { b.data = b.data[:n] }
+
 // Discard drops the first n bytes and moves the remaining data to the start of the buffer.
 func (b *Buffer) Discard(n int) { b.data = b.data[:copy(b.data, b.data[n:])] }
 
-// Append appends p to b, taking a larger buffer from the pool and returning the old one when the capacity is not enough.
+// Write appends p to b, taking a larger buffer from the pool and returning the old one when the capacity is not enough.
 //
 // Buffers above the largest size class do not enter the pool, and Get allocates them at the exact size, with no slack
 // left over from rounding up to a power of two: when such a buffer grows again, an extra 1/4 of slack is kept, since
 // otherwise every append would reallocate and copy the whole block, making the total cost of successive appends grow
 // with the square of the size.
-//
-// Growing the buffer is left to grow, which keeps Append small enough to be inlined: it is called for every small piece
-// of a response.
-func (b *Buffer) Append(p []byte) {
+func (b *Buffer) Write(p []byte) (int, error) {
 	if cap(b.data)-len(b.data) < len(p) {
 		b.grow(len(p))
 	}
 	b.data = append(b.data, p...)
+	return len(p), nil
 }
 
-// grow gives b room for n more bytes, see Append.
+// grow gives b room for n more bytes, see Write.
 func (b *Buffer) grow(n int) {
 	size := len(b.data) + n
 	if cap(b.data) > 1<<maxShift {
@@ -103,13 +104,40 @@ func (b *Buffer) grow(n int) {
 	b.data = nb
 }
 
-// AppendString is the same as Append, and inlined as well.
-//
-// No generic shared implementation: a generic instance called across packages has no escape information, so the compiler
-// conservatively assumes the argument escapes, forcing data on the caller's stack to be allocated on the heap.
-func (b *Buffer) AppendString(s string) {
+// WriteString is the same as Write, for a string.
+func (b *Buffer) WriteString(s string) (int, error) {
 	if cap(b.data)-len(b.data) < len(s) {
 		b.grow(len(s))
 	}
 	b.data = append(b.data, s...)
+	return len(s), nil
+}
+
+// Join combines newly read data (where data[:pending] was left empty for a small leftover) with the leftover already
+// in b, and returns the contiguous slice to pass to OnData.
+func (b *Buffer) Join(data []byte, pending int) []byte {
+	switch {
+	case pending > 0:
+		copy(data, b.data)
+		b.Release()
+	case len(b.data) > 0:
+		b.Write(data)
+		data = b.data
+	}
+	return data
+}
+
+// Keep retains the unconsumed tail of data (returned by Join) after consumed bytes were processed.
+func (b *Buffer) Keep(data []byte, consumed int) {
+	consumed = min(max(consumed, 0), len(data))
+	switch {
+	case consumed == len(data):
+		b.Release()
+	case len(b.data) > 0:
+		if consumed > 0 {
+			b.Discard(consumed)
+		}
+	default:
+		b.Write(data[consumed:])
+	}
 }

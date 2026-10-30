@@ -26,8 +26,6 @@ import (
 	"net"
 	"runtime"
 	"time"
-
-	"github.com/linfeip/fnet/internal/units"
 )
 
 var (
@@ -119,6 +117,9 @@ type Conn interface {
 	LocalAddr() net.Addr
 	// RemoteAddr returns the peer address.
 	RemoteAddr() net.Addr
+	// Fd returns the connection's file descriptor on Linux/macOS (and a per-connection identifier on other platforms),
+	// the same key with which the engine submits the connection's tasks to Options.Executor.
+	Fd() int
 	// Context returns the user data bound to the connection.
 	Context() any
 	// SetContext binds user data; it should be called in OnOpen.
@@ -251,7 +252,7 @@ func (o Options) withDefaults() Options {
 		o.NumLoops = max(2, runtime.GOMAXPROCS(0)/8)
 	}
 	if o.ReadBufferSize <= 0 {
-		o.ReadBufferSize = 16 * units.KB
+		o.ReadBufferSize = 16 << 10
 	}
 	return o
 }

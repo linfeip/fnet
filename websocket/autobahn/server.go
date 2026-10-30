@@ -10,7 +10,6 @@ import (
 	"net/http"
 
 	"github.com/linfeip/fnet/fhttp"
-	"github.com/linfeip/fnet/internal/units"
 	"github.com/linfeip/fnet/websocket"
 
 	"github.com/gobwas/ws"
@@ -27,7 +26,7 @@ func main() {
 	flag.Parse()
 
 	// The largest message in 9.* is 16MB, the default 1MB is not enough.
-	opts := websocket.Options{MaxMessageSize: 16 * units.MB}
+	opts := websocket.Options{MaxMessageSize: 16 << 20}
 	srv, err := fhttp.NewServer(*addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		websocket.Upgrade(w, r, echo{}, opts)
 	}), fhttp.Options{})

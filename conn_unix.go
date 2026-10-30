@@ -50,6 +50,7 @@ type conn struct {
 }
 
 func (c *conn) RemoteAddr() net.Addr { return addrPortToTCPAddr(c.remote) }
+func (c *conn) Fd() int              { return c.fd }
 func (c *conn) Context() any         { return c.ctx }
 func (c *conn) SetContext(ctx any)   { c.ctx = ctx }
 
@@ -67,18 +68,13 @@ func (c *conn) LocalAddr() net.Addr {
 }
 
 func (c *conn) Write(b []byte) (int, error) {
-	buffered := false
-	defer func() {
-		if buffered {
-			c.notify(evWrite) // notify after mu is released: the user-supplied Executor is not called under the lock
-		}
-	}()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed || c.closing {
+		c.mu.Unlock()
 		return 0, net.ErrClosed
 	}
 	if len(b) == 0 {
+		c.mu.Unlock()
 		return 0, nil
 	}
 	n := 0
@@ -87,26 +83,22 @@ func (c *conn) Write(b []byte) (int, error) {
 		// one go, without going through the connection's task.
 		wn, err := sysWrite(c.fd, b)
 		if n, err = afterDirectWrite(wn, err); err != nil || n == len(b) {
+			c.mu.Unlock()
 			return n, err
 		}
 	}
 	c.compactOut(len(b) - n)
-	c.out.Append(b[n:])
+	c.out.Write(b[n:])
 	c.backlogged.Store(true)
-	buffered = true
+	c.mu.Unlock()
+	c.notify(evWrite) // notify after mu is released: the user-supplied Executor is not called under the lock
 	return len(b), nil
 }
 
 func (c *conn) Writev(bs [][]byte) (int, error) {
-	buffered := false
-	defer func() {
-		if buffered {
-			c.notify(evWrite) // notify after mu is released: the user-supplied Executor is not called under the lock
-		}
-	}()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed || c.closing {
+		c.mu.Unlock()
 		return 0, net.ErrClosed
 	}
 	size := 0
@@ -114,6 +106,7 @@ func (c *conn) Writev(bs [][]byte) (int, error) {
 		size += len(b)
 	}
 	if size == 0 {
+		c.mu.Unlock()
 		return 0, nil
 	}
 	n := 0
@@ -121,6 +114,7 @@ func (c *conn) Writev(bs [][]byte) (int, error) {
 		// Segments beyond maxIovecs go into the send buffer, just like data that was not fully written.
 		wn, err := sysWritev(c.fd, bs[:min(len(bs), maxIovecs)])
 		if n, err = afterDirectWrite(wn, err); err != nil || n == size {
+			c.mu.Unlock()
 			return n, err
 		}
 	}
@@ -128,11 +122,12 @@ func (c *conn) Writev(bs [][]byte) (int, error) {
 	c.compactOut(size - n)
 	for _, b := range bs {
 		skip := min(n, len(b))
-		c.out.Append(b[skip:])
+		c.out.Write(b[skip:])
 		n -= skip
 	}
 	c.backlogged.Store(true)
-	buffered = true
+	c.mu.Unlock()
+	c.notify(evWrite) // notify after mu is released: the user-supplied Executor is not called under the lock
 	return size, nil
 }
 

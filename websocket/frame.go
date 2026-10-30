@@ -8,8 +8,10 @@ import (
 	"github.com/gobwas/ws"
 )
 
-// maxFrameHeaderSize is the longest header of a frame the server sends: 2 bytes and a 64-bit length, never a mask.
-const maxFrameHeaderSize = 2 + 8
+// maxSmallFrameSize is the buffer size on Conn for encoding a frame header (up to 10 bytes) or a complete small frame
+// (a 2-byte header and a payload of up to 125 bytes, covering all control frames and 7-bit-length data frames) without
+// borrowing from bytepool.
+const maxSmallFrameSize = 128
 
 var errLengthNotMinimal = errors.New("websocket: payload length not encoded in the fewest bytes")
 

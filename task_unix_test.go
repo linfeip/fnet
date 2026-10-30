@@ -10,8 +10,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/linfeip/fnet/internal/units"
 )
 
 // TestExecutor verifies the connection's task is run by Options.Executor.
@@ -160,7 +158,7 @@ func TestPeerCloseThenDeadline(t *testing.T) {
 	reasons := make(chan error, 1)
 	srv := startServer(t, &funcHandler{
 		open: func(c Conn) {
-			c.Write(make([]byte, 16*units.MB)) // the peer does not read, so the send buffer must have a backlog
+			c.Write(make([]byte, 16<<20)) // the peer does not read, so the send buffer must have a backlog
 			c.SetDeadline(time.Now().Add(200 * time.Millisecond))
 		},
 		close: func(c Conn, err error) { reasons <- err },
@@ -193,7 +191,7 @@ func TestBatchResubmissionSerial(t *testing.T) {
 	}})
 	c := dial(t, srv)
 	c.SetDeadline(time.Now().Add(5 * time.Second))
-	payload := bytes.Repeat([]byte("echo"), 32*units.KB)
+	payload := bytes.Repeat([]byte("echo"), 32<<10)
 	if n, err := c.Write(payload); err != nil || n != len(payload) {
 		t.Fatalf("wrote %d/%d bytes, err=%v", n, len(payload), err)
 	}
@@ -253,7 +251,7 @@ func TestLingerTimeout(t *testing.T) {
 func TestDetachDeadline(t *testing.T) {
 	opened := make(chan Conn, 1)
 	srv := startServer(t, &funcHandler{open: func(c Conn) {
-		c.Write(make([]byte, 64*units.MB)) // far more than the socket takes
+		c.Write(make([]byte, 64<<20)) // far more than the socket takes
 		c.PauseRead()
 		c.SetDeadline(time.Now().Add(1500 * time.Millisecond)) // past the next deadline check, so Detach comes first
 		opened <- c
@@ -314,7 +312,7 @@ func TestOnWritable(t *testing.T) {
 	opened := make(chan bool, 1)
 	h := &writableHandler{writable: make(chan Conn, 1)}
 	h.open = func(c Conn) {
-		c.Write(make([]byte, 16*units.MB)) // far more than the socket takes
+		c.Write(make([]byte, 16<<20)) // far more than the socket takes
 		opened <- c.Writable()
 	}
 	client := dial(t, startServer(t, h))
