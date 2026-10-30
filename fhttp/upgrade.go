@@ -74,7 +74,7 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 	}
 	// There are already requests queued after the upgrade request: the client did not wait for the upgrade
 	// response, so these requests must no longer be executed as HTTP.
-	if len(w.batch) > 0 || len(c.queue) > 0 {
+	if len(c.queue) > 0 {
 		c.mu.Unlock()
 		w.writeError(http.StatusBadRequest)
 		return errEarlyRequest

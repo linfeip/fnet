@@ -135,7 +135,8 @@ func (l *loop) checkDeadlines() {
 // startWorker starts the loop's worker.
 func (l *loop) startWorker() {
 	l.srv.workersWg.Add(1)
-	go (&worker{home: l}).run()
+	w := &worker{home: l}
+	go w.run()
 }
 
 // worker is the goroutine serving a loop: it polls the loop's Poller and hands the tasks of the connections it reports
@@ -195,7 +196,11 @@ func (w *worker) help() bool {
 	loops := w.home.srv.loops
 	w.next++
 	for i := range loops {
-		if l := loops[(w.next+i)%len(loops)]; l != w.home && l.active.Load() && w.serve(l) {
+		l := loops[(w.next+i)%len(loops)]
+		if l == w.home || !l.active.Load() {
+			continue
+		}
+		if w.serve(l) {
 			return true
 		}
 	}

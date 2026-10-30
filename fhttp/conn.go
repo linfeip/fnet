@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"runtime"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -254,6 +253,7 @@ func (c *conn) serve() {
 func (c *conn) serveQueue(w *response) {
 	var retained bytepool.Buffer
 	defer func() { retained.Release() }()
+	var base []request
 	for {
 		c.mu.Lock()
 		// The client is not taking the responses: answering more would only pile them up in fnet's send buffer.
@@ -297,78 +297,36 @@ func (c *conn) serveQueue(w *response) {
 			c.setDeadline()
 			c.mu.Unlock()
 			return
-		case len(c.queue) == 1:
-			r := c.queue[0]
-			c.queue[0] = request{}
-			c.queue = c.queue[:0]
-			c.queuedBytes = 0
-			c.mu.Unlock()
-			keepAlive := c.handle(w, r)
-			if keepAlive && cap(retained.Bytes()) == 0 && cap(r.msg.Bytes()) <= maxRetainedMessageBytes {
-				r.msg.Reset()
-				retained = r.msg
+		}
+		if cap(base) == 0 || &c.queue[:cap(c.queue)][cap(c.queue)-1] != &base[:cap(base)][cap(base)-1] {
+			base = c.queue[:0]
+		}
+		r := c.queue[0]
+		c.queue[0] = request{}
+		c.queue = c.queue[1:]
+		if len(c.queue) == 0 {
+			if cap(base) > maxRetainedQueueCapacity {
+				c.releaseQueue()
 			} else {
-				r.msg.Release()
+				c.queue = base
 			}
-			if !keepAlive {
-				w.flush()
-				c.closeFromWorker()
-				return
-			}
-			continue
 		}
-		base := w.batch[:0]
-		w.batch = append(base, c.queue...)
-		base = w.batch[:0]
-		clear(c.queue)
-		if cap(c.queue) > maxRetainedQueueCapacity {
-			c.releaseQueue()
-		} else {
-			c.queue = c.queue[:0]
-		}
-		c.queuedBytes = 0
+		c.queuedBytes -= int32(r.msg.Len())
 		c.mu.Unlock()
 
-		for len(w.batch) > 0 {
-			r := w.batch[0]
-			w.batch[0] = request{}
-			w.batch = w.batch[1:]
-			keepAlive := c.handle(w, r)
+		keepAlive := c.handle(w, r)
+		if keepAlive && cap(retained.Bytes()) == 0 && cap(r.msg.Bytes()) <= maxRetainedMessageBytes {
+			r.msg.Reset()
+			retained = r.msg
+		} else {
 			r.msg.Release()
-			if !keepAlive {
-				for i := range w.batch {
-					w.batch[i].msg.Release()
-				}
-				w.batch = base
-				w.flush()
-				c.closeFromWorker()
-				return
-			}
-			if len(w.batch) > 0 && (c.closed.Load() || !c.connection.Writable()) {
-				c.restoreBatch(w)
-				break
-			}
 		}
-		w.batch = base
-	}
-}
-
-// restoreBatch puts the unserved requests of w.batch back at the front of c.queue when the connection stalls mid-batch,
-// or releases them if the connection has closed.
-func (c *conn) restoreBatch(w *response) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed.Load() {
-		for i := range w.batch {
-			w.batch[i].msg.Release()
+		if !keepAlive {
+			w.flush()
+			c.closeFromWorker()
+			return
 		}
-		return
 	}
-	for i := range w.batch {
-		c.queuedBytes += int32(w.batch[i].msg.Len())
-	}
-	c.queue = append(slices.Clone(w.batch), c.queue...)
-	clear(w.batch)
 }
 
 // handle parses and processes one request, its response going into w's output, and reports whether to keep the

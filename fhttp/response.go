@@ -52,7 +52,6 @@ type response struct {
 	req            http.Request
 	bufferedReader *bufio.Reader
 	bytesReader    bytes.Reader
-	batch          []request
 	header         http.Header
 	status         int
 	writeErr       error
@@ -94,25 +93,20 @@ var responsePool = sync.Pool{New: func() any {
 
 // start readies w for the response to w.req.
 func (w *response) start() {
-	clear(w.header)
+	if len(w.header) > 0 {
+		clear(w.header)
+	}
 	w.status, w.wroteHeader, w.upgraded, w.streamed, w.writeErr = 0, false, false, false, nil
 	w.outStart = w.out.Len()
 	w.body.Reset()
 }
 
 func (w *response) release() {
-	for i := range w.batch {
-		w.batch[i].msg.Release()
-	}
-	clear(w.batch)
-	if cap(w.batch) > maxRetainedQueueCapacity {
-		w.batch = nil
-	} else {
-		w.batch = w.batch[:0]
-	}
 	resetOrRelease(&w.body)
 	resetOrRelease(&w.out)
-	clear(w.header)
+	if len(w.header) > 0 {
+		clear(w.header)
+	}
 	w.conn = nil
 	w.req = http.Request{}
 	w.writeErr = nil
