@@ -253,7 +253,6 @@ func (c *conn) serve() {
 func (c *conn) serveQueue(w *response) {
 	var retained bytepool.Buffer
 	defer func() { retained.Release() }()
-	var base []request
 	for {
 		c.mu.Lock()
 		// The client is not taking the responses: answering more would only pile them up in fnet's send buffer.
@@ -298,20 +297,15 @@ func (c *conn) serveQueue(w *response) {
 			c.mu.Unlock()
 			return
 		}
-		if cap(base) == 0 || &c.queue[:cap(c.queue)][cap(c.queue)-1] != &base[:cap(base)][cap(base)-1] {
-			base = c.queue[:0]
-		}
 		r := c.queue[0]
-		c.queue[0] = request{}
-		c.queue = c.queue[1:]
-		if len(c.queue) == 0 {
-			if cap(base) > maxRetainedQueueCapacity {
-				c.releaseQueue()
-			} else {
-				c.queue = base
-			}
+		n := copy(c.queue, c.queue[1:])
+		c.queue[n] = request{}
+		if n == 0 && cap(c.queue) > maxRetainedQueueCapacity {
+			c.releaseQueue()
+		} else {
+			c.queue = c.queue[:n]
+			c.queuedBytes -= int32(r.msg.Len())
 		}
-		c.queuedBytes -= int32(r.msg.Len())
 		c.mu.Unlock()
 
 		keepAlive := c.handle(w, r)

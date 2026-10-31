@@ -92,9 +92,11 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 	b := &w.out
 	b.Truncate(w.outStart)
 	b.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
-	delete(w.header, "Content-Length") // a 1xx response has neither (RFC 9110 8.6, RFC 9112 6.1)
-	delete(w.header, "Transfer-Encoding")
-	w.header.Write(b)
+	for name, values := range w.header {
+		if name != "Content-Length" && name != "Transfer-Encoding" && validName(name) { // a 1xx response has neither (RFC 9110 8.6, RFC 9112 6.1)
+			appendHeaderValues(b, name, values)
+		}
+	}
 	b.WriteString("\r\n")
 	return w.flush() // the responses before it and the 101 go out before the new protocol writes anything
 }

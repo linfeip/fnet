@@ -323,7 +323,7 @@ func hasEventStream(value []byte) bool {
 
 // hasField reports whether line is the header field name (case-insensitive) followed directly by a colon.
 func hasField(line []byte, name string) bool {
-	return len(line) > len(name) && line[len(name)] == ':' && line[0]|0x20 == name[0]|0x20 && bytes.EqualFold(line[:len(name)], []byte(name))
+	return len(line) > len(name) && line[len(name)] == ':' && bytes.EqualFold(line[:len(name)], []byte(name))
 }
 
 // fieldValue returns the value of the field line hasField matched with name, without the surrounding whitespace and the

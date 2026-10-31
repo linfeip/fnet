@@ -56,31 +56,32 @@ func validName(name string) bool {
 	return name != ""
 }
 
+// hostBytes marks the bytes allowed in a host name or inside an IPv6 literal (RFC 9110 7.2, RFC 3986 3.2.2).
+var hostBytes = func() (t [256]bool) {
+	for _, c := range []byte("!$%&'()*+,-.:;=_~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") {
+		t[c] = true
+	}
+	return t
+}()
+
 // validHost reports whether the Host value is empty or a host name, an IPv4 address or an IPv6 literal in brackets
 // (including the zone identifier), optionally followed by a colon and a port of digits (RFC 9110 7.2, RFC 3986 3.2.2).
 // The characters of a name are those the net/http server allows, so that what it serves is served here as well.
 func validHost(host string) bool {
-	for i := 0; i < len(host); i++ {
-		switch c := host[i]; {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
-		case strings.IndexByte("!$%&'()*+,-.:;=[]_~", c) >= 0:
-		default:
-			return false
-		}
-	}
-	rest := host // what follows the host: nothing, or a colon and the port
+	rest := "" // what follows the host: nothing, or a colon and the port
 	if strings.HasPrefix(host, "[") {
 		end := strings.IndexByte(host, ']')
-		if end < 2 || strings.IndexByte(host[1:end], '[') >= 0 { // not closed, empty, or opened again
+		if end < 2 { // not closed, or empty
 			return false
 		}
-		rest = host[end+1:]
-	} else if i := strings.IndexAny(host, ":[]"); i < 0 {
-		return true
-	} else if host[i] != ':' { // brackets enclose an IP literal only
-		return false
-	} else {
-		rest = host[i:]
+		host, rest = host[1:end], host[end+1:]
+	} else if i := strings.IndexByte(host, ':'); i >= 0 {
+		host, rest = host[:i], host[i:]
+	}
+	for i := 0; i < len(host); i++ {
+		if !hostBytes[host[i]] {
+			return false
+		}
 	}
 	if rest == "" {
 		return true

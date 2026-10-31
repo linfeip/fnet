@@ -85,12 +85,11 @@ func (b *Buffer) Discard(n int) { b.data = b.data[:copy(b.data, b.data[n:])] }
 // left over from rounding up to a power of two: when such a buffer grows again, an extra 1/4 of slack is kept, since
 // otherwise every append would reallocate and copy the whole block, making the total cost of successive appends grow
 // with the square of the size.
-func (b *Buffer) Write(p []byte) (int, error) {
+func (b *Buffer) Write(p []byte) {
 	if cap(b.data)-len(b.data) < len(p) {
 		b.grow(len(p))
 	}
 	b.data = append(b.data, p...)
-	return len(p), nil
 }
 
 // grow gives b room for n more bytes, see Write.
@@ -105,12 +104,11 @@ func (b *Buffer) grow(n int) {
 }
 
 // WriteString is the same as Write, for a string.
-func (b *Buffer) WriteString(s string) (int, error) {
+func (b *Buffer) WriteString(s string) {
 	if cap(b.data)-len(b.data) < len(s) {
 		b.grow(len(s))
 	}
 	b.data = append(b.data, s...)
-	return len(s), nil
 }
 
 // Join combines newly read data (where data[:pending] was left empty for a small leftover) with the leftover already
