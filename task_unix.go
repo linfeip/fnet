@@ -21,7 +21,7 @@ const (
 	evHup      = uint32(poll.EventHup)   // the peer has closed or an error occurred, see conn.peerClosed
 	evOpen     = evHup << 1              // new connection, the OnOpen callback is pending
 	evClose    = evOpen << 1             // a close has been requested, see requestClose
-	evExpired  = evClose << 1            // the deadline has expired, see loop.checkDeadlines
+	evExpired  = evClose << 1            // the deadline has expired, see Server.checkDeadlines
 	evShutdown = evExpired << 1          // the server is closing the connection, see Server.Serve
 	evResume   = evShutdown << 1         // reading has resumed, see conn.ResumeRead
 
@@ -286,17 +286,6 @@ func (c *conn) requestCloseOnEOF() {
 // (nil) and the peer's EOF still let the data already written reach the peer, any other reason does not.
 func closesNow(err error) bool { return err != nil && err != io.EOF }
 
-// expiredBy reports whether the deadline, or the end of the linger once the connection lingers (see beginLinger), has
-// passed by now. The task checks it again on evExpired: loop.checkDeadlines found it so, but it may have been put off
-// since, even by the callback of this very round.
-func (c *conn) expiredBy(now int64) bool {
-	d := c.deadline.Load()
-	if end := c.lingerEnd.Load(); end != 0 {
-		d = end
-	}
-	return d != 0 && d <= now
-}
-
 // onClosing invokes the OnClosing callback of a ClosingHandler before the engine requests the close of the connection on
 // its own, err being the reason, unless a close has been requested already.
 func (c *conn) onClosing(err error) {
@@ -368,11 +357,13 @@ const lingerTimeout = time.Second
 // reading away what arrives (see linger), until the peer closes too, a read fails, the server closes or lingerTimeout
 // has passed; the fd is closed then, and the server counts the connection as open until that happens.
 //
-// Meanwhile lingerEnd holds the end of the linger, which marks the connection as lingering and which loop.checkDeadlines
-// finds in place of the deadline, see expiredBy.
+// Meanwhile lingerEnd holds the end of the linger, which marks the connection as lingering and which
+// Server.checkDeadlines finds in place of the deadline, see expiredBy.
 func (c *conn) beginLinger() {
 	unix.Shutdown(c.fd, unix.SHUT_WR)
-	c.lingerEnd.Store(time.Now().Add(lingerTimeout).UnixNano())
+	end := time.Now().Add(lingerTimeout).UnixNano()
+	c.lingerEnd.Store(end)
+	connsByFd.noteDeadline(c.fd, end)
 	// What has arrived already raises no new event: it is read here once, and linger goes on in another round only when
 	// there was something, the EOF included. Usually there is nothing yet, and the peer's FIN brings the next event.
 	if _, err := c.discardInbound(); err != unix.EAGAIN {

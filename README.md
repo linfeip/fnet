@@ -14,7 +14,7 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 - 🧵 **Zero-goroutine idle connections**: idle sockets stay on the poller and hold no goroutine and no buffer; the read buffer is borrowed only while a task is reading.
 - ⚡ **Direct, concurrency-safe writes**: `Conn.Write` / `Writev` can be called from any goroutine, never block, and go straight to the socket (`writev` for header + payload).
 - 🔌 **Custom TCP protocols**: implement `OnOpen` / `OnData` / `OnClose`, and tell the engine how many bytes you consumed.
-- 🛡️ **Standards compatible**: use `http.Handler` / `http.ServeMux` as is; WebSocket follows RFC 6455 (frame types and protocol checks from gobwas/ws).
+- 🛡️ **Standards compatible**: use `http.Handler` / `http.ServeMux` as is; WebSocket follows RFC 6455.
 - 🔒 **TLS without a goroutine per connection**: HTTPS and WSS take one option (`fhttp.Options.TLSConfig`); the standard `crypto/tls` runs inside the connection's callbacks, and `ftls` adds TLS to any `fnet.Handler`.
 - ⏱️ **Deadline-style timeouts**: slow clients cannot hold a connection by trickling bytes.
 
@@ -180,15 +180,13 @@ import (
 
 	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/websocket"
-
-	"github.com/gobwas/ws"
 )
 
 type echo struct{}
 
-func (echo) OnOpen(c *websocket.Conn)                               {}
-func (echo) OnMessage(c *websocket.Conn, op ws.OpCode, data []byte) { c.WriteMessage(op, data) } // a complete message
-func (echo) OnClose(c *websocket.Conn, err error)                   {}
+func (echo) OnOpen(c *websocket.Conn)                                      {}
+func (echo) OnMessage(c *websocket.Conn, op websocket.OpCode, data []byte) { c.WriteMessage(op, data) } // a complete message
+func (echo) OnClose(c *websocket.Conn, err error)                          {}
 
 func main() {
 	mux := http.NewServeMux()

@@ -4,7 +4,6 @@ package fnet
 
 import (
 	"bytes"
-	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -232,20 +231,33 @@ func (c *conn) Detach() (net.Conn, error) {
 	return &detachedConn{TCPConn: nc.(*net.TCPConn), in: in}, nil
 }
 
-// SetDeadline only records the deadline, which the event loop checks once per second (see loop.checkDeadlines). A
+// SetDeadline only records the deadline, which the server checks once per second (see Server.checkDeadlines). A
 // lingering connection goes by the end of its linger instead, see expiredBy.
 func (c *conn) SetDeadline(t time.Time) {
-	var d int64
-	switch {
-	case t.IsZero():
-	case t.Unix() >= math.MaxInt64/int64(time.Second): // past 2262, beyond UnixNano: as good as never
-		d = math.MaxInt64
-	case t.Unix() < 0: // before 1970, and before 1678 beyond UnixNano: expired
-		d = 1
-	default:
-		d = max(t.UnixNano(), 1)
+	if t.IsZero() {
+		c.deadline.Store(0)
+		return
 	}
+	d := max(int64(t.Sub(time.Unix(0, 0))), 1)
 	c.deadline.Store(d)
+	connsByFd.noteDeadline(c.fd, d)
+}
+
+// effectiveDeadline returns the connection's close deadline, or the end of the linger once the connection lingers (see
+// beginLinger); 0 means no deadline.
+func (c *conn) effectiveDeadline() int64 {
+	if end := c.lingerEnd.Load(); end != 0 {
+		return end
+	}
+	return c.deadline.Load()
+}
+
+// expiredBy reports whether the deadline, or the end of the linger once the connection lingers, has passed by now. The
+// task checks it again on evExpired: Server.checkDeadlines found it so, but it may have been put off since, even by the
+// callback of this very round.
+func (c *conn) expiredBy(now int64) bool {
+	d := c.effectiveDeadline()
+	return d != 0 && d <= now
 }
 
 // sockaddrToAddrPort converts a TCP socket address; it returns the zero value for unsupported address types.

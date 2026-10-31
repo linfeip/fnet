@@ -5,9 +5,7 @@ package fnet
 import (
 	"runtime"
 	"slices"
-	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/linfeip/fnet/poll"
 )
@@ -18,14 +16,7 @@ type loop struct {
 	srv         *Server
 	poller      *poll.Poller // the readiness of the loop's connections, see poll.New
 	listenerFds []int        // the listening sockets the Poller watches as well (see accept), set before Serve
-
-	mu    sync.Mutex
-	added []*conn // the connections watched since collectConns last took them over
-
-	collectMu sync.Mutex // serializes collectConns, which goes over conns without holding mu
-	conns     []*conn    // the connections registered with this loop, see collectConns; guarded by collectMu
-
-	active atomic.Bool // the last poll retrieved events; other loops' workers help only while it is set (see help)
+	active      atomic.Bool  // the last poll retrieved events; other loops' workers help only while it is set (see help)
 }
 
 func newLoop(s *Server) (*loop, error) {
@@ -68,7 +59,7 @@ func (l *loop) accept(listenerFd int) {
 }
 
 // watch puts the new connection c in the table and its fd in the Poller, in this order so that the first event finds
-// it, and adds it to the loop's list; it runs in c's first task. When that fails c is closed, without any callback.
+// it; it runs in c's first task. When that fails c is closed, without any callback.
 // A connection added once the server has begun closing its connections (see Server.Serve) requests its own close.
 func (l *loop) watch(c *conn) bool {
 	if !connsByFd.store(c) { // an fd beyond the table's range
@@ -80,56 +71,10 @@ func (l *loop) watch(c *conn) bool {
 		c.abandon()
 		return false
 	}
-	l.mu.Lock()
-	l.added = append(l.added, c)
-	draining := l.srv.draining.Load()
-	l.mu.Unlock()
-	if draining {
+	if l.srv.draining.Load() {
 		c.notify(evShutdown)
 	}
 	return true
-}
-
-// collectConns returns the connections still registered with the loop for which keep reports true; keep must be quick
-// and must not call into user code. It takes over the connections watched since its last call while holding mu, then
-// goes over them all without it, so that watch, which the first task of every new connection runs, does not wait for a
-// pass over a million connections. The ones that have taken themselves out of connsByFd (see conn.closeFd) are dropped
-// from the list on the way, which is how the list catches up with them.
-func (l *loop) collectConns(keep func(c *conn) bool) []*conn {
-	l.collectMu.Lock()
-	defer l.collectMu.Unlock()
-	l.mu.Lock()
-	added := l.added
-	l.added = nil
-	l.mu.Unlock()
-	l.conns = append(l.conns, added...)
-	var kept []*conn
-	live := l.conns[:0]
-	for _, c := range l.conns {
-		if connsByFd.lookup(c.fd) == c {
-			live = append(live, c)
-			if keep(c) {
-				kept = append(kept, c)
-			}
-		}
-	}
-	clear(l.conns[len(live):]) // let the connections that were dropped be collected
-	// The loop held many more connections once: give the memory back.
-	if cap(live) > 4*len(live)+1024 {
-		live = slices.Clone(live)
-	}
-	l.conns = live
-	return kept
-}
-
-// checkDeadlines notifies the connections whose deadline has passed, which then close; the Server calls it once every
-// deadlineCheckInterval.
-func (l *loop) checkDeadlines() {
-	now := time.Now().UnixNano()
-	expired := l.collectConns(func(c *conn) bool { return c.expiredBy(now) })
-	for _, c := range expired {
-		c.notify(evExpired)
-	}
 }
 
 // startWorker starts the loop's worker.

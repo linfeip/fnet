@@ -11,15 +11,13 @@ import (
 
 	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/websocket"
-
-	"github.com/gobwas/ws"
 )
 
 type echo struct{}
 
-func (echo) OnOpen(c *websocket.Conn)                               {}
-func (echo) OnMessage(c *websocket.Conn, op ws.OpCode, data []byte) { c.WriteMessage(op, data) }
-func (echo) OnClose(c *websocket.Conn, err error)                   {}
+func (echo) OnOpen(c *websocket.Conn)                                      {}
+func (echo) OnMessage(c *websocket.Conn, op websocket.OpCode, data []byte) { c.WriteMessage(op, data) }
+func (echo) OnClose(c *websocket.Conn, err error)                          {}
 
 func main() {
 	addr := flag.String("addr", ":9001", "listen address")

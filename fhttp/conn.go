@@ -100,10 +100,8 @@ func (c *conn) setDeadline() {
 	}
 	var timeout time.Duration
 	switch {
-	case c.worker == workerWaiting:
-		timeout = c.srv.opts.IdleTimeout // the client has as long to take the responses, see serve
 	case c.worker == workerServing:
-	case c.partial:
+	case c.worker == workerIdle && c.partial:
 		timeout = c.srv.opts.ReadHeaderTimeout
 	default:
 		timeout = c.srv.opts.IdleTimeout

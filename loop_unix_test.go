@@ -47,9 +47,11 @@ func TestHandleEventOwnLoopOnly(t *testing.T) {
 // loopFds returns the fds of the connections the loop still holds.
 func loopFds(l *loop) []int {
 	var fds []int
-	for _, c := range l.collectConns(func(*conn) bool { return true }) {
-		fds = append(fds, c.fd)
-	}
+	connsByFd.each(func(c *conn) {
+		if c.loop == l {
+			fds = append(fds, c.fd)
+		}
+	})
 	slices.Sort(fds)
 	return fds
 }
@@ -93,9 +95,8 @@ func TestListenerPerLoop(t *testing.T) {
 	}
 }
 
-// TestCollectConnsDropsClosed checks that the loop's connection list catches up with connections that have closed:
-// they are not returned and are dropped from the list, while the ones still open are returned.
-func TestCollectConnsDropsClosed(t *testing.T) {
+// TestConnsDropsClosed checks that closed connections are removed from connsByFd while the ones still open remain.
+func TestConnsDropsClosed(t *testing.T) {
 	opened := make(chan Conn, 3)
 	closed := make(chan struct{}, 3)
 	srv := startServerWith(t, &funcHandler{
@@ -123,12 +124,6 @@ func TestCollectConnsDropsClosed(t *testing.T) {
 	want := slices.Sorted(slices.Values([]int{fds[0], fds[2]}))
 	if got := loopFds(l); !slices.Equal(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
-	}
-	l.collectMu.Lock()
-	n := len(l.conns)
-	l.collectMu.Unlock()
-	if n != 2 {
-		t.Fatalf("the list holds %d connections, want the closed one dropped and 2 left", n)
 	}
 }
 

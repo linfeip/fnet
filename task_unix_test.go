@@ -113,7 +113,7 @@ func TestExecutorNotCalledUnderConnLock(t *testing.T) {
 	sc.SetDeadline(time.Now().Add(-time.Second))
 	target.Store(sc.(*conn))
 	armed.Store(true)
-	srv.loops[0].checkDeadlines()
+	srv.checkDeadlines()
 	armed.Store(false)
 	if held.Load() {
 		t.Fatal("Executor was called while holding the connection's mu when requesting the close of an expired connection")
@@ -139,7 +139,7 @@ func TestDeadlinePutOff(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // let the connection settle: after this only the call below calls the Executor
 	sc.SetDeadline(time.Now().Add(-time.Second))
 	hold.Store(true)
-	srv.loops[0].checkDeadlines()
+	srv.checkDeadlines()
 	hold.Store(false)
 	task := <-tasks
 	sc.SetDeadline(time.Time{})

@@ -3,12 +3,12 @@ package websocket
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptorand "crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -16,7 +16,6 @@ import (
 	"log/slog"
 	"math"
 	"math/big"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -32,10 +31,127 @@ import (
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/taskpool"
-
-	"github.com/gobwas/ws"
-	"github.com/gobwas/ws/wsutil"
 )
+
+var testMask = [4]byte{0x12, 0x34, 0x56, 0x78}
+
+// appendHeader encodes any frameHeader (including client mask and non-zero reserved bits) for tests.
+func appendHeader(b []byte, h frameHeader) []byte {
+	b0 := byte(h.opCode) | (h.reserved&0x07)<<4
+	if h.final {
+		b0 |= 0x80
+	}
+	var b1 byte
+	if h.masked {
+		b1 = 0x80
+	}
+	switch {
+	case h.length <= 125:
+		b = append(b, b0, b1|byte(h.length))
+	case h.length <= 0xffff:
+		b = binary.BigEndian.AppendUint16(append(b, b0, b1|126), uint16(h.length))
+	default:
+		b = binary.BigEndian.AppendUint64(append(b, b0, b1|127), uint64(h.length))
+	}
+	if h.masked {
+		b = append(b, h.mask[:]...)
+	}
+	return b
+}
+
+// appendMaskedFrame appends one masked client frame to b.
+func appendMaskedFrame(b []byte, op OpCode, final bool, payload []byte) []byte {
+	b = appendHeader(b, frameHeader{
+		final:  final,
+		opCode: op,
+		masked: true,
+		mask:   testMask,
+		length: int64(len(payload)),
+	})
+	start := len(b)
+	b = append(b, payload...)
+	applyMask(b[start:], testMask)
+	return b
+}
+
+// writeClientMessage writes one masked, unfragmented client frame to w.
+func writeClientMessage(w io.Writer, op OpCode, payload []byte) error {
+	_, err := w.Write(appendMaskedFrame(nil, op, true, payload))
+	return err
+}
+
+// encodeCloseBody encodes a close frame payload with code and reason.
+func encodeCloseBody(code StatusCode, reason string) []byte {
+	b := make([]byte, 2+len(reason))
+	binary.BigEndian.PutUint16(b, uint16(code))
+	copy(b[2:], reason)
+	return b
+}
+
+// readServerFrame reads one frame sent by the server from r.
+func readServerFrame(r io.Reader) (h frameHeader, payload []byte, err error) {
+	var buf [14]byte
+	if _, err := io.ReadFull(r, buf[:2]); err != nil {
+		return h, nil, err
+	}
+	need := 2
+	switch buf[1] & 0x7f {
+	case 126:
+		need += 2
+	case 127:
+		need += 8
+	}
+	if buf[1]&0x80 != 0 {
+		need += 4
+	}
+	if _, err := io.ReadFull(r, buf[2:need]); err != nil {
+		return h, nil, err
+	}
+	h, _, err = parseHeader(buf[:need])
+	if err != nil {
+		return h, nil, err
+	}
+	payload = make([]byte, h.length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return h, nil, err
+	}
+	if h.masked {
+		applyMask(payload, h.mask)
+	}
+	return h, payload, nil
+}
+
+// dialConn dials addr (over TLS when tlsConfig is non-nil) and completes the WebSocket opening handshake.
+func dialConn(addr string, tlsConfig *tls.Config) (net.Conn, *bufio.Reader, error) {
+	var conn net.Conn
+	var err error
+	if tlsConfig != nil {
+		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, tlsConfig)
+	} else {
+		conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	const key = "dGhlIHNhbXBsZSBub25jZQ=="
+	req := "GET /ws HTTP/1.1\r\nHost: " + addr + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n"
+	if _, err := io.WriteString(conn, req); err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols || resp.Header.Get("Sec-WebSocket-Accept") != acceptKey(key) {
+		conn.Close()
+		return nil, nil, fmt.Errorf("unexpected handshake response: %s", resp.Status)
+	}
+	return conn, br, nil
+}
 
 // testHandler echoes the messages it receives; "close" triggers a close from the local side and "panic"
 // triggers a panic.
@@ -59,7 +175,7 @@ func (h *testHandler) OnOpen(c *Conn) {
 	}
 }
 
-func (h *testHandler) OnMessage(c *Conn, op ws.OpCode, data []byte) {
+func (h *testHandler) OnMessage(c *Conn, op OpCode, data []byte) {
 	if c.Context() != "opened" {
 		panic("OnMessage before OnOpen")
 	}
@@ -130,48 +246,49 @@ func (c *client) Read(p []byte) (int, error) { return c.reader.Read(p) }
 
 func dial(t *testing.T, s *fhttp.Server) *client {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	conn, br, _, err := ws.Dial(ctx, "ws://"+s.Addr().String()+"/ws")
+	conn, br, err := dialConn(s.Addr().String(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	c := &client{Conn: conn, reader: conn}
-	if br != nil {
-		c.reader = io.MultiReader(br, conn)
-	}
-	return c
+	return &client{Conn: conn, reader: br}
 }
 
-func (c *client) send(t *testing.T, op ws.OpCode, fin bool, payload string) {
+func (c *client) send(t *testing.T, op OpCode, final bool, payload string) {
 	t.Helper()
-	if err := ws.WriteFrame(c, ws.MaskFrame(ws.NewFrame(op, fin, []byte(payload)))); err != nil {
+	if _, err := c.Write(appendMaskedFrame(nil, op, final, []byte(payload))); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func (c *client) expectMessage(t *testing.T, wantOp ws.OpCode, want []byte) {
+func (c *client) expectMessage(t *testing.T, wantOp OpCode, want []byte) {
 	t.Helper()
-	data, op, err := wsutil.ReadServerData(c)
-	if err != nil || op != wantOp || !bytes.Equal(data, want) {
-		t.Fatalf("got op=%v len=%d err=%v, want op=%v len=%d", op, len(data), err, wantOp, len(want))
+	h, data, err := readServerFrame(c)
+	for err == nil && h.opCode.isControl() {
+		h, data, err = readServerFrame(c)
+	}
+	if err != nil || !h.final || h.opCode != wantOp || !bytes.Equal(data, want) {
+		t.Fatalf("got op=%v final=%v len=%d err=%v, want op=%v len=%d", h.opCode, h.final, len(data), err, wantOp, len(want))
 	}
 }
 
 // expectClose skips data frames until it reads the server's close frame and checks its status code; after
 // that the connection should be closed.
-func (c *client) expectClose(t *testing.T, want ws.StatusCode) {
+func (c *client) expectClose(t *testing.T, want StatusCode) {
 	t.Helper()
-	f, err := ws.ReadFrame(c)
-	for err == nil && f.Header.OpCode.IsData() {
-		f, err = ws.ReadFrame(c)
+	h, payload, err := readServerFrame(c)
+	for err == nil && !h.opCode.isControl() {
+		h, payload, err = readServerFrame(c)
 	}
-	if err != nil || f.Header.OpCode != ws.OpClose {
-		t.Fatalf("want a close frame, got %v %v", f.Header, err)
+	if err != nil || h.opCode != OpClose {
+		t.Fatalf("want a close frame, got %+v %v", h, err)
 	}
-	if code, _ := ws.ParseCloseFrameData(f.Payload); code != want {
+	var code StatusCode
+	if len(payload) >= 2 {
+		code = StatusCode(binary.BigEndian.Uint16(payload[:2]))
+	}
+	if code != want {
 		t.Fatalf("close frame status code %d, want %d", code, want)
 	}
 	// If the peer is still sending when the server closes (for example data sent after a protocol
@@ -192,24 +309,24 @@ func TestEcho(t *testing.T) {
 	s := newTestServer(t, &testHandler{}, Options{})
 	c := dial(t, s)
 
-	wsutil.WriteClientMessage(c, ws.OpText, []byte("hello"))
-	c.expectMessage(t, ws.OpText, []byte("hello"))
-	wsutil.WriteClientMessage(c, ws.OpBinary, nil)
-	c.expectMessage(t, ws.OpBinary, nil)
+	writeClientMessage(c, OpText, []byte("hello"))
+	c.expectMessage(t, OpText, []byte("hello"))
+	writeClientMessage(c, OpBinary, nil)
+	c.expectMessage(t, OpBinary, nil)
 	big := bytes.Repeat([]byte("0123456789abcdef"), 32*(1<<10)) // 512KB, spans multiple reads
-	wsutil.WriteClientMessage(c, ws.OpBinary, big)
-	c.expectMessage(t, ws.OpBinary, big)
+	writeClientMessage(c, OpBinary, big)
+	c.expectMessage(t, OpBinary, big)
 
 	// A ping inserted in the middle of a fragmented message: the pong arrives first, then the reassembled
 	// message.
-	c.send(t, ws.OpText, false, "frag")
-	c.send(t, ws.OpPing, true, "p")
-	c.send(t, ws.OpContinuation, true, "ment")
-	f, err := ws.ReadFrame(c)
-	if err != nil || f.Header.OpCode != ws.OpPong || string(f.Payload) != "p" {
-		t.Fatalf("want pong, got %v %q %v", f.Header, f.Payload, err)
+	c.send(t, OpText, false, "frag")
+	c.send(t, OpPing, true, "p")
+	c.send(t, OpContinuation, true, "ment")
+	h, payload, err := readServerFrame(c)
+	if err != nil || h.opCode != OpPong || string(payload) != "p" {
+		t.Fatalf("want pong, got %+v %q %v", h, payload, err)
 	}
-	c.expectMessage(t, ws.OpText, []byte("fragment"))
+	c.expectMessage(t, OpText, []byte("fragment"))
 }
 
 // TestEchoPipelined verifies a real WebSocket connection sending and receiving multi-frame batches back to back,
@@ -223,13 +340,13 @@ func TestEchoPipelined(t *testing.T) {
 			for i := range payloads {
 				payloads[i] = bytes.Repeat([]byte{byte(i)}, size)
 			}
-			batch := clientFrames(ws.OpBinary, payloads...)
+			batch := clientFrames(OpBinary, payloads...)
 			for range 3 {
 				if n, err := c.Write(batch); err != nil || n != len(batch) {
 					t.Fatalf("wrote %d/%d bytes, err=%v", n, len(batch), err)
 				}
 				for _, payload := range payloads {
-					c.expectMessage(t, ws.OpBinary, payload)
+					c.expectMessage(t, OpBinary, payload)
 				}
 			}
 		})
@@ -241,17 +358,18 @@ func TestEchoPipelined(t *testing.T) {
 func TestWriteMessageInvalid(t *testing.T) {
 	var c Conn
 	for _, tt := range []struct {
-		op   ws.OpCode
-		size int
-	}{{ws.OpClose, 2}, {ws.OpContinuation, 1}, {ws.OpCode(3), 1}, {ws.OpPing, 126}, {ws.OpPong, 126}} {
-		if err := c.WriteMessage(tt.op, make([]byte, tt.size)); err != errInvalidMessage {
-			t.Errorf("WriteMessage(%v, %d bytes) = %v, want errInvalidMessage", tt.op, tt.size, err)
+		opCode OpCode
+		size   int
+	}{{OpClose, 2}, {OpContinuation, 1}, {OpCode(3), 1}, {OpPing, 126}, {OpPong, 126}} {
+		if err := c.WriteMessage(tt.opCode, make([]byte, tt.size)); err != errInvalidMessage {
+			t.Errorf("WriteMessage(%v, %d bytes) = %v, want errInvalidMessage", tt.opCode, tt.size, err)
 		}
 	}
 }
 
-// TestApplyMaskMatchesCipher checks that applyMask produces identical output to ws.Cipher for all payload lengths.
-func TestApplyMaskMatchesCipher(t *testing.T) {
+// TestApplyMask checks that applyMask produces identical output to the byte-by-byte RFC 6455 mask definition for all
+// payload lengths.
+func TestApplyMask(t *testing.T) {
 	mask := [4]byte{0x12, 0x34, 0x56, 0x78}
 	for size := 0; size <= 1024; size++ {
 		src := make([]byte, size)
@@ -259,7 +377,9 @@ func TestApplyMaskMatchesCipher(t *testing.T) {
 			src[i] = byte(i * 17)
 		}
 		want := slices.Clone(src)
-		ws.Cipher(want, mask, 0)
+		for i := range want {
+			want[i] ^= mask[i&3]
+		}
 		got := slices.Clone(src)
 		applyMask(got, mask)
 		if !bytes.Equal(got, want) {
@@ -268,69 +388,64 @@ func TestApplyMaskMatchesCipher(t *testing.T) {
 	}
 }
 
-// TestAppendFrameHeader checks that the frame header encoding is byte-for-byte identical to ws.WriteHeader:
-// RFC 6455 requires the shortest encoding for the payload length, which the peer does not necessarily check
-// when parsing.
+// TestAppendFrameHeader checks that the frame header uses the shortest length encoding required by RFC 6455 5.2 and
+// round-trips through parseHeader.
 func TestAppendFrameHeader(t *testing.T) {
-	for _, n := range []int{0, 125, 126, 64*(1<<10) - 1, 64 * (1 << 10), (1 << 20)} {
-		var want bytes.Buffer
-		ws.WriteHeader(&want, ws.Header{Fin: true, OpCode: ws.OpText, Length: int64(n)})
-		if got := appendFrameHeader(nil, ws.OpText, n); !bytes.Equal(got, want.Bytes()) {
-			t.Errorf("length %d: got %x, want %x", n, got, want.Bytes())
+	for _, tc := range []struct {
+		length     int
+		headerSize int
+	}{
+		{0, 2},
+		{125, 2},
+		{126, 4},
+		{64*(1<<10) - 1, 4},
+		{64 * (1 << 10), 10},
+		{(1 << 20), 10},
+	} {
+		encoded := appendFrameHeader(nil, OpText, tc.length)
+		if len(encoded) != tc.headerSize {
+			t.Fatalf("length %d: header size %d, want %d", tc.length, len(encoded), tc.headerSize)
+		}
+		got, n, err := parseHeader(encoded)
+		want := frameHeader{final: true, opCode: OpText, length: int64(tc.length)}
+		if err != nil || n != tc.headerSize || got != want {
+			t.Errorf("length %d: got %+v n=%d err=%v, want %+v n=%d", tc.length, got, n, err, want, tc.headerSize)
 		}
 	}
 }
 
-// checkParseHeader checks that parseHeader agrees with ws.ReadHeader on data: the same header and header length, the
-// same error, and "incomplete" exactly when ws.ReadHeader hits the end of data. The one difference is a length sent in
-// more bytes than it needs, which ws.ReadHeader reads and parseHeader rejects (RFC 6455 5.2).
-func checkParseHeader(t *testing.T, data []byte) {
-	t.Helper()
-	var r bytes.Reader
-	r.Reset(data)
-	want, wantErr := ws.ReadHeader(&r)
-	if wantErr == nil {
-		if code := data[1] & 0x7f; code == 126 && want.Length < 126 || code == 127 && want.Length <= math.MaxUint16 {
-			wantErr = errLengthNotMinimal
-		}
-	}
-	got, n, err := parseHeader(data)
-	if wantErr == io.EOF || wantErr == io.ErrUnexpectedEOF {
-		if n != 0 || err != nil {
-			t.Fatalf("%x: incomplete header, got n=%d err=%v, want n=0 err=nil", data, n, err)
-		}
-		return
-	}
-	if err != wantErr {
-		t.Fatalf("%x: err = %v, want %v", data, err, wantErr)
-	}
-	if err != nil {
-		return // the header is undefined on error
-	}
-	if wantN := len(data) - r.Len(); got != want || n != wantN {
-		t.Fatalf("%x: got %+v n=%d, want %+v n=%d", data, got, n, want, wantN)
-	}
-}
-
-// TestParseHeader checks parseHeader against ws.ReadHeader on every combination of the header fields (every
-// length encoding, FIN, RSV, opcode and mask), on every truncation of the encoded header, and with payload bytes
-// following the header, which must not be consumed.
+// TestParseHeader checks parseHeader on every combination of header fields (every length encoding, FIN, RSV, opcode
+// and mask), on every truncation of the encoded header, and with payload bytes following the header, which must not
+// be consumed.
 func TestParseHeader(t *testing.T) {
 	lengths := []int64{0, 1, 125, 126, 127, 65535, 65536, 1 << 31, 1 << 40, math.MaxInt64}
 	for _, length := range lengths {
 		for _, masked := range []bool{false, true} {
-			for _, fin := range []bool{false, true} {
-				for op := range ws.OpCode(16) {
-					for rsv := range byte(8) {
-						h := ws.Header{Fin: fin, Rsv: rsv, OpCode: op, Masked: masked, Length: length}
-						if masked {
-							h.Mask = [4]byte{0x12, 0x34, 0x56, 0x78}
+			for _, final := range []bool{false, true} {
+				for op := range OpCode(16) {
+					for reserved := range byte(8) {
+						want := frameHeader{
+							final:    final,
+							reserved: reserved,
+							opCode:   op,
+							masked:   masked,
+							length:   length,
 						}
-						var buf bytes.Buffer
-						ws.WriteHeader(&buf, h)
-						encoded := append(buf.Bytes(), "payload"...)
-						for n := range len(encoded) + 1 {
-							checkParseHeader(t, encoded[:n])
+						if masked {
+							want.mask = testMask
+						}
+						header := appendHeader(nil, want)
+						for n := range len(header) {
+							if _, gotN, err := parseHeader(header[:n]); gotN != 0 || err != nil {
+								t.Fatalf("%x[:%d]: incomplete header got n=%d err=%v, want n=0 err=nil", header, n, gotN, err)
+							}
+						}
+						encoded := append(header, "payload"...)
+						for n := len(header); n <= len(encoded); n++ {
+							got, gotN, err := parseHeader(encoded[:n])
+							if err != nil || gotN != len(header) || got != want {
+								t.Fatalf("%x: got %+v n=%d err=%v, want %+v n=%d", encoded[:n], got, gotN, err, want, len(header))
+							}
 						}
 					}
 				}
@@ -340,35 +455,16 @@ func TestParseHeader(t *testing.T) {
 }
 
 // TestParseHeaderMSB checks that a 64-bit length with its most significant bit set is rejected, and only once the
-// whole header has arrived, as ws.ReadHeader does.
+// whole header has arrived.
 func TestParseHeaderMSB(t *testing.T) {
 	data := []byte{0x82, 0xff, 0x80, 0, 0, 0, 0, 0, 0, 1, 1, 2, 3, 4}
-	for n := range len(data) + 1 {
-		checkParseHeader(t, data[:n])
-	}
-	if _, _, err := parseHeader(data); err != ws.ErrHeaderLengthMSB {
-		t.Fatalf("err = %v, want %v", err, ws.ErrHeaderLengthMSB)
-	}
-	if _, n, err := parseHeader(data[:len(data)-1]); n != 0 || err != nil {
-		t.Fatalf("with an incomplete header n=%d err=%v, want n=0 err=nil", n, err)
-	}
-}
-
-// TestParseHeaderRandom checks parseHeader against ws.ReadHeader on random bytes, which also covers the headers a
-// well-behaved peer never sends (non-shortest length encodings, for example). The length code is picked among the
-// three length encodings, since a uniformly random byte would almost never pick the 16 and 64-bit ones.
-func TestParseHeaderRandom(t *testing.T) {
-	rng := rand.New(rand.NewPCG(1, 2))
-	for range 200000 {
-		data := make([]byte, rng.IntN(17))
-		for i := range data {
-			data[i] = byte(rng.Uint32())
+	for n := range len(data) {
+		if _, gotN, err := parseHeader(data[:n]); gotN != 0 || err != nil {
+			t.Fatalf("with an incomplete header (len=%d) n=%d err=%v, want n=0 err=nil", n, gotN, err)
 		}
-		if len(data) >= 2 {
-			code := [3]byte{byte(rng.IntN(126)), 126, 127}[rng.IntN(3)]
-			data[1] = data[1]&0x80 | code
-		}
-		checkParseHeader(t, data)
+	}
+	if _, _, err := parseHeader(data); err != errHeaderLengthMSB {
+		t.Fatalf("err = %v, want %v", err, errHeaderLengthMSB)
 	}
 }
 
@@ -390,18 +486,18 @@ func (stubConnection) SetDeadline(time.Time) {}
 // echoHandler echoes every message.
 type echoHandler struct{}
 
-func (echoHandler) OnOpen(*Conn)                                 {}
-func (echoHandler) OnMessage(c *Conn, op ws.OpCode, data []byte) { c.WriteMessage(op, data) }
-func (echoHandler) OnClose(*Conn, error)                         {}
+func (echoHandler) OnOpen(*Conn)                              {}
+func (echoHandler) OnMessage(c *Conn, op OpCode, data []byte) { c.WriteMessage(op, data) }
+func (echoHandler) OnClose(*Conn, error)                      {}
 
 // maskedFrames returns count masked binary frames of payload bytes each, back to back, as one client write.
 func maskedFrames(count, payload int) []byte {
-	var buf bytes.Buffer
+	var buf []byte
 	body := make([]byte, payload)
 	for range count {
-		ws.WriteFrame(&buf, ws.MaskFrame(ws.NewFrame(ws.OpBinary, true, body)))
+		buf = appendMaskedFrame(buf, OpBinary, true, body)
 	}
-	return buf.Bytes()
+	return buf
 }
 
 // BenchmarkOnData measures the receive path of one connection for a client write of frames pipelined messages of
@@ -456,11 +552,11 @@ func TestOrdering(t *testing.T) {
 	c := dial(t, s)
 	var buf bytes.Buffer
 	for i := range 200 {
-		wsutil.WriteClientMessage(&buf, ws.OpText, fmt.Appendf(nil, "%d", i))
+		writeClientMessage(&buf, OpText, fmt.Appendf(nil, "%d", i))
 	}
 	c.Write(buf.Bytes())
 	for i := range 200 {
-		c.expectMessage(t, ws.OpText, fmt.Appendf(nil, "%d", i))
+		c.expectMessage(t, OpText, fmt.Appendf(nil, "%d", i))
 	}
 }
 
@@ -479,17 +575,17 @@ func TestEarlyData(t *testing.T) {
 	var b bytes.Buffer
 	b.WriteString("GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
 		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
-	wsutil.WriteClientMessage(&b, ws.OpText, []byte("early"))
+	writeClientMessage(&b, OpText, []byte("early"))
 	conn.Write(b.Bytes())
 	br := bufio.NewReader(conn)
 	if resp, err := http.ReadResponse(br, nil); err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("handshake: %v %v", resp, err)
 	}
 	time.Sleep(300 * time.Millisecond) // OnOpen has returned
-	wsutil.WriteClientMessage(conn, ws.OpText, []byte("late"))
+	writeClientMessage(conn, OpText, []byte("late"))
 	c := &client{Conn: conn, reader: br}
-	c.expectMessage(t, ws.OpText, []byte("early"))
-	c.expectMessage(t, ws.OpText, []byte("late"))
+	c.expectMessage(t, OpText, []byte("early"))
+	c.expectMessage(t, OpText, []byte("late"))
 }
 
 // gateHandler blocks OnOpen of the first connection until gate is closed; the rest echo as usual.
@@ -539,14 +635,14 @@ func TestOpenDoesNotBlockExecutor(t *testing.T) {
 	t.Cleanup(func() { release.Do(func() { close(h.gate) }) }) // runs before srv.Close; failures never hang in OnOpen
 
 	blocked := dial(t, srv) // OnOpen blocks on gate
-	wsutil.WriteClientMessage(blocked, ws.OpText, []byte("a"))
+	writeClientMessage(blocked, OpText, []byte("a"))
 	time.Sleep(50 * time.Millisecond) // the data has arrived, but it must not occupy the only worker
 	other := dial(t, srv)
-	wsutil.WriteClientMessage(other, ws.OpText, []byte("b"))
-	other.expectMessage(t, ws.OpText, []byte("b"))
+	writeClientMessage(other, OpText, []byte("b"))
+	other.expectMessage(t, OpText, []byte("b"))
 
 	release.Do(func() { close(h.gate) })
-	blocked.expectMessage(t, ws.OpText, []byte("a"))
+	blocked.expectMessage(t, OpText, []byte("a"))
 }
 
 // TestServerCloseDuringOpen covers the server closing before OnOpen returns: the engine closes the
@@ -597,11 +693,11 @@ func TestClose(t *testing.T) {
 	// longer be written out), but messages received earlier are still delivered before OnClose.
 	c := dial(t, s)
 	var buf bytes.Buffer
-	wsutil.WriteClientMessage(&buf, ws.OpText, []byte("last"))
-	wsutil.WriteClientMessage(&buf, ws.OpClose, ws.NewCloseFrameBody(ws.StatusGoingAway, "bye"))
+	writeClientMessage(&buf, OpText, []byte("last"))
+	writeClientMessage(&buf, OpClose, encodeCloseBody(StatusGoingAway, "bye"))
 	c.Write(buf.Bytes())
-	c.expectClose(t, ws.StatusGoingAway)
-	if err := h.waitClose(t); err != (wsutil.ClosedError{Code: ws.StatusGoingAway, Reason: "bye"}) {
+	c.expectClose(t, StatusGoingAway)
+	if err := h.waitClose(t); err != (ClosedError{Code: StatusGoingAway, Reason: "bye"}) {
 		t.Fatalf("peer close: OnClose(%v)", err)
 	}
 	if len(h.received) != 1 || <-h.received != "last" {
@@ -610,16 +706,16 @@ func TestClose(t *testing.T) {
 
 	// A code IANA registered after RFC 6455, such as 1013 (Try Again Later), is answered like the others.
 	c = dial(t, s)
-	wsutil.WriteClientMessage(c, ws.OpClose, ws.NewCloseFrameBody(1013, "later"))
-	c.expectClose(t, 1013)
-	if err := h.waitClose(t); err != (wsutil.ClosedError{Code: 1013, Reason: "later"}) {
+	writeClientMessage(c, OpClose, encodeCloseBody(StatusTryAgainLater, "later"))
+	c.expectClose(t, StatusTryAgainLater)
+	if err := h.waitClose(t); err != (ClosedError{Code: StatusTryAgainLater, Reason: "later"}) {
 		t.Fatalf("peer close with 1013: OnClose(%v)", err)
 	}
 
 	// Close from the local side.
 	c = dial(t, s)
-	wsutil.WriteClientMessage(c, ws.OpText, []byte("close"))
-	c.expectClose(t, ws.StatusNormalClosure)
+	writeClientMessage(c, OpText, []byte("close"))
+	c.expectClose(t, StatusNormalClosure)
 	if err := h.waitClose(t); err != nil {
 		t.Fatalf("local close: OnClose(%v)", err)
 	}
@@ -643,35 +739,95 @@ func TestClose(t *testing.T) {
 func TestProtocolErrors(t *testing.T) {
 	h := &testHandler{}
 	s := newTestServer(t, h, Options{MaxMessageSize: (1 << 10)})
-	long := string(bytes.Repeat([]byte("a"), 600))
+	long := bytes.Repeat([]byte("a"), 600)
 	tests := []struct {
-		name     string
-		frames   []ws.Frame // masked before sending unless unmasked is set
-		unmasked bool
-		code     ws.StatusCode
-		err      error
+		name string
+		raw  []byte
+		code StatusCode
+		err  error
 	}{
-		{"unmasked", []ws.Frame{ws.NewTextFrame([]byte("x"))}, true, ws.StatusProtocolError, ws.ErrProtocolMaskRequired},
-		{"RSV non-zero", []ws.Frame{{Header: ws.Header{Fin: true, Rsv: ws.Rsv(true, false, false), OpCode: ws.OpText}}},
-			false, ws.StatusProtocolError, ws.ErrProtocolNonZeroRsv},
-		{"unexpected continuation frame", []ws.Frame{ws.NewFrame(ws.OpContinuation, true, nil)},
-			false, ws.StatusProtocolError, ws.ErrProtocolContinuationUnexpected},
-		{"close frame with a single byte", []ws.Frame{ws.NewCloseFrame([]byte{3})},
-			false, ws.StatusProtocolError, ws.ErrProtocolStatusCodeNotInUse},
-		{"invalid UTF-8", []ws.Frame{ws.NewTextFrame([]byte{0xff})},
-			false, ws.StatusInvalidFramePayloadData, wsutil.ErrInvalidUTF8},
-		{"message too big", []ws.Frame{ws.NewBinaryFrame(make([]byte, 2000))}, false, ws.StatusMessageTooBig, errMessageTooBig},
-		{"fragments together too big", []ws.Frame{ws.NewFrame(ws.OpText, false, []byte(long)), ws.NewFrame(ws.OpContinuation, true, []byte(long))},
-			false, ws.StatusMessageTooBig, errMessageTooBig},
+		{
+			name: "unmasked",
+			raw:  append(appendFrameHeader(nil, OpText, 1), 'x'),
+			code: StatusProtocolError,
+			err:  errMaskRequired,
+		},
+		{
+			name: "RSV non-zero",
+			raw:  appendHeader(nil, frameHeader{final: true, reserved: 0x4, opCode: OpText, masked: true, mask: testMask}),
+			code: StatusProtocolError,
+			err:  errReservedBits,
+		},
+		{
+			name: "reserved opcode",
+			raw:  appendMaskedFrame(nil, OpCode(3), true, nil),
+			code: StatusProtocolError,
+			err:  errReservedOpCode,
+		},
+		{
+			name: "fragmented control frame",
+			raw:  appendMaskedFrame(nil, OpPing, false, nil),
+			code: StatusProtocolError,
+			err:  errControlFragmented,
+		},
+		{
+			name: "control frame payload over 125 bytes",
+			raw:  appendMaskedFrame(nil, OpPing, true, make([]byte, 126)),
+			code: StatusProtocolError,
+			err:  errControlPayloadTooBig,
+		},
+		{
+			name: "unexpected continuation frame",
+			raw:  appendMaskedFrame(nil, OpContinuation, true, nil),
+			code: StatusProtocolError,
+			err:  errUnexpectedContinuation,
+		},
+		{
+			name: "new data frame during fragmented message",
+			raw:  appendMaskedFrame(appendMaskedFrame(nil, OpText, false, []byte("a")), OpText, true, []byte("b")),
+			code: StatusProtocolError,
+			err:  errUnexpectedDataFrame,
+		},
+		{
+			name: "close frame with a single byte",
+			raw:  appendMaskedFrame(nil, OpClose, true, []byte{3}),
+			code: StatusProtocolError,
+			err:  errInvalidCloseCode,
+		},
+		{
+			name: "close frame with reserved status code 1005",
+			raw:  appendMaskedFrame(nil, OpClose, true, encodeCloseBody(StatusNoStatusRcvd, "")),
+			code: StatusProtocolError,
+			err:  errInvalidCloseCode,
+		},
+		{
+			name: "close frame with invalid UTF-8 reason",
+			raw:  appendMaskedFrame(nil, OpClose, true, encodeCloseBody(StatusNormalClosure, "\xff")),
+			code: StatusProtocolError,
+			err:  errInvalidUTF8,
+		},
+		{
+			name: "invalid UTF-8",
+			raw:  appendMaskedFrame(nil, OpText, true, []byte{0xff}),
+			code: StatusInvalidFramePayloadData,
+			err:  errInvalidUTF8,
+		},
+		{
+			name: "message too big",
+			raw:  appendMaskedFrame(nil, OpBinary, true, make([]byte, 2000)),
+			code: StatusMessageTooBig,
+			err:  errMessageTooBig,
+		},
+		{
+			name: "fragments together too big",
+			raw:  appendMaskedFrame(appendMaskedFrame(nil, OpText, false, long), OpContinuation, true, long),
+			code: StatusMessageTooBig,
+			err:  errMessageTooBig,
+		},
 	}
 	for _, tt := range tests {
 		c := dial(t, s)
-		for _, f := range tt.frames {
-			if !tt.unmasked {
-				f = ws.MaskFrame(f)
-			}
-			ws.WriteFrame(c, f) // the server may close before reading it all; write errors surface in the checks below
-		}
+		c.Write(tt.raw) // the server may close before reading it all; write errors surface in the checks below
 		c.expectClose(t, tt.code)
 		if err := h.waitClose(t); err != tt.err {
 			t.Fatalf("%s: OnClose(%v), want %v", tt.name, err, tt.err)
@@ -753,7 +909,7 @@ func TestLengthNotMinimal(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := dial(t, s)
 			c.Write(slices.Concat(header, []byte{1, 2, 3, 4, 'x' ^ 1})) // the header is rejected as soon as it is there
-			c.expectClose(t, ws.StatusProtocolError)
+			c.expectClose(t, StatusProtocolError)
 			if err := h.waitClose(t); err != errLengthNotMinimal {
 				t.Fatalf("OnClose(%v), want %v", err, errLengthNotMinimal)
 			}
@@ -763,8 +919,8 @@ func TestLengthNotMinimal(t *testing.T) {
 	// The same lengths in their shortest form are served.
 	for _, size := range []int{125, 126, math.MaxUint16, math.MaxUint16 + 1} {
 		c := dial(t, s)
-		c.send(t, ws.OpBinary, true, string(make([]byte, size)))
-		c.expectMessage(t, ws.OpBinary, make([]byte, size))
+		c.send(t, OpBinary, true, string(make([]byte, size)))
+		c.expectMessage(t, OpBinary, make([]byte, size))
 	}
 }
 
@@ -810,10 +966,10 @@ func TestPanic(t *testing.T) {
 	s := newTestServer(t, h, Options{})
 	c := dial(t, s)
 	var b bytes.Buffer
-	wsutil.WriteClientMessage(&b, ws.OpText, []byte("panic"))
-	wsutil.WriteClientMessage(&b, ws.OpText, []byte("after"))
+	writeClientMessage(&b, OpText, []byte("panic"))
+	writeClientMessage(&b, OpText, []byte("after"))
 	c.Write(b.Bytes())
-	c.expectClose(t, ws.StatusInternalServerError)
+	c.expectClose(t, StatusInternalServerError)
 	if err := h.waitClose(t); err != errHandlerPanic {
 		t.Fatalf("OnClose(%v)", err)
 	}
@@ -828,7 +984,7 @@ func TestOpenPanic(t *testing.T) {
 	h := &testHandler{openPanic: true}
 	s := newTestServer(t, h, Options{})
 	c := dial(t, s)
-	c.expectClose(t, ws.StatusInternalServerError)
+	c.expectClose(t, StatusInternalServerError)
 	if err := h.waitClose(t); err != errHandlerPanic {
 		t.Fatalf("OnClose(%v)", err)
 	}
@@ -855,7 +1011,7 @@ func TestSlowHandler(t *testing.T) {
 	stream := bytes.NewBuffer(rest)
 	payload := bytes.Repeat([]byte("x"), 64*(1<<10))
 	for range 512 { // 32MB, far beyond the kernel buffer
-		wsutil.WriteClientMessage(stream, ws.OpBinary, payload)
+		writeClientMessage(stream, OpBinary, payload)
 	}
 	c.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
 	n, err := c.Write(stream.Bytes())
@@ -876,11 +1032,11 @@ func TestSlowHandler(t *testing.T) {
 		written <- err
 	}()
 	for range backlogMessages {
-		c.expectMessage(t, ws.OpBinary, nil)
+		c.expectMessage(t, OpBinary, nil)
 	}
-	c.expectMessage(t, ws.OpText, []byte("tail"))
+	c.expectMessage(t, OpText, []byte("tail"))
 	for range 512 {
-		c.expectMessage(t, ws.OpBinary, payload)
+		c.expectMessage(t, OpBinary, payload)
 	}
 	if err := <-written; err != nil {
 		t.Fatal(err)
@@ -894,20 +1050,20 @@ const backlogMessages = 1000
 // completes. When head is written in one go, the server receives them in a single read, and once the
 // callbacks are done the connection still holds an incompletely received message.
 func backlog() (head, rest []byte) {
-	var b, tail bytes.Buffer
+	var b []byte
 	for range backlogMessages {
-		wsutil.WriteClientMessage(&b, ws.OpBinary, nil)
+		b = appendMaskedFrame(b, OpBinary, true, nil)
 	}
-	ws.WriteFrame(&tail, ws.MaskFrame(ws.NewTextFrame([]byte("tail"))))
-	b.Write(tail.Bytes()[:tail.Len()-2])
-	return b.Bytes(), tail.Bytes()[tail.Len()-2:]
+	tail := appendMaskedFrame(nil, OpText, true, []byte("tail"))
+	b = append(b, tail[:len(tail)-2]...)
+	return b, tail[len(tail)-2:]
 }
 
 type nopHandler struct{}
 
-func (nopHandler) OnOpen(*Conn)                       {}
-func (nopHandler) OnMessage(*Conn, ws.OpCode, []byte) {}
-func (nopHandler) OnClose(*Conn, error)               {}
+func (nopHandler) OnOpen(*Conn)                    {}
+func (nopHandler) OnMessage(*Conn, OpCode, []byte) {}
+func (nopHandler) OnClose(*Conn, error)            {}
 
 // recordConn is a fake connection that records writes and closes; each Write or Writev is one syscall.
 type recordConn struct {
@@ -965,7 +1121,7 @@ func TestCloseTimeoutStands(t *testing.T) {
 	rc := &raceDeadlineConn{}
 	c := &Conn{connection: rc, handler: nopHandler{}, maxMessageSize: (1 << 20)}
 	rc.conn = c
-	c.OnData(clientFrames(ws.OpText, []byte("hi")))
+	c.OnData(clientFrames(OpText, []byte("hi")))
 	if until := time.Until(rc.deadline); until < closeTimeout/2 {
 		t.Fatalf("deadline %v after a concurrent Close, want closeTimeout from now", rc.deadline)
 	}
@@ -979,17 +1135,17 @@ func newCorkConn() (*Conn, *recordConn) {
 	return c, rc
 }
 
-func frame(op ws.OpCode, payload []byte) []byte {
+func frame(op OpCode, payload []byte) []byte {
 	return append(appendFrameHeader(nil, op, len(payload)), payload...)
 }
 
 // clientFrames lays out the client frames (masked) for payloads, in order.
-func clientFrames(op ws.OpCode, payloads ...[]byte) []byte {
-	var b bytes.Buffer
+func clientFrames(op OpCode, payloads ...[]byte) []byte {
+	var b []byte
 	for _, p := range payloads {
-		wsutil.WriteClientMessage(&b, op, p)
+		b = appendMaskedFrame(b, op, true, p)
 	}
-	return b.Bytes()
+	return b
 }
 
 // TestCorkWrites covers receiving several frames in one OnData: the replies written while handling them are
@@ -1001,9 +1157,9 @@ func TestCorkWrites(t *testing.T) {
 	for i := range 10 {
 		data := fmt.Appendf(nil, "m%d", i)
 		payloads = append(payloads, data)
-		want = append(want, frame(ws.OpText, data)...)
+		want = append(want, frame(OpText, data)...)
 	}
-	in := clientFrames(ws.OpText, payloads...)
+	in := clientFrames(OpText, payloads...)
 	if n := c.OnData(in); n != len(in) {
 		t.Fatalf("consumed %d bytes, want %d", n, len(in))
 	}
@@ -1011,8 +1167,8 @@ func TestCorkWrites(t *testing.T) {
 		t.Fatalf("10 frames were written %d times, want them merged into 1", len(rc.events))
 	}
 
-	c.OnData(clientFrames(ws.OpText, []byte("one")))
-	if len(rc.events) != 2 || rc.events[1].vectored || !bytes.Equal(rc.events[1].data, frame(ws.OpText, []byte("one"))) {
+	c.OnData(clientFrames(OpText, []byte("one")))
+	if len(rc.events) != 2 || rc.events[1].vectored || !bytes.Equal(rc.events[1].data, frame(OpText, []byte("one"))) {
 		t.Fatalf("single frame: %+v", rc.events[1:])
 	}
 	if c.corkBuffer.Bytes() != nil {
@@ -1032,7 +1188,7 @@ func TestCorkConcurrentWrites(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 16 {
-				if err := c.WriteMessage(ws.OpText, payload); err != nil {
+				if err := c.WriteMessage(OpText, payload); err != nil {
 					t.Error(err)
 				}
 			}
@@ -1040,7 +1196,7 @@ func TestCorkConcurrentWrites(t *testing.T) {
 	}
 	wg.Wait()
 	c.uncork()
-	want := bytes.Repeat(frame(ws.OpText, payload), 8*16)
+	want := bytes.Repeat(frame(OpText, payload), 8*16)
 	if len(rc.events) != 1 || !bytes.Equal(rc.events[0].data, want) {
 		t.Fatalf("concurrent corking result mismatch, wrote %d times", len(rc.events))
 	}
@@ -1059,10 +1215,10 @@ func TestWriteFrame(t *testing.T) {
 		rc := &recordConn{}
 		c := &Conn{connection: rc}
 		payload := bytes.Repeat([]byte("x"), tc.size)
-		if err := c.WriteMessage(ws.OpBinary, payload); err != nil {
+		if err := c.WriteMessage(OpBinary, payload); err != nil {
 			t.Fatal(err)
 		}
-		if len(rc.events) != 1 || !bytes.Equal(rc.events[0].data, frame(ws.OpBinary, payload)) {
+		if len(rc.events) != 1 || !bytes.Equal(rc.events[0].data, frame(OpBinary, payload)) {
 			t.Fatalf("%dB: wrote %d times, data mismatch", tc.size, len(rc.events))
 		}
 		if rc.events[0].vectored != tc.vectored {
@@ -1083,9 +1239,9 @@ func TestCorkLimit(t *testing.T) {
 	payloads = append(payloads, bytes.Repeat([]byte("b"), maxCorkBytes), []byte("tail"))
 	var want []byte
 	for _, p := range payloads {
-		want = append(want, frame(ws.OpBinary, p)...)
+		want = append(want, frame(OpBinary, p)...)
 	}
-	c.OnData(clientFrames(ws.OpBinary, payloads...))
+	c.OnData(clientFrames(OpBinary, payloads...))
 
 	var got []byte
 	for _, e := range rc.events {
@@ -1111,11 +1267,11 @@ func TestCorkLimit(t *testing.T) {
 // never held over to the next OnData.
 func TestCorkPerOnData(t *testing.T) {
 	c, rc := newCorkConn()
-	c.OnData(clientFrames(ws.OpText, []byte("a"), []byte("b")))
-	c.OnData(clientFrames(ws.OpText, []byte("c")))
-	want := slices.Concat(frame(ws.OpText, []byte("a")), frame(ws.OpText, []byte("b")))
+	c.OnData(clientFrames(OpText, []byte("a"), []byte("b")))
+	c.OnData(clientFrames(OpText, []byte("c")))
+	want := slices.Concat(frame(OpText, []byte("a")), frame(OpText, []byte("b")))
 	if len(rc.events) != 2 || !bytes.Equal(rc.events[0].data, want) ||
-		rc.events[1].vectored || !bytes.Equal(rc.events[1].data, frame(ws.OpText, []byte("c"))) {
+		rc.events[1].vectored || !bytes.Equal(rc.events[1].data, frame(OpText, []byte("c"))) {
 		t.Fatalf("writes: %+v", rc.events)
 	}
 }
@@ -1124,9 +1280,9 @@ func TestCorkPerOnData(t *testing.T) {
 // OnData must not leak into the next, or the replies of the later batches would go out one write each.
 func TestCorkEveryOnData(t *testing.T) {
 	c, rc := newCorkConn()
-	want := slices.Concat(frame(ws.OpText, []byte("a")), frame(ws.OpText, []byte("b")), frame(ws.OpText, []byte("c")))
+	want := slices.Concat(frame(OpText, []byte("a")), frame(OpText, []byte("b")), frame(OpText, []byte("c")))
 	for round := range 3 {
-		c.OnData(clientFrames(ws.OpText, []byte("a"), []byte("b"), []byte("c")))
+		c.OnData(clientFrames(OpText, []byte("a"), []byte("b"), []byte("c")))
 		if len(rc.events) != round+1 || !bytes.Equal(rc.events[round].data, want) {
 			t.Fatalf("batch %d: writes %+v, want each batch merged into 1", round, rc.events)
 		}
@@ -1140,14 +1296,14 @@ func TestCorkEveryOnData(t *testing.T) {
 // then the close frame, and only then is the underlying connection closed; later writes return net.ErrClosed.
 func TestCorkClose(t *testing.T) {
 	c, rc := newCorkConn()
-	c.OnData(clientFrames(ws.OpText, []byte("a"), []byte("b"), []byte("close"), []byte("c")))
-	want := slices.Concat(frame(ws.OpText, []byte("a")), frame(ws.OpText, []byte("b")))
-	closeFrame := frame(ws.OpClose, ws.NewCloseFrameBody(ws.StatusNormalClosure, ""))
+	c.OnData(clientFrames(OpText, []byte("a"), []byte("b"), []byte("close"), []byte("c")))
+	want := slices.Concat(frame(OpText, []byte("a")), frame(OpText, []byte("b")))
+	closeFrame := frame(OpClose, encodeCloseBody(StatusNormalClosure, ""))
 	if len(rc.events) != 3 || !bytes.Equal(rc.events[0].data, want) || !bytes.Equal(rc.events[1].data, closeFrame) ||
 		!rc.events[2].close {
 		t.Fatalf("close during handling: %+v", rc.events)
 	}
-	if err := c.WriteMessage(ws.OpText, []byte("after")); err != net.ErrClosed {
+	if err := c.WriteMessage(OpText, []byte("after")); err != net.ErrClosed {
 		t.Fatalf("write after close: %v", err)
 	}
 	if c.corkBuffer.Bytes() != nil {
@@ -1162,14 +1318,14 @@ func TestNoMessageAfterClose(t *testing.T) {
 	c, _ := newCorkConn()
 	h := &testHandler{received: make(chan string, 16)}
 	c.handler = h
-	in := clientFrames(ws.OpText, []byte("a"), []byte("close"), []byte("b"), []byte("c"))
+	in := clientFrames(OpText, []byte("a"), []byte("close"), []byte("b"), []byte("c"))
 	if n := c.OnData(in); n != len(in) {
 		t.Fatalf("consumed %d bytes, want %d", n, len(in))
 	}
 	if got := len(h.received); got != 2 { // "a" and "close"
 		t.Fatalf("messages left in the same batch were still delivered after Close: %d delivered, want 2", got)
 	}
-	later := clientFrames(ws.OpText, []byte("d"))
+	later := clientFrames(OpText, []byte("d"))
 	if n := c.OnData(later); n != len(later) || len(h.received) != 2 {
 		t.Fatalf("data arriving after Close: consumed %d/%d bytes, %d delivered", n, len(later), len(h.received))
 	}
@@ -1177,7 +1333,7 @@ func TestNoMessageAfterClose(t *testing.T) {
 	c, _ = newCorkConn()
 	c.handler = h
 	c.Close()
-	if c.deliver(ws.OpText, []byte("e")); len(h.received) != 2 {
+	if c.deliver(OpText, []byte("e")); len(h.received) != 2 {
 		t.Fatal("the message of a frame received during Close was delivered")
 	}
 }
@@ -1192,10 +1348,10 @@ func TestCorkPanic(t *testing.T) {
 				t.Error("panic should keep propagating up")
 			}
 		}()
-		c.OnData(clientFrames(ws.OpText, []byte("a"), []byte("b"), []byte("panic"), []byte("c")))
+		c.OnData(clientFrames(OpText, []byte("a"), []byte("b"), []byte("panic"), []byte("c")))
 	}()
-	want := slices.Concat(frame(ws.OpText, []byte("a")), frame(ws.OpText, []byte("b")))
-	closeFrame := frame(ws.OpClose, ws.NewCloseFrameBody(ws.StatusInternalServerError, ""))
+	want := slices.Concat(frame(OpText, []byte("a")), frame(OpText, []byte("b")))
+	closeFrame := frame(OpClose, encodeCloseBody(StatusInternalServerError, ""))
 	if len(rc.events) != 3 || !bytes.Equal(rc.events[0].data, want) || !bytes.Equal(rc.events[1].data, closeFrame) ||
 		!rc.events[2].close || c.corkBuffer.Bytes() != nil {
 		t.Fatalf("after panic: %+v", rc.events)
@@ -1212,20 +1368,20 @@ func TestConcurrentClients(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c, _, _, err := ws.Dial(context.Background(), "ws://"+s.Addr().String()+"/ws")
+			conn, br, err := dialConn(s.Addr().String(), nil)
 			if err != nil {
 				t.Error(err)
 				return
 			}
-			defer c.Close()
-			c.SetDeadline(time.Now().Add(5 * time.Second))
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(5 * time.Second))
 			for i := range 50 {
 				msg := fmt.Appendf(nil, "message %d", i)
-				if err := wsutil.WriteClientMessage(c, ws.OpText, msg); err != nil {
+				if err := writeClientMessage(conn, OpText, msg); err != nil {
 					t.Error(err)
 					return
 				}
-				data, _, err := wsutil.ReadServerData(c)
+				_, data, err := readServerFrame(br)
 				if err != nil || !bytes.Equal(data, msg) {
 					t.Errorf("got %q %v, want %q", data, err, msg)
 					return
@@ -1245,7 +1401,7 @@ func TestTimeouts(t *testing.T) {
 		stopped := make(chan struct{})
 		go func() {
 			defer close(stopped)
-			for ws.WriteFrame(c, ws.MaskFrame(ws.NewPingFrame(nil))) == nil {
+			for writeClientMessage(c, OpPing, nil) == nil {
 				select {
 				case <-stop:
 					return
@@ -1260,7 +1416,7 @@ func TestTimeouts(t *testing.T) {
 		h := &testHandler{}
 		s := newTestServer(t, h, Options{MessageTimeout: 200 * time.Millisecond})
 		c := dial(t, s)
-		c.send(t, ws.OpText, false, "part")
+		c.send(t, OpText, false, "part")
 		ping(c, nil) // control frames received in the meantime do not extend the deadline
 		if err := h.waitClose(t); err != os.ErrDeadlineExceeded {
 			t.Fatalf("OnClose(%v)", err)
@@ -1279,9 +1435,7 @@ func TestTimeouts(t *testing.T) {
 		// restarting the timer for each message the connection would certainly be closed.
 		var frames [][]byte
 		for i := range 16 {
-			var b bytes.Buffer
-			ws.WriteFrame(&b, ws.MaskFrame(ws.NewTextFrame(fmt.Appendf(nil, "m%02d", i))))
-			frames = append(frames, b.Bytes())
+			frames = append(frames, appendMaskedFrame(nil, OpText, true, fmt.Appendf(nil, "m%02d", i)))
 		}
 		c.Write(frames[0][:3])
 		for i := range frames {
@@ -1293,7 +1447,7 @@ func TestTimeouts(t *testing.T) {
 			c.Write(chunk)
 		}
 		for i := range frames {
-			c.expectMessage(t, ws.OpText, fmt.Appendf(nil, "m%02d", i))
+			c.expectMessage(t, OpText, fmt.Appendf(nil, "m%02d", i))
 		}
 	})
 	t.Run("timer restarts after a callback", func(t *testing.T) {
@@ -1323,8 +1477,8 @@ func TestTimeouts(t *testing.T) {
 		time.Sleep(time.Second) // let one more check pass
 		close(stop)
 		<-stopped
-		wsutil.WriteClientMessage(active, ws.OpText, []byte("alive"))
-		active.expectMessage(t, ws.OpText, []byte("alive"))
+		writeClientMessage(active, OpText, []byte("alive"))
+		active.expectMessage(t, OpText, []byte("alive"))
 	})
 }
 
@@ -1371,19 +1525,14 @@ func BenchmarkEchoScheduling(b *testing.B) {
 					})
 					payload := make([]byte, 7)
 					request := maskedFrames(pipeline, len(payload))
-					want := bytes.Repeat(frame(ws.OpBinary, payload), pipeline)
+					want := bytes.Repeat(frame(OpBinary, payload), pipeline)
 					for i := range clients {
-						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-						conn, buffered, _, err := ws.Dial(ctx, "ws://"+srv.Addr().String()+"/ws")
-						cancel()
+						conn, br, err := dialConn(srv.Addr().String(), nil)
 						if err != nil {
 							b.Fatal(err)
 						}
 						clients[i].connection = conn
-						clients[i].reader = conn
-						if buffered != nil {
-							clients[i].reader = io.MultiReader(buffered, conn)
-						}
+						clients[i].reader = br
 						clients[i].reply = make([]byte, len(want))
 						conn.SetDeadline(time.Now().Add(30 * time.Second))
 					}
@@ -1465,24 +1614,23 @@ func TestWSS(t *testing.T) {
 		}
 	})
 
-	dialer := ws.Dialer{TLSConfig: &tls.Config{InsecureSkipVerify: true}}
-	conn, _, _, err := dialer.Dial(context.Background(), "wss://"+s.Addr().String()+"/ws")
+	conn, br, err := dialConn(s.Addr().String(), &tls.Config{InsecureSkipVerify: true})
 	if err != nil {
 		t.Fatalf("dial wss: %v", err)
 	}
 	defer conn.Close()
 
 	msg := []byte("hello wss over reactor")
-	if err := wsutil.WriteClientMessage(conn, ws.OpText, msg); err != nil {
+	if err := writeClientMessage(conn, OpText, msg); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
-	reply, op, err := wsutil.ReadServerData(conn)
+	replyHeader, reply, err := readServerFrame(br)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if op != ws.OpText || !bytes.Equal(reply, msg) {
-		t.Fatalf("got %s op=%v, want %s", reply, op, msg)
+	if replyHeader.opCode != OpText || !bytes.Equal(reply, msg) {
+		t.Fatalf("got %s op=%v, want %s", reply, replyHeader.opCode, msg)
 	}
 
 	conn.Close()

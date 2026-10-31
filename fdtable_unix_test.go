@@ -129,3 +129,64 @@ func TestFdTableConcurrentReadWrite(t *testing.T) {
 	stop.Store(true)
 	wg.Wait()
 }
+
+// TestFdTableDeadlines checks page-level minDeadline tracking and pruning: a page whose minDeadline is 0 or in the
+// future is skipped, an expired connection is notified, and scanning a page folds the earliest remaining deadline (including
+// one that was pushed back) into minDeadlines.
+func TestFdTableDeadlines(t *testing.T) {
+	var table fdTable
+	srv := &Server{opts: Options{Executor: func(_ int, _ func()) {}}}
+	l := &loop{srv: srv}
+
+	c1 := &conn{fd: 1, loop: l}
+	c2 := &conn{fd: 2, loop: l}
+	c3 := &conn{fd: fdPageSize + 1, loop: l}
+	table.store(c1)
+	table.store(c2)
+	table.store(c3)
+	c1.deadline.Store(100)
+	table.noteDeadline(c1.fd, 100)
+	c2.deadline.Store(300)
+	table.noteDeadline(c2.fd, 300)
+	c3.deadline.Store(500)
+	table.noteDeadline(c3.fd, 500)
+
+	if got := table.minDeadlines[0].Load(); got != 100 {
+		t.Fatalf("page 0 minDeadline = %d, want 100", got)
+	}
+	if got := table.minDeadlines[1].Load(); got != 500 {
+		t.Fatalf("page 1 minDeadline = %d, want 500", got)
+	}
+
+	// Before any deadline has passed: nothing is notified and minDeadlines stay intact.
+	table.checkDeadlines(srv, 50)
+	if c1.state.Load()&evExpired != 0 || table.minDeadlines[0].Load() != 100 {
+		t.Fatal("checkDeadlines notified or cleared a page before its minDeadline")
+	}
+
+	// Put c1's deadline off to 400 without lowering minDeadlines[0]; scanning at 100 must see 400, notify nothing, and
+	// advance minDeadlines[0] to c2's 300.
+	c1.deadline.Store(400)
+	table.checkDeadlines(srv, 100)
+	if c1.state.Load()&evExpired != 0 || c2.state.Load()&evExpired != 0 {
+		t.Fatal("a connection whose deadline was put off was notified")
+	}
+	if got := table.minDeadlines[0].Load(); got != 300 {
+		t.Fatalf("page 0 minDeadline after scan = %d, want 300", got)
+	}
+
+	// At 300: c2 expires and is notified, minDeadlines[0] advances to c1's 400, and page 1 (500) is still untouched.
+	table.checkDeadlines(srv, 300)
+	if c2.state.Load()&evExpired == 0 {
+		t.Fatal("expired c2 was not notified")
+	}
+	if c1.state.Load()&evExpired != 0 || c3.state.Load()&evExpired != 0 {
+		t.Fatal("unexpired connection was notified")
+	}
+	if got := table.minDeadlines[0].Load(); got != 400 {
+		t.Fatalf("page 0 minDeadline = %d, want 400", got)
+	}
+	if got := table.minDeadlines[1].Load(); got != 500 {
+		t.Fatalf("page 1 minDeadline = %d, want 500", got)
+	}
+}

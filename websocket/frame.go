@@ -4,8 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
-
-	"github.com/gobwas/ws"
+	"unicode/utf8"
 )
 
 // maxSmallFrameSize is the buffer size on Conn for encoding a frame header (up to 10 bytes) or a complete small frame
@@ -13,11 +12,36 @@ import (
 // borrowing from bytepool.
 const maxSmallFrameSize = 128
 
-var errLengthNotMinimal = errors.New("websocket: payload length not encoded in the fewest bytes")
+// maxControlPayload is the maximum payload length of a control frame in bytes (RFC 6455 5.5).
+const maxControlPayload = 125
+
+var (
+	errLengthNotMinimal       = errors.New("websocket: payload length not encoded in the fewest bytes")
+	errHeaderLengthMSB        = errors.New("websocket: most significant bit of 64-bit length is set")
+	errReservedBits           = errors.New("websocket: reserved bits are non-zero")
+	errMaskRequired           = errors.New("websocket: client frame is not masked")
+	errReservedOpCode         = errors.New("websocket: reserved opcode")
+	errControlFragmented      = errors.New("websocket: control frame is fragmented")
+	errControlPayloadTooBig   = errors.New("websocket: control frame payload exceeds 125 bytes")
+	errUnexpectedContinuation = errors.New("websocket: unexpected continuation frame")
+	errUnexpectedDataFrame    = errors.New("websocket: new data frame during fragmented message")
+	errInvalidCloseCode       = errors.New("websocket: invalid close status code")
+	errInvalidUTF8            = errors.New("websocket: invalid UTF-8 in text or close frame")
+)
+
+// frameHeader is the parsed header of a WebSocket frame (RFC 6455 5.2).
+type frameHeader struct {
+	final    bool
+	reserved byte
+	opCode   OpCode
+	masked   bool
+	mask     [4]byte
+	length   int64
+}
 
 // appendFrameHeader appends a frame header with FIN=1, RSV of 0 and no mask (RFC 6455 5.2); the payload length is
 // encoded in 7, 16 or 64 bits.
-func appendFrameHeader(b []byte, op ws.OpCode, length int) []byte {
+func appendFrameHeader(b []byte, op OpCode, length int) []byte {
 	b = append(b, 0x80|byte(op))
 	switch {
 	case length <= 125:
@@ -30,20 +54,18 @@ func appendFrameHeader(b []byte, op ws.OpCode, length int) []byte {
 }
 
 // parseHeader parses the frame header at the start of data and returns it together with its length in bytes; the
-// length is 0 when data does not hold the whole header yet. It is ws.ReadHeader on a byte slice: that one reads
-// through an io.Reader and allocates a scratch buffer for every frame, which, run once per received frame, was the
-// biggest source of garbage under pipelined load.
-// Like ws.ReadHeader it checks nothing but the encoding: a 64-bit length with its most significant bit set is
-// rejected, and so is a length sent in more bytes than it needs (RFC 6455 5.2), both only once the whole header is
-// there. The rest of the validation is ws.CheckHeader's.
-func parseHeader(data []byte) (h ws.Header, n int, err error) {
+// length is 0 when data does not hold the whole header yet.
+// It checks only the length encoding: a 64-bit length with its most significant bit set is rejected, and so is a
+// length sent in more bytes than it needs (RFC 6455 5.2), both only once the whole header is there. The rest of the
+// validation is in checkHeader.
+func parseHeader(data []byte) (h frameHeader, n int, err error) {
 	if len(data) < 2 {
 		return h, 0, nil
 	}
-	h.Fin = data[0]&0x80 != 0
-	h.Rsv = (data[0] & 0x70) >> 4
-	h.OpCode = ws.OpCode(data[0] & 0x0f)
-	h.Masked = data[1]&0x80 != 0
+	h.final = data[0]&0x80 != 0
+	h.reserved = (data[0] & 0x70) >> 4
+	h.opCode = OpCode(data[0] & 0x0f)
+	h.masked = data[1]&0x80 != 0
 	size := 2 // header length: the two fixed bytes, the extended length and the mask
 	length := data[1] & 0x7f
 	switch length {
@@ -52,7 +74,7 @@ func parseHeader(data []byte) (h ws.Header, n int, err error) {
 	case 127:
 		size += 8
 	}
-	if h.Masked {
+	if h.masked {
 		size += 4
 	}
 	if len(data) < size {
@@ -60,23 +82,54 @@ func parseHeader(data []byte) (h ws.Header, n int, err error) {
 	}
 	switch length {
 	case 126:
-		if h.Length = int64(binary.BigEndian.Uint16(data[2:])); h.Length < 126 {
+		if h.length = int64(binary.BigEndian.Uint16(data[2:])); h.length < 126 {
 			return h, 0, errLengthNotMinimal
 		}
 	case 127:
 		if data[2]&0x80 != 0 {
-			return h, 0, ws.ErrHeaderLengthMSB
+			return h, 0, errHeaderLengthMSB
 		}
-		if h.Length = int64(binary.BigEndian.Uint64(data[2:])); h.Length <= math.MaxUint16 {
+		if h.length = int64(binary.BigEndian.Uint64(data[2:])); h.length <= math.MaxUint16 {
 			return h, 0, errLengthNotMinimal
 		}
 	default:
-		h.Length = int64(length)
+		h.length = int64(length)
 	}
-	if h.Masked {
-		copy(h.Mask[:], data[size-4:size])
+	if h.masked {
+		copy(h.mask[:], data[size-4:size])
 	}
 	return h, size, nil
+}
+
+// checkHeader validates a client frame header against RFC 6455 5.2–5.5. fragmented reports whether the connection is
+// in the middle of receiving a fragmented message.
+func checkHeader(h frameHeader, fragmented bool) error {
+	if h.reserved != 0 {
+		return errReservedBits
+	}
+	if !h.masked {
+		return errMaskRequired
+	}
+	switch h.opCode {
+	case OpContinuation:
+		if !fragmented {
+			return errUnexpectedContinuation
+		}
+	case OpText, OpBinary:
+		if fragmented {
+			return errUnexpectedDataFrame
+		}
+	case OpClose, OpPing, OpPong:
+		if !h.final {
+			return errControlFragmented
+		}
+		if h.length > maxControlPayload {
+			return errControlPayloadTooBig
+		}
+	default:
+		return errReservedOpCode
+	}
+	return nil
 }
 
 // applyMask unmasks payload in place using mask (RFC 6455 5.3).
@@ -99,12 +152,25 @@ func applyMask(b []byte, mask [4]byte) {
 	}
 }
 
-// checkCloseFrame is ws.CheckCloseFrameData, which knows only the codes RFC 6455 defines and rejects those IANA has
-// registered since for a peer to close with as well: 1012 (Service Restart), 1013 (Try Again Later) and 1014 (Bad
-// Gateway).
-func checkCloseFrame(code ws.StatusCode, reason string) error {
-	if code >= 1012 && code <= 1014 {
-		code = ws.StatusNormalClosure // checked as one of the defined codes: the reason must be UTF-8
+// parseClosePayload parses and validates the non-empty payload of a close frame (RFC 6455 5.5.1, 7.4).
+func parseClosePayload(payload []byte) (StatusCode, string, error) {
+	if len(payload) < 2 {
+		return 0, "", errInvalidCloseCode
 	}
-	return ws.CheckCloseFrameData(code, reason)
+	code := StatusCode(binary.BigEndian.Uint16(payload[:2]))
+	if !validCloseCode(code) {
+		return 0, "", errInvalidCloseCode
+	}
+	reason := string(payload[2:])
+	if !utf8.ValidString(reason) {
+		return 0, "", errInvalidUTF8
+	}
+	return code, reason, nil
+}
+
+// validCloseCode reports whether code may be sent in a close frame (RFC 6455 7.4 and IANA codes 1012–1014).
+func validCloseCode(code StatusCode) bool {
+	return code >= 1000 && code <= 1003 ||
+		code >= 1007 && code <= 1014 ||
+		code >= 3000 && code < 5000
 }

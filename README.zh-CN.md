@@ -14,7 +14,7 @@
 - 🧵 **空闲连接 0 协程常驻**：空闲套接字只挂在 Poller 上，不占用 goroutine，也不持有缓冲；读缓冲只在任务读取时借用。
 - ⚡ **并发安全的直接写**：`Conn.Write` / `Writev` 可在任意 goroutine 调用，永不阻塞，直接写 socket（头部 + 负载用 `writev` 一次写出）。
 - 🔌 **自定义 TCP 协议**：实现 `OnOpen` / `OnData` / `OnClose`，由你告诉引擎消费了多少字节。
-- 🛡️ **符合标准**：直接使用 `http.Handler` / `http.ServeMux`；WebSocket 遵循 RFC 6455（帧类型与协议校验使用 gobwas/ws）。
+- 🛡️ **符合标准**：直接使用 `http.Handler` / `http.ServeMux`；WebSocket 遵循 RFC 6455。
 - 🔒 **TLS 不需要每连接一个 goroutine**：HTTPS 和 WSS 只需一个选项（`fhttp.Options.TLSConfig`）；标准库 `crypto/tls` 直接在连接的回调里运行，`ftls` 可以给任意 `fnet.Handler` 加上 TLS。
 - ⏱️ **截止时间式超时**：慢速客户端无法靠一点一点送字节来占住连接。
 
@@ -179,15 +179,13 @@ import (
 
 	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/websocket"
-
-	"github.com/gobwas/ws"
 )
 
 type echo struct{}
 
-func (echo) OnOpen(c *websocket.Conn)                               {}
-func (echo) OnMessage(c *websocket.Conn, op ws.OpCode, data []byte) { c.WriteMessage(op, data) } // a complete message
-func (echo) OnClose(c *websocket.Conn, err error)                   {}
+func (echo) OnOpen(c *websocket.Conn)                                      {}
+func (echo) OnMessage(c *websocket.Conn, op websocket.OpCode, data []byte) { c.WriteMessage(op, data) } // a complete message
+func (echo) OnClose(c *websocket.Conn, err error)                          {}
 
 func main() {
 	mux := http.NewServeMux()

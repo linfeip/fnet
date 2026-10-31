@@ -1,5 +1,4 @@
-// Package websocket is a WebSocket (RFC 6455) server built on fhttp; the frame format and protocol validation use
-// github.com/gobwas/ws.
+// Package websocket is a WebSocket (RFC 6455) server built on fhttp.
 //
 // A connection's data is read and processed by fnet's executor (see fnet.Options.Executor, a private taskpool.NewDefault()
 // by default) in the connection's task: splitting frames, unmasking, replying to ping and close frames, and
@@ -18,14 +17,69 @@ package websocket
 import (
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/fhttp"
 	"github.com/linfeip/fnet/internal/httpx"
+)
 
-	"github.com/gobwas/ws"
+// OpCode is the operation code of a WebSocket frame (RFC 6455 5.2).
+type OpCode byte
+
+const (
+	OpContinuation OpCode = 0x0
+	OpText         OpCode = 0x1
+	OpBinary       OpCode = 0x2
+	OpClose        OpCode = 0x8
+	OpPing         OpCode = 0x9
+	OpPong         OpCode = 0xa
+)
+
+func (op OpCode) isControl() bool { return op&0x08 != 0 }
+
+// StatusCode is a WebSocket close status code (RFC 6455 7.4).
+type StatusCode uint16
+
+const (
+	StatusNormalClosure           StatusCode = 1000
+	StatusGoingAway               StatusCode = 1001
+	StatusProtocolError           StatusCode = 1002
+	StatusUnsupportedData         StatusCode = 1003
+	StatusNoStatusRcvd            StatusCode = 1005
+	StatusAbnormalClosure         StatusCode = 1006
+	StatusInvalidFramePayloadData StatusCode = 1007
+	StatusPolicyViolation         StatusCode = 1008
+	StatusMessageTooBig           StatusCode = 1009
+	StatusMandatoryExtension      StatusCode = 1010
+	StatusInternalServerError     StatusCode = 1011
+	StatusServiceRestart          StatusCode = 1012
+	StatusTryAgainLater           StatusCode = 1013
+	StatusBadGateway              StatusCode = 1014
+	StatusTLSHandshake            StatusCode = 1015
+)
+
+// ClosedError is passed to Handler.OnClose when the peer closed the connection with a close frame.
+type ClosedError struct {
+	Code   StatusCode
+	Reason string
+}
+
+func (e ClosedError) Error() string {
+	return "websocket: peer closed (" + strconv.Itoa(int(e.Code)) + "): " + e.Reason
+}
+
+var (
+	errHandshakeBadMethod       = errors.New("websocket: handshake request method is not GET")
+	errHandshakeBadProtocol     = errors.New("websocket: handshake HTTP version is not at least 1.1")
+	errHandshakeBadUpgrade      = errors.New("websocket: missing or invalid Upgrade header")
+	errHandshakeBadConnection   = errors.New("websocket: missing or invalid Connection header")
+	errHandshakeBadSecVersion   = errors.New("websocket: missing or multiple Sec-WebSocket-Version headers")
+	errHandshakeUpgradeRequired = errors.New("websocket: unsupported Sec-WebSocket-Version")
+	errHandshakeBadSecKey       = errors.New("websocket: missing or invalid Sec-WebSocket-Key")
 )
 
 // Handler receives the event callbacks of a WebSocket connection. OnMessage and OnClose run on a goroutine of
@@ -45,11 +99,11 @@ type Handler interface {
 	// OnOpen is called after a successful handshake and runs on the goroutine that called Upgrade.
 	OnOpen(c *Conn)
 	// OnMessage is called after a complete message has been received (fragments already reassembled); op is
-	// ws.OpText or ws.OpBinary. data is valid only within this callback (it may be the engine's read buffer), so
+	// OpText or OpBinary. data is valid only within this callback (it may be the engine's read buffer), so
 	// copy it if you need to keep it.
-	OnMessage(c *Conn, op ws.OpCode, data []byte)
+	OnMessage(c *Conn, op OpCode, data []byte)
 	// OnClose is called after the connection has closed and all previously received messages have been delivered.
-	// err is the reason for closing: nil for a local Close; wsutil.ClosedError when the peer sent a close frame;
+	// err is the reason for closing: nil for a local Close; ClosedError when the peer sent a close frame;
 	// the corresponding error on a protocol error; io.EOF when the peer disconnected outright;
 	// os.ErrDeadlineExceeded on timeout (see Options), in which case no close frame is sent.
 	OnClose(c *Conn, err error)
@@ -66,7 +120,7 @@ type Options struct {
 	MessageTimeout time.Duration
 	// IdleTimeout is the maximum time without receiving any frame while there is no incomplete message; when <=0
 	// it is unlimited (the default).
-	// To detect idle connections, the server can send a ping periodically (WriteMessage(ws.OpPing, nil)); the pong
+	// To detect idle connections, the server can send a ping periodically (WriteMessage(OpPing, nil)); the pong
 	// the client replies with refreshes the timer.
 	IdleTimeout time.Duration
 }
@@ -88,12 +142,12 @@ func (o Options) withDefaults() Options {
 // w must not be used after this call; when the handshake fails, the corresponding HTTP error has already been
 // replied and the error is returned.
 func Upgrade(w http.ResponseWriter, r *http.Request, h Handler, opts Options) error {
-	key, err := checkHandshake(r)
+	key, status, err := checkHandshake(r)
 	if err != nil {
-		if err == ws.ErrHandshakeUpgradeRequired {
+		if status == http.StatusUpgradeRequired {
 			w.Header().Set("Sec-WebSocket-Version", "13")
 		}
-		http.Error(w, err.Error(), err.(*ws.ConnectionRejectedError).StatusCode())
+		http.Error(w, err.Error(), status)
 		return err
 	}
 	header := w.Header()
@@ -124,7 +178,7 @@ func Upgrade(w http.ResponseWriter, r *http.Request, h Handler, opts Options) er
 	opened := false
 	defer func() {
 		if !opened { // OnOpen panicked: close the connection with 1011; the panic propagates upwards and is recovered by fhttp
-			c.closeWith(ws.StatusInternalServerError, errHandlerPanic)
+			c.closeWith(StatusInternalServerError, errHandlerPanic)
 		}
 		// After OnOpen returns (panic included): resume reading; if the engine closed the connection before OnOpen
 		// returned (see Conn.OnClose), make up for the missing OnClose
@@ -140,30 +194,29 @@ func Upgrade(w http.ResponseWriter, r *http.Request, h Handler, opts Options) er
 }
 
 // checkHandshake validates the handshake request per RFC 6455 4.2.1 (Host has already been validated by fhttp) and
-// returns the Sec-WebSocket-Key.
-// Every error it returns is a *ws.ConnectionRejectedError carrying a response status code.
-func checkHandshake(r *http.Request) (key string, err error) {
+// returns the Sec-WebSocket-Key or the HTTP status code and error for rejecting the handshake.
+func checkHandshake(r *http.Request) (key string, status int, err error) {
 	switch {
 	case r.Method != http.MethodGet:
-		return "", ws.ErrHandshakeBadMethod
+		return "", http.StatusMethodNotAllowed, errHandshakeBadMethod
 	case !r.ProtoAtLeast(1, 1):
-		return "", ws.ErrHandshakeBadProtocol
+		return "", http.StatusHTTPVersionNotSupported, errHandshakeBadProtocol
 	case !httpx.HasToken(r.Header["Upgrade"], "websocket"):
-		return "", ws.ErrHandshakeBadUpgrade
+		return "", http.StatusBadRequest, errHandshakeBadUpgrade
 	case !httpx.HasToken(r.Header["Connection"], "upgrade"):
-		return "", ws.ErrHandshakeBadConnection
+		return "", http.StatusBadRequest, errHandshakeBadConnection
 	}
 	// Neither of these may be repeated (RFC 6455 11.3.1, 11.3.5): the parties on the way could take different ones.
 	versions, keys := r.Header["Sec-Websocket-Version"], r.Header["Sec-Websocket-Key"]
 	switch {
 	case len(versions) != 1:
-		return "", ws.ErrHandshakeBadSecVersion
+		return "", http.StatusBadRequest, errHandshakeBadSecVersion
 	case versions[0] != "13":
-		return "", ws.ErrHandshakeUpgradeRequired
+		return "", http.StatusUpgradeRequired, errHandshakeUpgradeRequired
 	case len(keys) != 1 || !validNonce(keys[0]):
-		return "", ws.ErrHandshakeBadSecKey
+		return "", http.StatusBadRequest, errHandshakeBadSecKey
 	}
-	return keys[0], nil
+	return keys[0], 0, nil
 }
 
 // validNonce reports whether key is a Sec-WebSocket-Key: the base64 encoding of 16 bytes (RFC 6455 4.1), 24 characters.

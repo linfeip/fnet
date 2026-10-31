@@ -40,8 +40,15 @@ type fdPage [fdPageSize]atomic.Pointer[conn]
 //     in strict sequence, and remove's compare-and-swap is only a second line of defence.
 //
 // Memory grows with the fds in use, 8 bytes per fd plus the slack of the last page.
+//
+// minDeadlines[i] holds the earliest deadline (UnixNano, 0 when none) among the connections on pages[i], so
+// checkDeadlines skips any page whose earliest deadline has not yet passed without touching the page or its
+// connections. Before scanning a due page its entry is reset to 0, and the earliest remaining deadline found by the
+// scan is folded back in through noteDeadline, so a smaller deadline set concurrently during the scan is never
+// overwritten.
 type fdTable struct {
-	pages [fdPageSize]atomic.Pointer[fdPage]
+	pages        [fdPageSize]atomic.Pointer[fdPage]
+	minDeadlines [fdPageSize]atomic.Int64
 }
 
 // slot returns the slot of fd, or nil when fd is out of range or its page has not been allocated yet.
@@ -87,5 +94,76 @@ func (t *fdTable) store(c *conn) bool {
 func (t *fdTable) remove(c *conn) {
 	if s := t.slot(c.fd); s != nil {
 		s.CompareAndSwap(c, nil)
+	}
+}
+
+// noteDeadline records d as a deadline on fd's page when d is earlier than the page's minDeadline.
+func (t *fdTable) noteDeadline(fd int, d int64) {
+	if uint(fd) < maxFd && d > 0 {
+		t.lowerDeadline(fd>>fdPageShift, d)
+	}
+}
+
+func (t *fdTable) lowerDeadline(page int, d int64) {
+	min := &t.minDeadlines[page]
+	for {
+		cur := min.Load()
+		if cur != 0 && cur <= d {
+			return
+		}
+		if min.CompareAndSwap(cur, d) {
+			return
+		}
+	}
+}
+
+// checkDeadlines notifies every connection of srv whose deadline has passed by now. A page whose minDeadline is not yet
+// due is skipped without looking at its connections.
+func (t *fdTable) checkDeadlines(srv *Server, now int64) {
+	for i := range t.minDeadlines {
+		if min := t.minDeadlines[i].Load(); min == 0 || min > now {
+			continue
+		}
+		t.minDeadlines[i].Store(0)
+		page := t.pages[i].Load()
+		if page == nil {
+			continue
+		}
+		var nextMin int64
+		for j := range page {
+			c := page[j].Load()
+			if c == nil {
+				continue
+			}
+			d := c.effectiveDeadline()
+			if d == 0 {
+				continue
+			}
+			if c.loop.srv == srv && d <= now {
+				c.notify(evExpired)
+				continue
+			}
+			if nextMin == 0 || d < nextMin {
+				nextMin = d
+			}
+		}
+		if nextMin > 0 {
+			t.lowerDeadline(i, nextMin)
+		}
+	}
+}
+
+// each calls fn for every connection currently in the table.
+func (t *fdTable) each(fn func(c *conn)) {
+	for i := range t.pages {
+		page := t.pages[i].Load()
+		if page == nil {
+			continue
+		}
+		for j := range page {
+			if c := page[j].Load(); c != nil {
+				fn(c)
+			}
+		}
 	}
 }

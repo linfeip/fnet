@@ -140,17 +140,17 @@ func (s *Server) Serve() error {
 	}
 	go s.tick()
 	<-s.closing
-	// No connection is accepted from here on, and one accepted before is either in a loop's list already or closes
+	// No connection is accepted from here on, and one accepted before is either in connsByFd already or closes
 	// itself (see loop.watch).
 	s.draining.Store(true)
 	s.acceptMu.Lock()
 	s.acceptMu.Unlock() //nolint:staticcheck // an empty critical section: it waits for the accepts under way
 	s.closeListeners()  // a client connecting from now on is refused, instead of waiting in the listen queue until the server has gone
-	for _, l := range s.loops {
-		for _, c := range l.collectConns(func(*conn) bool { return true }) {
+	connsByFd.each(func(c *conn) {
+		if c.loop.srv == s {
 			c.notify(evShutdown)
 		}
-	}
+	})
 	s.openConnsWg.Wait() // the closes are carried out by the connections' tasks, which the Executor runs
 	s.stopping.Store(true)
 	for _, l := range s.loops {
@@ -201,20 +201,24 @@ func (s *Server) shutdown(err error) (first, serving bool) {
 // precision of Conn.SetDeadline.
 const deadlineCheckInterval = time.Second
 
-// tick periodically checks the connection deadlines of every sub-reactor; it stops after Serve exits.
+// tick periodically checks the connection deadlines of the server; it stops after Serve exits.
 func (s *Server) tick() {
 	ticker := time.NewTicker(deadlineCheckInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			for _, l := range s.loops {
-				l.checkDeadlines()
-			}
+			s.checkDeadlines()
 		case <-s.done:
 			return
 		}
 	}
+}
+
+// checkDeadlines notifies the connections whose deadline has passed, which then close; tick calls it once every
+// deadlineCheckInterval.
+func (s *Server) checkDeadlines() {
+	connsByFd.checkDeadlines(s, time.Now().UnixNano())
 }
 
 func (s *Server) release() {
