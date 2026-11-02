@@ -1255,7 +1255,7 @@ func TestNoDataWhilePausedAfterClose(t *testing.T) {
 }
 
 // TestNoDataAfterClose checks that OnData is not called once the handler has closed the connection, though the peer goes
-// on sending: what still arrives is read away, so that the close sends no RST, but not passed on.
+// on sending: what still arrives is read away but not passed on.
 func TestNoDataAfterClose(t *testing.T) {
 	var calls atomic.Int32
 	closed := make(chan struct{})
@@ -1342,50 +1342,5 @@ func TestListenersClosedWhileClosing(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("still accepting connections while closing")
 		}
-	}
-}
-
-// TestLingeringClose has the peer go on sending while the server answers and closes: closing the socket with that data
-// unread would answer it with an RST, so the server lingers instead, and the peer reads the answer and then EOF rather
-// than ECONNRESET. OnClose does not wait for the linger.
-func TestLingeringClose(t *testing.T) {
-	reasons := make(chan error, 1)
-	srv := startServer(t, &funcHandler{
-		data: func(c Conn, b []byte) int {
-			c.Write([]byte("answer"))
-			c.Close()
-			return len(b)
-		},
-		close: func(c Conn, err error) { reasons <- err },
-	})
-	c := dial(t, srv)
-	go c.Write(make([]byte, 4*(1<<20))) // far more than the server reads before it closes
-	c.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if got, err := io.ReadAll(c); err != nil || string(got) != "answer" {
-		t.Fatalf("received %q, err=%v, want the answer and EOF", got, err)
-	}
-	select {
-	case err := <-reasons:
-		if err != nil {
-			t.Fatalf("OnClose(%v), want nil", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("OnClose was not called")
-	}
-}
-
-// TestCloseEndsLinger checks that a lingering socket does not hold up Server.Close.
-func TestCloseEndsLinger(t *testing.T) {
-	closed := make(chan struct{}, 1)
-	srv := startServer(t, &funcHandler{
-		open:  func(c Conn) { c.Close() },
-		close: func(Conn, error) { closed <- struct{}{} },
-	})
-	dial(t, srv)
-	<-closed
-	start := time.Now()
-	srv.Close()
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("Close took %v, waiting for the linger", elapsed)
 	}
 }

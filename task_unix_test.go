@@ -204,48 +204,6 @@ func TestBatchResubmissionSerial(t *testing.T) {
 	}
 }
 
-// TestLingerEndsOnPeerClose has the peer's FIN arrive before the server closes: the linger finds the EOF at once and
-// closes the socket, rather than wait for its timeout.
-func TestLingerEndsOnPeerClose(t *testing.T) {
-	srv := startServerWith(t, &funcHandler{data: func(c Conn, b []byte) int {
-		time.Sleep(50 * time.Millisecond) // the peer's FIN arrives meanwhile
-		c.Close()
-		return len(b)
-	}}, Options{NumLoops: 1})
-	client := dial(t, srv)
-	client.Write([]byte("x"))
-	client.Close()
-	l := srv.loops[0]
-	for deadline := time.Now().Add(500 * time.Millisecond); len(loopFds(l)) != 0; time.Sleep(10 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("the socket lingered although the peer had closed")
-		}
-	}
-}
-
-// TestLingerTimeout has the peer neither send nor close after the server closes: the socket lingers, but is closed once
-// the linger times out, even though the deadline was cancelled after the close.
-func TestLingerTimeout(t *testing.T) {
-	closed := make(chan Conn, 1)
-	srv := startServerWith(t, &funcHandler{
-		open:  func(c Conn) { c.Close() },
-		close: func(c Conn, err error) { closed <- c },
-	}, Options{NumLoops: 1})
-	dial(t, srv)
-	sc := <-closed
-	sc.SetDeadline(time.Time{})
-	time.Sleep(500 * time.Millisecond)
-	l := srv.loops[0]
-	if len(loopFds(l)) != 1 {
-		t.Fatal("the socket was closed at once, without lingering")
-	}
-	for deadline := time.Now().Add(3 * time.Second); len(loopFds(l)) != 0; time.Sleep(10 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("the socket lingered past its timeout")
-		}
-	}
-}
-
 // TestDetachDeadline checks that Detach writes out what the send buffer holds within the deadline: a peer that reads
 // nothing makes it fail then, instead of blocking the caller for good.
 func TestDetachDeadline(t *testing.T) {

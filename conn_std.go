@@ -3,7 +3,6 @@
 package fnet
 
 import (
-	"io"
 	"net"
 	"slices"
 	"sync"
@@ -68,7 +67,7 @@ func (c *stdConn) Writev(bs [][]byte) (int, error) {
 func (c *stdConn) Writable() bool { return true }
 
 // Close closes the connection. Write is synchronous on this platform, so by the time Close is called all data already
-// written has been handed to the kernel; the socket is closed in stages after OnClose, see linger.
+// written has been handed to the kernel.
 func (c *stdConn) Close() error {
 	c.closeWith(closedByUser)
 	return nil
@@ -131,8 +130,8 @@ func (c *stdConn) Detach() (net.Conn, error) {
 }
 
 // closeWith records who closes the connection, which decides the err reported to OnClose, and wakes the read loop up. A
-// local close leaves the socket open, to be closed in stages after OnClose (see linger); the server closes it at once, a
-// staged close or an OnClosing under way included.
+// local close leaves the socket open, to be closed after OnClose; the server closes it at once, an OnClosing under way
+// included.
 func (c *stdConn) closeWith(by int32) {
 	// Taken while holding mu, so that neither the check in waitResumed nor SetDeadline interleaves with it (see SetDeadline).
 	c.mu.Lock()
@@ -146,17 +145,4 @@ func (c *stdConn) closeWith(by int32) {
 	} else if first {
 		c.netConnection.SetReadDeadline(time.Unix(1, 0)) // wakes a Read in progress
 	}
-}
-
-// lingerTimeout is how long a connection closed locally keeps reading what the peer still sends, see linger.
-const lingerTimeout = time.Second
-
-// linger closes a connection closed locally in stages, as on Linux/macOS (see Conn.Close): closing a socket that is still
-// receiving makes the kernel answer with an RST, which can make the peer drop what it has received but not read yet, such
-// as the last response. So only the write direction is shut down, and what the peer still sends is read away until it
-// closes too, lingerTimeout passes or the server closes the connection.
-func (c *stdConn) linger() {
-	c.netConnection.(*net.TCPConn).CloseWrite()
-	c.netConnection.SetReadDeadline(time.Now().Add(lingerTimeout))
-	io.Copy(io.Discard, c.netConnection)
 }

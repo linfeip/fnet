@@ -146,12 +146,6 @@ type Conn interface {
 	// before closing, even if an EOF from the peer is read in the meantime; on an error or an expired deadline
 	// it closes immediately. Writes after the call return net.ErrClosed, and OnData is not called again: when Close is
 	// called from another goroutine, a read that has already started still results in one more OnData callback.
-	//
-	// The socket is then closed in stages (RFC 9112 9.6), unless the peer has closed already: first only its write
-	// direction, so that a FIN follows the data, and what the peer still sends is read and discarded until it closes
-	// too, for at most about two seconds (one on other platforms). Closing a socket that is still receiving makes the kernel
-	// answer with an RST, which can make the peer drop what it has received but not read yet, such as the last
-	// response. OnClose does not wait for this.
 	Close() error
 	// PauseRead pauses reading (read backpressure): no more data is read from the socket and OnData is no
 	// longer called, until ResumeRead.

@@ -5,7 +5,6 @@ package fnet
 import (
 	"io"
 	"os"
-	"time"
 
 	"github.com/linfeip/fnet/internal/bytepool"
 	"github.com/linfeip/fnet/poll"
@@ -68,15 +67,12 @@ func (c *conn) run() {
 	defer func() {
 		if !done {
 			c.close(ErrHandlerPanic) // the task is not released, so there will be no further one
-			if c.lingering() {       // OnClose itself panicked, the linger having begun
-				c.endLinger()
-			}
 		}
 	}()
 	c.handle(ev)
 	done = true
-	// A closed connection keeps its task for good, so there is no further one, unless it lingers.
-	if !c.closed || c.lingering() {
+	// A closed connection keeps its task for good, so there is no further one.
+	if !c.closed {
 		c.release()
 	}
 }
@@ -91,12 +87,6 @@ func (c *conn) run() {
 func (c *conn) handle(ev uint32) {
 	if ev&evHup != 0 {
 		c.peerClosed = true
-	}
-	if c.closed { // events left over after the connection was closed, or for its linger
-		if c.lingering() {
-			c.linger(ev)
-		}
-		return
 	}
 	if ev&evOpen != 0 {
 		// The connection is watched here rather than where it is accepted: accepts on a listener are serialized (the
@@ -149,6 +139,11 @@ func (c *conn) handle(ev uint32) {
 
 // read reads from the socket once and invokes OnData; the read buffer is borrowed from the pool and returned after the
 // callback returns.
+//
+// Edge-triggered mode does not notify again for data that has already arrived: filling the buffer means the socket may
+// still hold data, so the connection notifies itself to run another round; not filling it means the socket is drained.
+// The exception is a closed peer: the FIN may have been merged into the same notification as the data, or have arrived
+// while reading was paused, so once the data is read there will be no further notification and we must read until EOF.
 func (c *conn) read() {
 	srv := c.loop.srv
 	size := srv.opts.ReadBufferSize
@@ -160,49 +155,32 @@ func (c *conn) read() {
 		pending = c.in.Len()
 	}
 	n, err := sysRead(c.fd, b[pending:])
-	switch err = c.afterRead(n, size-pending, err); {
-	case err == io.EOF: // the peer closed its write direction
-		if !c.halfClose() {
-			c.onClosing(io.EOF)
-			c.requestCloseOnEOF()
+	if n <= 0 {
+		switch err {
+		case unix.EAGAIN: // already drained, wait for the next edge-triggered event
+			// The peer has not closed after all: the evHup was left over from a previous connection with this fd (see
+			// loop.handleEvent), and would otherwise cost every read from now on another round.
+			c.peerClosed = false
+		case unix.EINTR: // interrupted by a signal: this edge-triggered event was used up without reading, read again
+			c.notify(evRead)
+		case nil: // EOF: the peer closed its write direction
+			if !c.halfClose() {
+				c.onClosing(io.EOF)
+				c.requestCloseOnEOF()
+			}
+		default:
+			c.requestClose(err)
 		}
 		return
-	case err != nil:
-		c.requestClose(err)
-		return
-	case n <= 0 || c.closing.Load(): // nothing read, or read away after a close request (see handle)
+	}
+	if pending+n == size || c.peerClosed {
+		c.notify(evRead)
+	}
+	if c.closing.Load() { // read away after a close request (see handle)
 		return
 	}
 	data := c.in.Join(b[:pending+n], pending)
 	c.in.Keep(data, srv.handler.OnData(c, data))
-}
-
-// afterRead takes in the result of a read of n bytes into room bytes, the one read of a round, and returns io.EOF once
-// the peer has closed its write direction, the error when the read failed, and nil otherwise. When there may be more to
-// read, it notifies the connection to run another round: edge-triggered mode does not notify again for data that has
-// already arrived, so a read that fills the room may have left some, and a read interrupted by a signal used the event
-// up without reading. The FIN of a closed peer may have been merged into the same notification as the data, or have
-// arrived while reading was paused, so once the data is read there will be no further notification and we must read
-// until EOF.
-func (c *conn) afterRead(n, room int, err error) error {
-	switch {
-	case n > 0:
-		if n == room || c.peerClosed {
-			c.notify(evRead)
-		}
-		return nil
-	case err == nil:
-		return io.EOF
-	case err == unix.EAGAIN: // already drained, wait for the next edge-triggered event
-		// The peer has not closed after all: the evHup was left over from a previous connection with this fd (see
-		// loop.handleEvent), and would otherwise cost every read from now on another round.
-		c.peerClosed = false
-		return nil
-	case err == unix.EINTR:
-		c.notify(evRead)
-		return nil
-	}
-	return err
 }
 
 // maxBacklog is how much data may wait in a connection's send buffer before the connection stops being read: what it
@@ -317,83 +295,24 @@ func (c *conn) closeIfRequested() {
 }
 
 // close closes the connection and invokes OnClose with err as the close reason; it may only be called from the
-// connection's task. The fd of a local close (err nil) stays open for a while, see beginLinger.
+// connection's task.
 func (c *conn) close(err error) {
 	if c.closed {
 		return
 	}
+	defer c.loop.srv.openConnsWg.Done()
 	c.mu.Lock()
 	c.closed = true // before the fd is closed: whoever sees closed=false while holding mu may use the fd
 	c.out.Release()
 	c.backlogged.Store(false)
 	c.mu.Unlock()
 	c.in.Release()
-	if err == nil {
-		c.beginLinger()
-	} else {
-		defer c.loop.srv.openConnsWg.Done()
-		if err != io.EOF { // once EOF is read nothing is left to read away
-			c.discardInbound()
-		}
-		c.closeFd()
+	if err != io.EOF { // once EOF is read nothing is left to read away
+		c.discardInbound()
 	}
-	c.loop.srv.handler.OnClose(c, err)
-}
-
-// lingerTimeout is how long a connection closed locally keeps reading what the peer still sends, see beginLinger. The
-// deadlines are checked once per second, so its fd is closed within two seconds.
-const lingerTimeout = time.Second
-
-// beginLinger closes the connection in stages (RFC 9112 9.6): while the peer may still be sending, closing the socket
-// makes the kernel answer what arrives with an RST, which can make the peer drop what it has received but not read yet,
-// such as the last response. So only the write direction is shut down, a FIN following the data, and the task goes on
-// reading away what arrives (see linger), until the peer closes too, a read fails, the server closes or lingerTimeout
-// has passed; the fd is closed then, and the server counts the connection as open until that happens.
-//
-// Meanwhile lingerEnd holds the end of the linger, which marks the connection as lingering and which
-// Server.checkDeadlines finds in place of the deadline, see expiredBy.
-func (c *conn) beginLinger() {
-	unix.Shutdown(c.fd, unix.SHUT_WR)
-	end := clockNow() + int64(lingerTimeout)
-	c.lingerEnd.Store(end)
-	connsByFd.noteDeadline(c.fd, end)
-	// What has arrived already raises no new event: it is read here once, and linger goes on in another round only when
-	// there was something, the EOF included. Usually there is nothing yet, and the peer's FIN brings the next event.
-	if _, err := c.discardInbound(); err != unix.EAGAIN {
-		c.notify(evRead)
-	}
-}
-
-// lingering reports whether the connection is closed but its fd is still open, see beginLinger.
-func (c *conn) lingering() bool { return c.lingerEnd.Load() != 0 }
-
-// linger handles the events of a lingering connection: it reads away what arrives, a read per round as in read, and
-// closes the fd once the peer has closed, a read has failed, the linger has timed out or the server is closing.
-func (c *conn) linger(ev uint32) {
-	if ev&evShutdown != 0 || ev&evExpired != 0 && c.expiredBy(clockNow()) {
-		c.endLinger()
-		return
-	}
-	if ev&evRead == 0 {
-		return
-	}
-	n, err := c.discardInbound()
-	if c.afterRead(n, c.loop.srv.opts.ReadBufferSize, err) != nil {
-		c.endLinger() // the peer has closed too, or the read failed
-	}
-}
-
-// endLinger closes the fd of a lingering connection.
-func (c *conn) endLinger() {
-	c.lingerEnd.Store(0) // no longer lingering: no task runs after this one (see run)
-	c.closeFd()
-	c.loop.srv.openConnsWg.Done()
-}
-
-// closeFd takes the connection out of the table and closes its fd.
-func (c *conn) closeFd() {
 	connsByFd.remove(c) // before the fd is closed: a closed fd may immediately be reused by a new connection
 	unix.Close(c.fd)
+	c.loop.srv.handler.OnClose(c, err)
 }
 
 // abandon closes a connection that could not be watched, before OnOpen; it may only be called from the connection's
@@ -406,13 +325,12 @@ func (c *conn) abandon() {
 	c.loop.srv.openConnsWg.Done()
 }
 
-// discardInbound reads away data that has arrived but has not been read yet, and returns the result of the read: closing
-// while the socket holds unread data sends an RST, which may make the peer discard the data it has already sent (such as
-// a close frame). It reads only once, since it must not keep reading while the peer keeps sending.
-func (c *conn) discardInbound() (int, error) {
+// discardInbound reads away data that has arrived but has not been read yet: closing while the socket holds unread data
+// sends an RST, which may make the peer discard the data it has already sent (such as a close frame).
+// It reads only once, since it must not keep reading while the peer keeps sending.
+func (c *conn) discardInbound() {
 	size := c.loop.srv.opts.ReadBufferSize
 	buf := bytepool.Get(size)
-	n, err := sysRead(c.fd, buf.Bytes()[:size])
+	sysRead(c.fd, buf.Bytes()[:size])
 	buf.Release()
-	return n, err
 }

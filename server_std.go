@@ -188,9 +188,6 @@ func (s *Server) serveConn(c *stdConn) {
 		defer recoverPanic(nil)
 		s.handler.OnClose(c, err)
 	}()
-	if err == nil {
-		c.linger()
-	}
 	c.netConnection.Close()
 	s.mu.Lock()
 	delete(s.conns, c)

@@ -39,7 +39,7 @@ type Server struct {
 	acceptMu       sync.RWMutex
 	acceptRetrying atomic.Bool // a retry of the accepts that ran out of resources is pending, see retryAccept
 
-	openConnsWg sync.WaitGroup // connections not yet closed: closed means OnClose returned and the fd is closed (see conn.endLinger); Serve waits for them before exiting
+	openConnsWg sync.WaitGroup // connections not yet closed: closed means OnClose returned and the fd is closed; Serve waits for them before exiting
 	workersWg   sync.WaitGroup // the loops' workers; Serve stops them once every connection has closed
 	draining    atomic.Bool    // Serve is closing every connection: one being opened closes itself (see loop.watch)
 	stopping    atomic.Bool    // the workers are to exit

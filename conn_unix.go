@@ -38,10 +38,9 @@ type conn struct {
 	ctx        any
 	in         bytepool.Buffer // unconsumed inbound data, accessed only by the task
 
-	mu        sync.Mutex
-	out       bytepool.Buffer // send buffer, the data to send is out.Bytes()[outPos:]; empty when nothing is backed up
-	deadline  atomic.Int64    // close deadline on the engine's clock (see clockStart), 0 means no deadline; written by any goroutine, checked by the event loop
-	lingerEnd atomic.Int64    // when the linger of a connection closed locally ends, on the engine's clock, 0 while it does not linger; see beginLinger
+	mu       sync.Mutex
+	out      bytepool.Buffer // send buffer, the data to send is out.Bytes()[outPos:]; empty when nothing is backed up
+	deadline atomic.Int64    // close deadline on the engine's clock (see clockStart), 0 means no deadline; written by any goroutine, checked by the event loop
 
 	outPos     int
 	closeErr   error          // close reason: nil means an explicit close, io.EOF means the peer closed its write direction; both drain the send buffer before closing, any other reason closes at once (see closesNow)
@@ -183,8 +182,8 @@ func (c *conn) ResumeRead() {
 func (c *conn) Detach() (net.Conn, error) {
 	for !c.takeOver() {
 		c.mu.Lock()
-		// A closed connection keeps its task for good (see run), unless it lingers. One that is closing may not become
-		// idle for minutes: its peer takes none of the send buffer, and the events it keeps getting each run a task.
+		// A closed connection keeps its task for good (see run). One that is closing may not become idle for minutes:
+		// its peer takes none of the send buffer, and the events it keeps getting each run a task.
 		closed := c.closed || c.closing.Load()
 		c.mu.Unlock()
 		if closed {
@@ -235,8 +234,7 @@ func (c *conn) Detach() (net.Conn, error) {
 	return &detachedConn{TCPConn: nc.(*net.TCPConn), in: in}, nil
 }
 
-// SetDeadline only records the deadline, which the server checks once per second (see Server.checkDeadlines). A
-// lingering connection goes by the end of its linger instead, see expiredBy.
+// SetDeadline only records the deadline, which the server checks once per second (see Server.checkDeadlines).
 func (c *conn) SetDeadline(t time.Time) {
 	if t.IsZero() {
 		c.deadline.Store(0)
@@ -255,20 +253,10 @@ var clockStart = time.Now()
 // clockNow reads the engine's clock, see clockStart.
 func clockNow() int64 { return int64(time.Since(clockStart)) }
 
-// effectiveDeadline returns the connection's close deadline, or the end of the linger once the connection lingers (see
-// beginLinger); 0 means no deadline.
-func (c *conn) effectiveDeadline() int64 {
-	if end := c.lingerEnd.Load(); end != 0 {
-		return end
-	}
-	return c.deadline.Load()
-}
-
-// expiredBy reports whether the deadline, or the end of the linger once the connection lingers, has passed by now. The
-// task checks it again on evExpired: Server.checkDeadlines found it so, but it may have been put off since, even by the
-// callback of this very round.
+// expiredBy reports whether the deadline has passed by now. The task checks it again on evExpired:
+// Server.checkDeadlines found it so, but it may have been put off since, even by the callback of this very round.
 func (c *conn) expiredBy(now int64) bool {
-	d := c.effectiveDeadline()
+	d := c.deadline.Load()
 	return d != 0 && d <= now
 }
 
