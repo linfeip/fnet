@@ -218,7 +218,7 @@ func (s *Server) tick() {
 // checkDeadlines notifies the connections whose deadline has passed, which then close; tick calls it once every
 // deadlineCheckInterval.
 func (s *Server) checkDeadlines() {
-	connsByFd.checkDeadlines(s, time.Now().UnixNano())
+	connsByFd.checkDeadlines(clockNow())
 }
 
 func (s *Server) release() {

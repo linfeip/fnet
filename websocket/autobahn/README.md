@@ -35,7 +35,7 @@ docker compose -f websocket/autobahn/docker-compose.yml up
 
 用浏览器打开 `websocket/autobahn/reports/servers/index.html`，点击用例可查看收发的帧与关闭过程。
 
-- `OK`、`NON-STRICT`、`INFORMATIONAL` 视为通过。
+- `OK`、`NON-STRICT`、`INFORMATIONAL` 视为通过；`run.sh` 遇到其他结果，或没有写出新报告时，以非零状态退出。
 - `websocket` 在分片消息接收完整后才校验 UTF-8，不是逐帧尽早失败，因此 6.4.* 预期为 `NON-STRICT`。
 
 报告由容器以 root 身份写入，在宿主机上删除 `reports` 目录可能需要 `sudo`。

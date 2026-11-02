@@ -34,7 +34,10 @@ func (c *conn) readRequest(w *response, r request) int {
 		w.bytesReader.Reset(nil)
 		return status
 	}
-	w.req = *req.WithContext(c.state)
+	// The copy WithContext makes stays on the stack: the Handler gets the request http.ReadRequest allocated, its own to
+	// keep after it returns, as on net/http.
+	*req = *req.WithContext(c.state)
+	w.req = req
 	return 0
 }
 

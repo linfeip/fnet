@@ -101,7 +101,7 @@ Handler 还可以实现几个可选接口：`ClosingHandler`（`OnClosing`，引
 
 ### HTTP
 
-Handler 就是普通的 `net/http` Handler，但**交给 Handler 的请求是池化对象：只在本次 `ServeHTTP` 调用期间有效**。返回后不能继续持有它，也不要持有由它派生的东西（`r.Header`、`r.URL`、`r.Body`）——放进字段、缓存，或交给 Handler 里启动的 goroutine 都不行：同一 worker 上的后续请求会复用这个对象和它背后的缓冲，之后再用读到的是别的请求的数据（数据竞争）。需要跨 Handler 存活的请自行拷贝，详见[当前限制](#当前限制)。下面是 [examples/http](examples/http/main.go) 的精简版，完整示例还包含 PUT/PATCH/DELETE/OPTIONS、multipart 上传和文件下载：
+Handler 就是普通的 `net/http` Handler。有一点不同：在 `fnet` 路径上，`Request.Context` 随连接结束（见上文），而不是在 `ServeHTTP` 返回时结束，所以等它来做请求收尾的东西（goroutine、`context.AfterFunc`）要等到那时。下面是 [examples/http](examples/http/main.go) 的精简版，完整示例还包含 PUT/PATCH/DELETE/OPTIONS、multipart 上传和文件下载：
 
 ```go
 package main
@@ -224,7 +224,7 @@ go test ./http -run XXX -bench GET   # GET 压测：fhttp、net/http、fiber对�
 
 ## 当前限制
 
-- 没有写超时，发送缓冲也没有硬上限：积压超过 64KB 时连接暂停读取，从不读取的客户端不会让回复无限堆积；但应用自己主动写出的数据（例如广播）仍会让它增长，除非像 `fhttp` 那样先检查 `Conn.Writable`，再等待 `WritableHandler.OnWritable`。反过来，客户端在开始读取之前写入的数据超过 socket 缓冲能容纳的量，就会和回显它的连接互相等待而卡死，与阻塞式服务端的行为相同。
+- 没有写超时，发送缓冲也没有硬上限：积压超过 64KB 时连接暂停读取，从不读取的客户端不会让回复无限堆积；但应用自己主动写出的数据（例如广播）仍会让它增长，除非像 `fhttp` 那样先检查 `Conn.Writable`，再等待 `WritableHandler.OnWritable`（`websocket` 也提供同样的一对接口）。反过来，客户端在开始读取之前写入的数据超过 socket 缓冲能容纳的量，就会和回显它的连接互相等待而卡死，与阻塞式服务端的行为相同。
 - `fhttp` 交给 `net/http` 的请求沿用 `net/http` 的默认超时，读完请求头后不再有超时：读取流式请求体的 Handler 请用 `http.ResponseController.SetReadDeadline` 自行限定。
 - 不支持 HTTP/2：HTTPS 只有 HTTP/1.1。不支持 `http.Flusher` / `http.Hijacker`（超过 64KB 的响应体按 64KB 一段边写边发），交给 `net/http` 的连接除外：带流式请求体的请求，以及 Server-Sent Events（`Accept` 中带有 `text/event-stream` 的请求，`EventSource` 总会发送）。这类连接和在 `net/http` 上一样，每条占一个 goroutine。
 - 向慢客户端写大响应体的 Handler，在 `Write` 等待期间会一直占用 Handler executor 的一个 goroutine，和其他阻塞的 Handler 一样。默认 Handler executor 与引擎执行器分开，所以 Handler 等待时引擎仍能继续刷新连接。如果有大量大响应要发给慢客户端，请通过 `fhttp.Options.Executor` 配置足够 worker。在 Linux/macOS 以外的平台，这样的写在内核里阻塞，没有时间限制。

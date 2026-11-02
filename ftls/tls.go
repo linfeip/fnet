@@ -54,7 +54,11 @@ func NewHandler(handler fnet.Handler, config *tls.Config, handshakeTimeout time.
 	if handshakeTimeout == 0 {
 		handshakeTimeout = defaultHandshakeTimeout
 	}
-	return &Handler{handler: handler, config: serverConfig(config), handshakeTimeout: handshakeTimeout}
+	return &Handler{
+		handler:          handler,
+		config:           serverConfig(config),
+		handshakeTimeout: handshakeTimeout,
+	}
 }
 
 // serverConfig returns a copy of config with dynamic record sizing turned off: otherwise crypto/tls cuts the first
@@ -80,9 +84,12 @@ func serverConfig(config *tls.Config) *tls.Config {
 
 // OnOpen sets up the handshake, which OnData runs.
 func (h *Handler) OnOpen(c fnet.Conn) {
-	tc := &Conn{Conn: c, handler: h.handler}
+	tc := &Conn{
+		Conn:        c,
+		handler:     h.handler,
+		handshaking: true,
+	}
 	tc.tlsConn = tls.Server((*rawConn)(tc), h.config)
-	tc.handshaking = true
 	c.SetContext(tc)
 	if h.handshakeTimeout > 0 {
 		c.SetDeadline(time.Now().Add(h.handshakeTimeout))
@@ -99,9 +106,10 @@ func (h *Handler) OnData(c fnet.Conn, data []byte) int {
 	}
 	tc.ciphertext = data
 	defer func() { tc.ciphertext = nil }()
-	if !tc.handshaking || tc.open() {
-		tc.drain()
+	if tc.handshaking && !tc.open() {
+		return len(data)
 	}
+	tc.drain()
 	return len(data)
 }
 
@@ -125,7 +133,7 @@ func (h *Handler) OnClosing(c fnet.Conn, err error) {
 // been asked about once.
 func (h *Handler) OnHalfClose(c fnet.Conn) bool {
 	tc := c.Context().(*Conn)
-	return tc.readClosed || !tc.handshaking && tc.halfClose()
+	return !tc.handshaking && tc.halfClose()
 }
 
 // OnWritable passes the engine's OnWritable on to the handler, if it is an fnet.WritableHandler: what waits in the send
@@ -190,7 +198,7 @@ type Conn struct {
 	detached   atomic.Bool
 
 	handshaking bool // the handshake has not succeeded yet, so the handler has not seen the connection
-	readClosed  bool // the peer's close_notify was read and the handler kept the connection open, so nothing more is read
+	readClosed  bool // the peer closed its write direction (close_notify or FIN) and the handler kept it open: no more reads
 }
 
 // Context returns the user data bound to the connection.
@@ -290,11 +298,13 @@ func (c *Conn) open() bool {
 		return false
 	}
 	if c.tlsConn.Handshake() != nil { // the handshake is over: this returns its error at once
-		c.Conn.Close() // the handler never sees the connection
+		// The handler never sees the connection. resume stays set: data arriving until the close resumes the coroutine that
+		// ended instead of starting another.
+		c.Conn.Close()
 		return false
 	}
-	c.handshaking = false
 	c.resume, c.stop, c.yield = nil, nil, nil
+	c.handshaking = false
 	c.Conn.SetDeadline(time.Time{}) // the handshake's; the handler sets its own
 	c.handler.OnOpen(c)
 	return true
@@ -311,7 +321,6 @@ func (c *Conn) drain() {
 			return
 		}
 		if err == io.EOF && c.halfClose() {
-			c.readClosed = true
 			return
 		}
 		if err != nil {
@@ -349,8 +358,15 @@ func (c *Conn) readPlaintext() (err error) {
 // halfClose asks the handler, if it is an fnet.HalfCloseHandler, whether to keep the connection open now that the peer has
 // closed its write direction: with its close_notify, or at the TCP level (see Handler.OnHalfClose).
 func (c *Conn) halfClose() bool {
+	if c.readClosed {
+		return true
+	}
 	h, ok := c.handler.(fnet.HalfCloseHandler)
-	return ok && h.OnHalfClose(c)
+	if !ok || !h.OnHalfClose(c) {
+		return false
+	}
+	c.readClosed = true
+	return true
 }
 
 // deliver passes the plaintext on to the handler, unless reading is paused; data holds the new plaintext after room for
@@ -411,22 +427,24 @@ func (r *rawConn) LocalAddr() net.Addr {
 
 // The engine's writes never block and its reads are fed by OnData, so deadlines only apply to the detached connection.
 func (r *rawConn) SetDeadline(t time.Time) error {
-	return r.setDeadline(t, net.Conn.SetDeadline)
+	if r.netConn != nil {
+		return r.netConn.SetDeadline(t)
+	}
+	return nil
 }
 
 func (r *rawConn) SetReadDeadline(t time.Time) error {
-	return r.setDeadline(t, net.Conn.SetReadDeadline)
+	if r.netConn != nil {
+		return r.netConn.SetReadDeadline(t)
+	}
+	return nil
 }
 
 func (r *rawConn) SetWriteDeadline(t time.Time) error {
-	return r.setDeadline(t, net.Conn.SetWriteDeadline)
-}
-
-func (r *rawConn) setDeadline(t time.Time, set func(net.Conn, time.Time) error) error {
-	if r.netConn == nil {
-		return nil
+	if r.netConn != nil {
+		return r.netConn.SetWriteDeadline(t)
 	}
-	return set(r.netConn, t)
+	return nil
 }
 
 // detachedConn is the connection Detach returns: Read first returns the plaintext OnData left unconsumed.

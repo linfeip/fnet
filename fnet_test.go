@@ -1254,6 +1254,31 @@ func TestNoDataWhilePausedAfterClose(t *testing.T) {
 	}
 }
 
+// TestNoDataAfterClose checks that OnData is not called once the handler has closed the connection, though the peer goes
+// on sending: what still arrives is read away, so that the close sends no RST, but not passed on.
+func TestNoDataAfterClose(t *testing.T) {
+	var calls atomic.Int32
+	closed := make(chan struct{})
+	srv := startServer(t, &funcHandler{
+		data: func(c Conn, b []byte) int {
+			calls.Add(1)
+			c.Close()
+			return len(b)
+		},
+		close: func(Conn, error) { close(closed) },
+	})
+	c := dial(t, srv)
+	go c.Write(make([]byte, 4<<20)) // far more than a read takes
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnClose was not called")
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("OnData was called %d times, want once: the connection was closed in the first", n)
+	}
+}
+
 // TestDeadlineWhileWriting checks that the deadline closes a connection whose callback writes far more than a peer that
 // does not read takes: on Linux/macOS the writes are buffered, on other platforms they block until the deadline.
 func TestDeadlineWhileWriting(t *testing.T) {
@@ -1327,7 +1352,7 @@ func TestLingeringClose(t *testing.T) {
 	reasons := make(chan error, 1)
 	srv := startServer(t, &funcHandler{
 		data: func(c Conn, b []byte) int {
-			c.Write([]byte("answer")) // fails once closed, when more data comes in the round that closes
+			c.Write([]byte("answer"))
 			c.Close()
 			return len(b)
 		},

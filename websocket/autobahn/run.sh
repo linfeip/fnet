@@ -15,13 +15,18 @@ cleanup() {
     echo "=== Stopping test server (PID: $SERVER_PID) ==="
     kill -TERM "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
-    rm -f autobahn_server
+    rm -f autobahn_server "$started"
 }
 trap cleanup EXIT INT TERM
 
 sleep 1
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then # it could not listen (say :9001 is in use): the run would test another server
+    echo "Error: the echo server did not start, see its output above."
+    exit 1
+fi
 
 mkdir -p reports
+started=$(mktemp) # the report must be newer than this, or the run wrote none
 
 if command -v docker >/dev/null 2>&1; then
     echo "=== Running Autobahn Testsuite via Docker ==="
@@ -42,4 +47,15 @@ else
     exit 1
 fi
 
-echo "=== Autobahn test complete! Reports generated in $DIR/reports/servers/index.html ==="
+# Autobahn counts OK, NON-STRICT and INFORMATIONAL as passing; any other result of a case, or of its close, fails the run.
+results="$DIR/reports/servers/index.json"
+if [ ! "$results" -nt "$started" ]; then
+    echo "Error: the run wrote no report to $results."
+    exit 1
+fi
+failed=$(grep -oE '"behavior(Close)?": "[^"]*"' "$results" | grep -cvE '"(OK|NON-STRICT|INFORMATIONAL)"$' || true)
+if [ "$failed" -ne 0 ]; then
+    echo "=== Autobahn found $failed failing results, see $DIR/reports/servers/index.html ==="
+    exit 1
+fi
+echo "=== Autobahn test passed! Reports generated in $DIR/reports/servers/index.html ==="

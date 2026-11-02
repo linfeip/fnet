@@ -391,6 +391,21 @@ func TestRequestContextValues(t *testing.T) {
 	}
 }
 
+// TestRequestOutlivesHandler checks that a Handler may keep its *http.Request after it returns, as on net/http (gin's
+// Context.Copy hands it to a goroutine that way): it is the Handler's own, and later requests do not reuse it.
+func TestRequestOutlivesHandler(t *testing.T) {
+	kept := make(chan *http.Request, 2)
+	s := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { kept <- r }), Options{})
+	br := dialRaw(t, s, "GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n")
+	readResp(t, br)
+	readResp(t, br)
+	for _, want := range []string{"/a", "/b"} {
+		if r := <-kept; r.URL == nil || r.URL.Path != want {
+			t.Fatalf("a request kept after its Handler returned reads %v, want %s", r.URL, want)
+		}
+	}
+}
+
 // TestCloseDuringFirstRequest closes the client while the Handler of the connection's first request runs, the Handler
 // leaving the request's context alone: onClose then reads what the worker set up for the connection (run with -race).
 func TestCloseDuringFirstRequest(t *testing.T) {

@@ -20,12 +20,14 @@
 // otherwise in chunks (on HTTP/1.0, until the connection closes). As on net/http, the header is what the Handler left
 // when it wrote the status, with WriteHeader or with the first Write: later changes to it do not count, though a buffered
 // response is serialized only when the Handler returns. A Write that would go past the Content-Length the Handler
-// declared fails with http.ErrContentLength; a buffered body that falls short of it goes out with the length it has.
+// declared fails with http.ErrContentLength, and a body that falls short of it goes out cut short, the connection closing
+// after it, as on net/http: the client sees the response is incomplete.
 // http.Flusher and http.Hijacker are not supported, except for the requests served by net/http (see below). Protocol
 // upgrades (such as WebSocket) are done through Upgrade.
 //
 // On the fnet path, Request.Context is canceled when the client connection closes, or once Upgrade or net/http has
-// taken the connection over (see below); a response Write after the close returns an error.
+// taken the connection over (see below), not when the Handler returns as on net/http: whatever waits on it to clean up
+// after a request (a goroutine, context.AfterFunc) waits until then. A response Write after the close returns an error.
 //
 // A request whose body is not buffered (larger than MaxBufferedBodyBytes, or framed in an unusual way) is served by
 // net/http instead: the connection is detached from fnet and handed to an internal http.Server running the same
@@ -243,12 +245,21 @@ func (h engineHandler) OnOpen(c fnet.Conn) {
 	hc.setDeadline() // a new connection counts as idle; there is no concurrent access yet, so mu need not be held
 }
 
-// OnWritable resumes answering a client that has taken the responses waiting for it, see conn.onWritable.
+// OnWritable resumes answering a client that has taken the responses waiting for it (see conn.onWritable), or passes it
+// on to the protocol that took the connection over, if it is a WritableProtocol.
 func (h engineHandler) OnWritable(c fnet.Conn) {
-	if hc, ok := c.Context().(*conn); ok {
+	hc, p := route(c)
+	if p == nil {
 		hc.onWritable()
+	} else if wp, ok := p.(WritableProtocol); ok {
+		wp.OnWritable()
 	}
 }
+
+// OnResume hands the connection's context to the protocol that took the connection over, if any, as soon as the protocol
+// resumes reading (websocket does once its OnOpen has returned) rather than with the data that follows: a client that
+// only receives would otherwise keep the HTTP state for good.
+func (h engineHandler) OnResume(c fnet.Conn) { route(c) }
 
 // OnHalfClose keeps the connection open for the requests of a client that closed its write direction, see conn.halfClose.
 func (h engineHandler) OnHalfClose(c fnet.Conn) bool {
@@ -256,17 +267,33 @@ func (h engineHandler) OnHalfClose(c fnet.Conn) bool {
 	return ok && hc.halfClose()
 }
 
-// OnData and OnClose find the connection's state in its context: the HTTP conn, or, once a protocol has taken the
-// connection over, that protocol itself (see conn.onData), which leaves the HTTP state out of the path of every
-// message the protocol receives.
-func (h engineHandler) OnData(c fnet.Conn, data []byte) int {
+// route returns what the connection's events go to, which its context holds: the HTTP conn while HTTP is in charge of the
+// connection, otherwise the protocol that took it over (see Upgrade). The protocol takes over the context the first time,
+// in a callback as SetContext must be: the HTTP state can go then, and the protocol's later events find it at once.
+func route(c fnet.Conn) (*conn, Protocol) {
 	ctx := c.Context()
-	if hc, ok := ctx.(*conn); ok {
-		return hc.onData(data)
+	hc, ok := ctx.(*conn)
+	if !ok {
+		return nil, ctx.(Protocol)
 	}
-	return ctx.(Protocol).OnData(data)
+	p := hc.protocol.Load()
+	if p == nil {
+		return hc, nil
+	}
+	c.SetContext(*p)
+	return nil, *p
 }
 
+func (h engineHandler) OnData(c fnet.Conn, data []byte) int {
+	hc, p := route(c)
+	if p != nil {
+		return p.OnData(data)
+	}
+	return hc.onData(data)
+}
+
+// OnClose goes to the HTTP conn while the context holds it: the HTTP state is closed first, then the close is passed on
+// to a protocol that took the connection over (see conn.onClose).
 func (h engineHandler) OnClose(c fnet.Conn, err error) {
 	ctx := c.Context()
 	if hc, ok := ctx.(*conn); ok {

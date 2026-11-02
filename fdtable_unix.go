@@ -41,7 +41,7 @@ type fdPage [fdPageSize]atomic.Pointer[conn]
 //
 // Memory grows with the fds in use, 8 bytes per fd plus the slack of the last page.
 //
-// minDeadlines[i] holds the earliest deadline (UnixNano, 0 when none) among the connections on pages[i], so
+// minDeadlines[i] holds the earliest deadline (on the engine's clock, 0 when none) among the connections on pages[i], so
 // checkDeadlines skips any page whose earliest deadline has not yet passed without touching the page or its
 // connections. Before scanning a due page its entry is reset to 0, and the earliest remaining deadline found by the
 // scan is folded back in through noteDeadline, so a smaller deadline set concurrently during the scan is never
@@ -117,9 +117,10 @@ func (t *fdTable) lowerDeadline(page int, d int64) {
 	}
 }
 
-// checkDeadlines notifies every connection of srv whose deadline has passed by now. A page whose minDeadline is not yet
-// due is skipped without looking at its connections.
-func (t *fdTable) checkDeadlines(srv *Server, now int64) {
+// checkDeadlines notifies every connection whose deadline has passed by now, whatever its server: a server checking at the
+// same time may find the page's minDeadline reset by this scan and skip the page. A page whose minDeadline is not yet due
+// is skipped without looking at its connections.
+func (t *fdTable) checkDeadlines(now int64) {
 	for i := range t.minDeadlines {
 		if min := t.minDeadlines[i].Load(); min == 0 || min > now {
 			continue
@@ -139,7 +140,7 @@ func (t *fdTable) checkDeadlines(srv *Server, now int64) {
 			if d == 0 {
 				continue
 			}
-			if c.loop.srv == srv && d <= now {
+			if d <= now {
 				c.notify(evExpired)
 				continue
 			}

@@ -102,7 +102,7 @@ A handler can also implement optional interfaces: `ClosingHandler` (`OnClosing`,
 
 ### HTTP
 
-Handlers are plain `net/http` ones, but **the request handed to a Handler is a pooled object: it is valid only within that `ServeHTTP` call**. Do not keep it — or anything derived from it (`r.Header`, `r.URL`, `r.Body`) — after it returns, including in a goroutine the Handler starts: later requests on the same worker reuse the object and the buffers behind it, so using it then reads another request's data (a data race). Copy what must outlive the Handler; see [Limitations](#limitations). A shorter version of [examples/http](examples/http/main.go), which also covers PUT/PATCH/DELETE/OPTIONS, multipart uploads and file downloads:
+Handlers are plain `net/http` ones. One difference: on the `fnet` path `Request.Context` ends with the connection (see above), not when `ServeHTTP` returns, so whatever waits on it to clean up after a request (a goroutine, `context.AfterFunc`) waits until then. A shorter version of [examples/http](examples/http/main.go), which also covers PUT/PATCH/DELETE/OPTIONS, multipart uploads and file downloads:
 
 ```go
 package main
@@ -225,7 +225,7 @@ go test ./http -run XXX -bench GET   # GET benchmark: fhttp vs net/http vs fiber
 
 ## Limitations
 
-- There is no write timeout, and the send buffer has no hard upper bound: a connection is not read while more than 64KB waits in it, so the replies to a client that never reads stop piling up, but what the application writes on its own (say a broadcast) still makes it grow, unless it checks `Conn.Writable` and waits for `WritableHandler.OnWritable`, as `fhttp` does. Conversely, a client that writes more than the socket buffers hold before it starts reading deadlocks against a connection that echoes it, just as it would against a blocking server.
+- There is no write timeout, and the send buffer has no hard upper bound: a connection is not read while more than 64KB waits in it, so the replies to a client that never reads stop piling up, but what the application writes on its own (say a broadcast) still makes it grow, unless it checks `Conn.Writable` and waits for `WritableHandler.OnWritable`, as `fhttp` does (`websocket` has the same pair). Conversely, a client that writes more than the socket buffers hold before it starts reading deadlocks against a connection that echoes it, just as it would against a blocking server.
 - A request `fhttp` hands to `net/http` has `net/http`'s default timeouts, none once its header has been read: a Handler reading a streamed body bounds it with `http.ResponseController.SetReadDeadline`.
 - No HTTP/2: HTTPS is HTTP/1.1 only. No `http.Flusher` / `http.Hijacker` (a response body over 64KB goes out while it is written, in pieces of 64KB), except on connections handed to `net/http`: those with a streamed request body, and Server-Sent Events (a request whose `Accept` mentions `text/event-stream`, as `EventSource` always sends), which then cost a goroutine each, as on `net/http`.
 - A Handler writing a large body to a slow client holds a goroutine of the Handler executor while its `Write` waits, as any blocking Handler does. The default Handler executor is separate from the engine executor, so the engine can continue flushing connections while Handlers wait. If many large responses go to slow clients, configure a Handler executor with enough workers through `fhttp.Options.Executor`. On other platforms than Linux/macOS such a write blocks in the kernel, with no time limit.

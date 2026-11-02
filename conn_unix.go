@@ -3,11 +3,11 @@
 package fnet
 
 import (
-	"bytes"
 	"net"
 	"net/netip"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,7 +28,7 @@ type conn struct {
 	state      atomic.Uint32 // pending events and scheduledBit, see notify
 	readPaused atomic.Bool   // reading has been paused
 	backlogged atomic.Bool   // out holds data; written while holding mu, read lock-free by the task (see handle)
-	closing    bool          // a close has been requested, see requestClose; accessed while holding mu
+	closing    atomic.Bool   // a close has been requested, see requestClose; written while holding mu, read lock-free by the task (see read)
 	closed     bool          // written only by the task while holding the lock, so the task itself can read it lock-free
 	peerClosed bool          // the peer closed or an error occurred (see evHup), accessed only by the task
 	readClosed bool          // EOF has been read and a HalfCloseHandler kept the connection open, so it is not read again; accessed only by the task
@@ -40,8 +40,8 @@ type conn struct {
 
 	mu        sync.Mutex
 	out       bytepool.Buffer // send buffer, the data to send is out.Bytes()[outPos:]; empty when nothing is backed up
-	deadline  atomic.Int64    // close deadline (UnixNano), 0 means no deadline; written by any goroutine, checked by the event loop
-	lingerEnd atomic.Int64    // when the linger of a connection closed locally ends (UnixNano), 0 while it does not linger; see beginLinger
+	deadline  atomic.Int64    // close deadline on the engine's clock (see clockStart), 0 means no deadline; written by any goroutine, checked by the event loop
+	lingerEnd atomic.Int64    // when the linger of a connection closed locally ends, on the engine's clock, 0 while it does not linger; see beginLinger
 
 	outPos     int
 	closeErr   error          // close reason: nil means an explicit close, io.EOF means the peer closed its write direction; both drain the send buffer before closing, any other reason closes at once (see closesNow)
@@ -68,7 +68,7 @@ func (c *conn) LocalAddr() net.Addr {
 
 func (c *conn) Write(b []byte) (int, error) {
 	c.mu.Lock()
-	if c.closed || c.closing {
+	if c.closed || c.closing.Load() {
 		c.mu.Unlock()
 		return 0, net.ErrClosed
 	}
@@ -96,7 +96,7 @@ func (c *conn) Write(b []byte) (int, error) {
 
 func (c *conn) Writev(bs [][]byte) (int, error) {
 	c.mu.Lock()
-	if c.closed || c.closing {
+	if c.closed || c.closing.Load() {
 		c.mu.Unlock()
 		return 0, net.ErrClosed
 	}
@@ -146,10 +146,12 @@ func afterDirectWrite(n int, err error) (int, error) {
 	return n, nil
 }
 
-// compactOut first reclaims the space of the already-sent part when the send buffer's capacity is not enough to
-// append size bytes; the caller must hold mu.
+// compactOut makes room in the send buffer for size more bytes by dropping the part already sent, when the room after
+// the data is not enough and that part is at least as large as what is still to be sent: moving what is left then costs
+// no more than it frees, whereas a backlog kept close to the buffer's capacity would otherwise be moved whole for every
+// small write. Short of that, Write grows the buffer. The caller must hold mu.
 func (c *conn) compactOut(size int) {
-	if c.outPos > 0 && cap(c.out.Bytes())-c.out.Len() < size {
+	if c.outPos > 0 && cap(c.out.Bytes())-c.out.Len() < size && c.outPos >= c.out.Len()-c.outPos {
 		c.out.Discard(c.outPos)
 		c.outPos = 0
 	}
@@ -183,7 +185,7 @@ func (c *conn) Detach() (net.Conn, error) {
 		c.mu.Lock()
 		// A closed connection keeps its task for good (see run), unless it lingers. One that is closing may not become
 		// idle for minutes: its peer takes none of the send buffer, and the events it keeps getting each run a task.
-		closed := c.closed || c.closing
+		closed := c.closed || c.closing.Load()
 		c.mu.Unlock()
 		if closed {
 			return nil, net.ErrClosed
@@ -191,19 +193,21 @@ func (c *conn) Detach() (net.Conn, error) {
 		runtime.Gosched() // a task is queued or running; callbacks return quickly
 	}
 	c.mu.Lock()
-	if c.closing {
+	if c.closing.Load() {
 		c.mu.Unlock()
 		c.release() // the task carries out the close
 		return nil, net.ErrClosed
 	}
 	c.closed = true // writes now fail; close does nothing, so OnClose is never called
-	out := bytes.Clone(c.out.Bytes()[c.outPos:])
-	c.out.Release()
-	c.outPos = 0
+	// Nothing touches the buffers again, so they are taken over rather than copied: Detach writes out the send buffer and
+	// returns it to the pool, and the inbound data leaves the pool with the detached connection.
+	out, outPos := c.out, c.outPos
+	c.out, c.outPos = bytepool.Buffer{}, 0
 	c.backlogged.Store(false)
 	c.mu.Unlock()
-	in := bytes.Clone(c.in.Bytes())
-	c.in.Release()
+	defer out.Release()
+	in := c.in.Bytes()
+	c.in = bytepool.Buffer{}
 
 	// Deregister explicitly: net.FileConn duplicates the fd, and an epoll registration lasts as long as any descriptor
 	// of the socket stays open. The table entry goes before the fd is closed, which frees the fd number for reuse.
@@ -216,12 +220,12 @@ func (c *conn) Detach() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(out) > 0 {
+	if pending := out.Bytes()[outPos:]; len(pending) > 0 {
 		// This write blocks, and the peer may not be reading: the connection's deadline bounds it, see SetDeadline.
 		if d := c.deadline.Load(); d > 0 {
-			nc.SetWriteDeadline(time.Unix(0, d))
+			nc.SetWriteDeadline(clockStart.Add(time.Duration(d)))
 		}
-		_, err := nc.Write(out)
+		_, err := nc.Write(pending)
 		nc.SetWriteDeadline(time.Time{})
 		if err != nil {
 			nc.Close()
@@ -238,10 +242,18 @@ func (c *conn) SetDeadline(t time.Time) {
 		c.deadline.Store(0)
 		return
 	}
-	d := max(int64(t.Sub(time.Unix(0, 0))), 1)
+	d := max(int64(t.Sub(clockStart)), 1)
 	c.deadline.Store(d)
 	connsByFd.noteDeadline(c.fd, d)
 }
+
+// clockStart is where the engine's clock starts: deadlines are kept as the time since then, which a deadline made with
+// time.Now, as they all are, measures on the monotonic clock, as net.Conn's deadlines do. A step of the wall clock (an NTP
+// correction, a virtual machine resumed) then neither expires connections at once nor holds them past their time.
+var clockStart = time.Now()
+
+// clockNow reads the engine's clock, see clockStart.
+func clockNow() int64 { return int64(time.Since(clockStart)) }
 
 // effectiveDeadline returns the connection's close deadline, or the end of the linger once the connection lingers (see
 // beginLinger); 0 means no deadline.
@@ -271,13 +283,13 @@ func sockaddrToAddrPort(sa unix.Sockaddr) netip.AddrPort {
 	return netip.AddrPort{}
 }
 
-// inet6AddrPort builds an IPv6 address and port; a non-zero scope id becomes the zone, named after its interface.
+// inet6AddrPort builds an IPv6 address and port; a non-zero scope id becomes the zone, as the interface's number: its
+// name would cost a look at every interface per connection (a netlink dump on Linux), and the number serves all the same
+// to dial back.
 func inet6AddrPort(addr [16]byte, port uint16, scopeID uint32) netip.AddrPort {
 	ip := netip.AddrFrom16(addr)
 	if scopeID != 0 {
-		if ifi, err := net.InterfaceByIndex(int(scopeID)); err == nil {
-			ip = ip.WithZone(ifi.Name)
-		}
+		ip = ip.WithZone(strconv.FormatUint(uint64(scopeID), 10))
 	}
 	return netip.AddrPortFrom(ip, port)
 }

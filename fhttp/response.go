@@ -49,7 +49,7 @@ var (
 // conn.serve).
 type response struct {
 	conn           *conn
-	req            http.Request
+	req            *http.Request // the request being answered, see conn.readRequest
 	bufferedReader *bufio.Reader
 	bytesReader    bytes.Reader
 	header         http.Header
@@ -108,7 +108,7 @@ func (w *response) release() {
 		clear(w.header)
 	}
 	w.conn = nil
-	w.req = http.Request{}
+	w.req = nil
 	w.writeErr = nil
 	w.committed = committedHeader{}
 	responsePool.Put(w)
@@ -300,8 +300,9 @@ func (w *response) finish() bool {
 	switch {
 	case w.bodyWriting.discardBody:
 		body = nil
-	case w.streamed && w.remaining > 0:
-		// The Handler wrote less than the Content-Length it declared: what goes out ends there, and so does the connection.
+	case w.remaining > 0:
+		// The Handler wrote less than the Content-Length it declared: what goes out ends there, and so does the connection,
+		// as on net/http, so that the client sees the response cut short.
 		keepAlive = false
 	case w.bodyWriting.chunked: // body holds at least a byte, see stream
 		appendChunkSize(&w.out, len(body))
@@ -387,14 +388,14 @@ func appendHeaderValues(b *bytepool.Buffer, name string, values []string) {
 }
 
 // writeHeader finishes serializing the response header into the output and decides how the body goes out and whether to
-// keep the connection alive; content is the start of the body, to detect its type from. A streamed body (see stream) has
-// the Content-Length the Handler declared, if any; otherwise its length is not known, and it goes out in chunks on
-// HTTP/1.1, and until the connection closes on HTTP/1.0.
+// keep the connection alive; content is the start of the body, to detect its type from. The body has the Content-Length
+// the Handler declared, if any; otherwise a buffered body has its own length, and a streamed one (see stream) goes out in
+// chunks on HTTP/1.1, and until the connection closes on HTTP/1.0.
 func (w *response) writeHeader(content []byte, streamed bool) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	req := &w.req
+	req := w.req
 	http11 := req.ProtoAtLeast(1, 1)
 	isHEAD := req.Method == http.MethodHead
 	bodyAllowed := w.bodyAllowed()
@@ -422,7 +423,7 @@ func (w *response) writeHeader(content []byte, streamed bool) {
 	case !bodyAllowed:
 	case w.status == http.StatusResetContent:
 		appendContentLength(b, 0)
-	case committed.declaredLength >= 0 && (isHEAD || streamed):
+	case committed.declaredLength >= 0:
 		appendContentLength(b, committed.declaredLength)
 	case !streamed:
 		if !isHEAD || w.body.Len() > 0 {

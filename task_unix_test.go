@@ -276,18 +276,18 @@ func TestDetachDeadline(t *testing.T) {
 	}
 }
 
-// TestSetDeadlineOutOfRange checks that a deadline past what UnixNano counts (the year 2262) never expires, and one
-// before it (the year 1678) has expired, rather than either wrapping around.
+// TestSetDeadlineOutOfRange checks that a deadline further away than a time.Duration counts (about 292 years) never
+// expires, and one as long ago has expired, rather than either wrapping around.
 func TestSetDeadlineOutOfRange(t *testing.T) {
 	var c conn
 	c.SetDeadline(time.Unix(1<<62, 0))
-	if c.expiredBy(time.Now().UnixNano()) {
+	if c.expiredBy(clockNow()) {
 		t.Fatal("a deadline in the far future has expired")
 	}
-	// Before 1678 UnixNano overflows, which must not turn a time long past into one far ahead.
+	// A time long past must not turn into one far ahead.
 	for _, past := range []time.Time{time.Date(1000, 1, 1, 0, 0, 0, 0, time.UTC), time.Unix(-1, 0)} {
 		c.SetDeadline(past)
-		if !c.expiredBy(time.Now().UnixNano()) {
+		if !c.expiredBy(clockNow()) {
 			t.Fatalf("a deadline of %v has not expired", past)
 		}
 	}

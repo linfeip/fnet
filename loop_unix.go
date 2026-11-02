@@ -176,12 +176,15 @@ func (w *worker) runBatch(l *loop) {
 // An event left over for a connection that has already closed finds no connection. The fd may even have been reused
 // by now, by a connection of this loop (which then only gets a spurious event, and reading it finds nothing) or of
 // another one (which must not be notified through this loop).
+//
+// A writable event alone matters only to a backlog, which Write records before it notifies the connection itself: kqueue
+// reports one whenever the peer's ACKs free send space, and epoll one when the connection is watched.
 func (l *loop) handleEvent(fd int, ev poll.Event) (listener bool) {
 	c := connsByFd.lookup(fd)
 	if c == nil {
 		return slices.Contains(l.listenerFds, fd)
 	}
-	if c.loop == l {
+	if c.loop == l && (ev != poll.EventWrite || c.backlogged.Load()) {
 		c.notify(uint32(ev))
 	}
 	return false

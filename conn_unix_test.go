@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/linfeip/fnet/internal/bytepool"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -37,6 +39,45 @@ func TestSocketOptions(t *testing.T) {
 				t.Fatalf("TCP_NODELAY=%d SO_KEEPALIVE=%d TCP_KEEPINTVL=%d err=%v", r.noDelay, r.keepAlive, r.interval, r.err)
 			}
 		})
+	}
+}
+
+// TestInet6AddrPort checks that a scope id becomes the zone of the address by its number, which dials back like a name.
+func TestInet6AddrPort(t *testing.T) {
+	addr := [16]byte{0: 0xfe, 1: 0x80, 15: 1}
+	for _, tt := range []struct {
+		scopeID uint32
+		want    string
+	}{{0, "[fe80::1]:80"}, {7, "[fe80::1%7]:80"}} {
+		if got := inet6AddrPort(addr, 80, tt.scopeID).String(); got != tt.want {
+			t.Errorf("scope id %d: got %s, want %s", tt.scopeID, got, tt.want)
+		}
+	}
+}
+
+// TestCompactOut checks when the send buffer drops the part already sent to make room: only when the room after the data
+// is short and the part is at least as large as what is left to send, so that it never moves more than it frees.
+func TestCompactOut(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		sent, live    int // the part already sent, and what is left to send, of a full 4KB buffer
+		size          int // what is to be appended
+		wantCompacted bool
+	}{
+		{"room left", 0, 1 << 10, 512, false},
+		{"sent part as large as the rest", 2 << 10, 2 << 10, 512, true},
+		{"sent part smaller than the rest", 512, 3584, 512, false},
+	} {
+		var c conn
+		c.out = bytepool.Get(4 << 10)
+		c.out.Write(make([]byte, tt.sent+tt.live))
+		c.outPos = tt.sent
+		c.compactOut(tt.size)
+		if compacted := c.outPos == 0 && tt.sent > 0; compacted != tt.wantCompacted || c.out.Len()-c.outPos != tt.live {
+			t.Errorf("%s: compacted=%v with %d bytes left to send, want compacted=%v and %d", tt.name, compacted,
+				c.out.Len()-c.outPos, tt.wantCompacted, tt.live)
+		}
+		c.out.Release()
 	}
 }
 

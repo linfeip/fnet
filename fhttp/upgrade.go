@@ -23,6 +23,13 @@ type Protocol interface {
 	OnClose(err error)
 }
 
+// WritableProtocol is a Protocol that holds back what it writes while the connection's Writable reports false, see
+// fnet.WritableHandler: OnWritable is called, like the other callbacks, once the connection takes more again.
+type WritableProtocol interface {
+	Protocol
+	OnWritable()
+}
+
 // Upgrade switches the protocol of the connection that w belongs to (for example to WebSocket) from inside a
 // Handler: the protocol created by newProtocol(underlying connection) takes over the inbound data, then w.Header()
 // is written out with 101 Switching Protocols. The protocol is switched before the response, so all data the peer
@@ -57,6 +64,7 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 		return http.ErrNotSupported
 	}
 	w.upgraded = true
+	w.out.Truncate(w.outStart) // what the Handler wrote of its own response is dropped: the 101, or the 400 below, replaces it
 	// Reading paused for a full queue (see maxPipeline) resumes before the new protocol takes over: resumed by serve
 	// afterwards, it would undo a pause the protocol makes itself.
 	c.mu.Lock()
@@ -90,7 +98,6 @@ func (c *conn) upgrade(w *response, newProtocol func(fnet.Conn) Protocol) error 
 	c.mu.Unlock()
 
 	b := &w.out
-	b.Truncate(w.outStart)
 	b.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
 	for name, values := range w.header {
 		if name != "Content-Length" && name != "Transfer-Encoding" && validName(name) { // a 1xx response has neither (RFC 9110 8.6, RFC 9112 6.1)

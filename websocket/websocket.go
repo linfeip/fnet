@@ -7,7 +7,9 @@
 // connection occupies no goroutine.
 //
 // When the application cannot keep up, the connection is not read again until the callback returns; the data stays
-// in the kernel buffer and TCP flow control makes the peer slow down (backpressure).
+// in the kernel buffer and TCP flow control makes the peer slow down (backpressure). A handler that sends on its own,
+// such as a broadcast, checks Conn.Writable (see WritableHandler), so that a client that does not read cannot pile up
+// what is sent to it.
 //
 // The handshake is completed by calling Upgrade from fhttp's http.Handler, after which websocket takes over the
 // connection. Every message must be received in full within MessageTimeout; the idle timeout is off by default (see
@@ -109,6 +111,14 @@ type Handler interface {
 	OnClose(c *Conn, err error)
 }
 
+// WritableHandler is a Handler that holds back what it sends on its own while Conn.Writable reports false: OnWritable is
+// called, like OnMessage, once the connection takes more again, see fnet.WritableHandler. Linux/macOS only: elsewhere
+// writes block instead.
+type WritableHandler interface {
+	Handler
+	OnWritable(c *Conn)
+}
+
 // Options are the WebSocket parameters; the zero value is the default configuration.
 type Options struct {
 	// MaxMessageSize is the maximum number of bytes of a single message (after fragments are reassembled); when
@@ -144,8 +154,11 @@ func (o Options) withDefaults() Options {
 func Upgrade(w http.ResponseWriter, r *http.Request, h Handler, opts Options) error {
 	key, status, err := checkHandshake(r)
 	if err != nil {
-		if status == http.StatusUpgradeRequired {
+		switch status {
+		case http.StatusUpgradeRequired:
 			w.Header().Set("Sec-WebSocket-Version", "13")
+		case http.StatusMethodNotAllowed:
+			w.Header().Set("Allow", http.MethodGet) // a 405 lists the methods the resource takes (RFC 9110 15.5.6)
 		}
 		http.Error(w, err.Error(), status)
 		return err

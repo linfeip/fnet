@@ -16,11 +16,12 @@ import (
 	"github.com/linfeip/fnet/internal/httpx"
 )
 
-// maxPipeline and maxQueuedBytes bound the requests queued for processing on a connection, by number and by size: once
-// either is reached the connection is not read until the worker has answered them all (see conn.serve), so a client
-// that pipelines deeply, or sends requests faster than the Handlers answer them, is slowed down by TCP flow control
-// instead of being held in memory. The requests of the data at hand are queued in full first, so the queue may go past
-// them by what one read brings (see conn.onData).
+// maxPipeline and maxQueuedBytes bound a connection's request queue: maxPipeline the requests taken in since it was last
+// empty (the length of its array, see conn.pop), maxQueuedBytes the size of those not answered yet. Once either is
+// reached the connection is not read until the worker has answered them all (see conn.serve), so a client that pipelines
+// deeply, or sends requests faster than the Handlers answer them, is slowed down by TCP flow control instead of being held
+// in memory. The requests of the data at hand are queued in full first, so the queue may go past them by what one read
+// brings (see conn.onData).
 const (
 	maxPipeline    = 128
 	maxQueuedBytes = 64 << 10
@@ -77,6 +78,7 @@ type conn struct {
 	halfClosed bool          // the client has closed its write direction while requests were still to be answered; guarded by mu
 	broken     bool          // a protocol error has occurred, all subsequent data is discarded; accessed only by fnet's callbacks
 	closed     atomic.Bool   // set by onClose while holding mu; read without it by the response's writes
+	head       int32         // queue[head:] are the requests not taken yet (see pop); guarded by mu, placed last to fill the room left
 }
 
 // workerState is what the worker of a connection is doing (see serve); it changes while holding mu. At most one worker
@@ -110,21 +112,15 @@ func (c *conn) setDeadline() {
 }
 
 // onData splits out the complete request messages and enqueues them all at once, returning the number of consumed
-// bytes.
+// bytes; it gets the data while HTTP is in charge of the connection (see route).
 func (c *conn) onData(data []byte) int {
-	if p := c.protocol.Load(); p != nil {
-		// The protocol takes over the context from here on, which a callback may set. Nothing of the HTTP state is
-		// needed any more: Upgrade released the queue, and closed only stops an upgrade that has already happened.
-		c.connection.SetContext(*p)
-		return (*p).OnData(data)
-	}
 	if c.broken {
 		return len(data)
 	}
 	c.mu.Lock()
 	if c.protocol.Load() != nil {
-		// The protocol was switched (it is stored while holding mu) after the check above: this data was sent by a client
-		// that did not wait for the upgrade response, so it must not be executed as HTTP.
+		// The protocol was switched (it is stored while holding mu) after route looked: this data was sent by a client that
+		// did not wait for the upgrade response, so it must not be executed as HTTP.
 		c.broken = true
 		c.mu.Unlock()
 		c.connection.Close()
@@ -162,30 +158,39 @@ func (c *conn) onData(data []byte) int {
 	return consumed
 }
 
-// maxRetainedMessageBytes is the largest request message buffer retained in the connection's queue slot across requests.
-const maxRetainedMessageBytes = 4 << 10
-
 // push puts a copy of the request message data framed as m (or, when data is nil, the status code status) into the
 // queue; the caller holds mu.
 func (c *conn) push(data []byte, m message, status int16) {
 	var msg bytepool.Buffer
-	if i := len(c.queue); i < cap(c.queue) {
-		slot := &c.queue[:i+1][i]
-		msg = slot.msg
-		slot.msg = bytepool.Buffer{}
-	}
-	msg.Write(data) // handle owns a dequeued buffer; releaseQueue releases those still in the queue
+	msg.Write(data) // the queue's until pop hands it to the worker, which releases it once handled (see serveQueue)
 	c.queue = append(c.queue, request{msg: msg, header: int32(m.header), status: status, chunked: m.chunked})
 	c.queuedBytes += int32(len(data))
 }
 
-// releaseQueue releases every buffer held in c.queue, including any retained in its spare capacity; the caller holds mu.
-func (c *conn) releaseQueue() {
-	full := c.queue[:cap(c.queue)]
-	for i := range full {
-		full[i].msg.Release()
+// pop takes the first request not taken yet out of the queue, which has one; the caller holds mu. Once it has taken the
+// last, the queue starts over at the front of its array, which it keeps unless a burst of pipelined requests made it
+// large (see maxRetainedQueueCapacity).
+func (c *conn) pop() request {
+	r := c.queue[c.head]
+	c.queue[c.head] = request{}
+	c.head++
+	c.queuedBytes -= int32(r.msg.Len())
+	if int(c.head) == len(c.queue) {
+		c.queue, c.head = c.queue[:0], 0
+		if cap(c.queue) > maxRetainedQueueCapacity {
+			c.queue = nil
+		}
 	}
-	c.queue, c.queuedBytes = nil, 0
+	return r
+}
+
+// releaseQueue releases the buffers of the requests not taken yet; the caller holds mu.
+func (c *conn) releaseQueue() {
+	pending := c.queue[c.head:]
+	for i := range pending {
+		pending[i].msg.Release()
+	}
+	c.queue, c.head, c.queuedBytes = nil, 0, 0
 }
 
 // halfClose is called when the client has closed its write direction, which the engine finds out only after it has read
@@ -249,8 +254,6 @@ func (c *conn) serve() {
 
 // serveQueue is the loop of serve.
 func (c *conn) serveQueue(w *response) {
-	var retained bytepool.Buffer
-	defer func() { retained.Release() }()
 	for {
 		c.mu.Lock()
 		// The client is not taking the responses: answering more would only pile them up in fnet's send buffer.
@@ -272,12 +275,6 @@ func (c *conn) serveQueue(w *response) {
 				c.closeFromWorker()
 				return
 			}
-			if !c.closed.Load() && cap(c.queue) > 0 && cap(retained.Bytes()) > 0 {
-				slot := &c.queue[:1][0]
-				if cap(slot.msg.Bytes()) == 0 {
-					slot.msg, retained = retained, bytepool.Buffer{}
-				}
-			}
 			c.worker = workerIdle
 			resume := c.readPaused // everything queued has been answered, see maxPipeline
 			c.readPaused = false
@@ -295,24 +292,11 @@ func (c *conn) serveQueue(w *response) {
 			c.mu.Unlock()
 			return
 		}
-		r := c.queue[0]
-		n := copy(c.queue, c.queue[1:])
-		c.queue[n] = request{}
-		if n == 0 && cap(c.queue) > maxRetainedQueueCapacity {
-			c.releaseQueue()
-		} else {
-			c.queue = c.queue[:n]
-			c.queuedBytes -= int32(r.msg.Len())
-		}
+		r := c.pop()
 		c.mu.Unlock()
 
 		keepAlive := c.handle(w, r)
-		if keepAlive && cap(retained.Bytes()) == 0 && cap(r.msg.Bytes()) <= maxRetainedMessageBytes {
-			r.msg.Reset()
-			retained = r.msg
-		} else {
-			r.msg.Release()
-		}
+		r.msg.Release()
 		if !keepAlive {
 			w.flush()
 			c.closeFromWorker()
@@ -351,7 +335,7 @@ func (c *conn) handle(w *response, r request) bool {
 		w.writeError(status)
 		return false
 	}
-	req := &w.req
+	req := w.req
 	if c.state.remoteAddr == "" {
 		c.state.remoteAddr = c.connection.RemoteAddr().String()
 	}
@@ -366,16 +350,11 @@ func (c *conn) handle(w *response, r request) bool {
 
 	w.start()
 	ok := c.serveHTTP(w, req)
-	keepAlive := false
-	switch {
-	case !ok:
-	case w.upgraded: // Upgrade already wrote the response: on success the connection goes to the new protocol, on failure it closes
-		keepAlive = c.protocol.Load() != nil && w.writeErr == nil
+	if w.upgraded { // Upgrade already wrote the response: on success the connection goes to the new protocol, on failure it closes
 		c.endContext()
-	default:
-		keepAlive = w.finish()
+		return ok && c.protocol.Load() != nil && w.writeErr == nil
 	}
-	return keepAlive
+	return ok && w.finish()
 }
 
 // serveHTTP runs the Handler; when the Handler panics it logs the panic (except for http.ErrAbortHandler) and
@@ -388,7 +367,7 @@ func (c *conn) serveHTTP(w *response, req *http.Request) (ok bool) {
 		if req.MultipartForm != nil {
 			req.MultipartForm.RemoveAll()
 		}
-		if !ok && !w.streamed {
+		if !ok && !w.streamed && !w.upgraded { // Upgrade has already written out, or dropped, what the Handler wrote
 			w.out.Truncate(w.outStart)
 		}
 		if err := recover(); err != nil {

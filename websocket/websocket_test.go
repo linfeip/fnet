@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/linfeip/fnet"
 	"github.com/linfeip/fnet/fhttp"
@@ -616,6 +617,61 @@ func newGateServer(t *testing.T, h Handler, engine fnet.Options) *fhttp.Server {
 	return srv
 }
 
+// writableHandler is a testHandler that is a WritableHandler too: OnOpen writes far more than the socket takes, as a
+// broadcast to a client that does not read would, and reports Writable then and in OnWritable.
+type writableHandler struct {
+	testHandler
+	backlogged chan bool // Writable once OnOpen has written
+	writable   chan bool // Writable in OnWritable
+}
+
+func (h *writableHandler) OnOpen(c *Conn) {
+	payload := make([]byte, 64<<10)
+	for range 256 { // 16MB
+		c.WriteMessage(OpBinary, payload)
+	}
+	h.testHandler.OnOpen(c)
+	h.backlogged <- c.Writable()
+}
+
+func (h *writableHandler) OnWritable(c *Conn) {
+	select {
+	case h.writable <- c.Writable():
+	default:
+	}
+}
+
+// TestOnWritable checks that Writable reports false while more than fnet lets wait is still to be sent, and that a
+// WritableHandler gets OnWritable once the client has taken enough of it.
+func TestOnWritable(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("elsewhere a write blocks, and Writable always reports true")
+	}
+	h := &writableHandler{backlogged: make(chan bool, 1), writable: make(chan bool, 1)}
+	h.closed = make(chan error, 1)
+	c := dial(t, newGateServer(t, h, fnet.Options{}))
+	if <-h.backlogged {
+		t.Fatal("Writable with 16MB still to be sent")
+	}
+	time.Sleep(100 * time.Millisecond) // OnOpen has returned: OnWritable comes only from then on
+	go io.Copy(io.Discard, c)
+	select {
+	case writable := <-h.writable:
+		if !writable {
+			t.Fatal("OnWritable, but Writable reports false")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnWritable did not come once the client read")
+	}
+}
+
+// TestConnSize keeps the state every WebSocket connection holds in its 288-byte size class.
+func TestConnSize(t *testing.T) {
+	if size := unsafe.Sizeof(Conn{}); size > 288 {
+		t.Fatalf("Conn is %d bytes, want no more than 288", size)
+	}
+}
+
 // TestOpenDoesNotBlockExecutor checks that data sent by the peer while OnOpen runs stays in the kernel and
 // does not occupy a goroutine of the executor: the executor has only one worker, yet the other connections
 // are still handled as usual.
@@ -872,6 +928,9 @@ func TestHandshakeErrors(t *testing.T) {
 		}
 		if tt.status == http.StatusUpgradeRequired && resp.Header.Get("Sec-WebSocket-Version") != "13" {
 			t.Fatalf("426 should carry Sec-WebSocket-Version: %v", resp.Header)
+		}
+		if tt.status == http.StatusMethodNotAllowed && resp.Header.Get("Allow") != http.MethodGet {
+			t.Fatalf("405 should carry Allow: GET: %v", resp.Header)
 		}
 		conn.Close()
 	}

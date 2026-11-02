@@ -344,6 +344,19 @@ func TestQueueCapacity(t *testing.T) {
 	}
 }
 
+// TestIdleHoldsNoBuffer checks that a connection waiting for its next request holds no buffer of the requests it has
+// answered, only the array of its queue: a million idle connections would each hold a request's worth otherwise.
+func TestIdleHoldsNoBuffer(t *testing.T) {
+	c := queueConn(&recordConn{})
+	c.onData([]byte("GET /hello HTTP/1.1\r\nHost: a\r\n\r\n"))
+	c.serve()
+	for _, r := range c.queue[:cap(c.queue)] {
+		if size := cap(r.msg.Bytes()); size != 0 {
+			t.Fatalf("an idle connection holds a buffer of %d bytes", size)
+		}
+	}
+}
+
 // TestQueueBackpressure checks that a connection with too much queued, by number or by size, is not read until its
 // worker has answered everything, and that a client pipelining more than that is answered in full. Every request at
 // hand is queued before reading pauses: the engine does not pass the data left unconsumed on again when reading
@@ -611,10 +624,10 @@ func TestStreamedResponse(t *testing.T) {
 		{name: "chunked", request: get, handle: write, fields: []string{"Transfer-Encoding: chunked"}, absent: []string{"Content-Length"}, body: payload},
 		{name: "declared length", request: get, handle: declare("102400"), fields: []string{"Content-Length: 102400"},
 			absent: []string{"Transfer-Encoding"}, body: payload},
-		// A Write that would go past the declared length fails whole, as on net/http. Before any of the body has gone out
-		// the response is the one of what was written, and after it the declared length stands, with the connection closed.
+		// A Write that would go past the declared length fails whole, as on net/http, and the declared length stands: what
+		// was written goes out cut short, and the connection closes.
 		{name: "declared length exceeded", request: get, handle: declare("30000"), err: http.ErrContentLength,
-			fields: []string{"Content-Length: 0"}},
+			fields: []string{"Content-Length: 30000"}, truncated: true, closed: true},
 		{name: "declared length exceeded after the body started", request: get, handle: func(w http.ResponseWriter) error {
 			w.Header().Set("Content-Length", "70000")
 			io.WriteString(w, payload[:maxBufferedBody+1])
@@ -709,19 +722,21 @@ func TestHeaderFixedWhenStatusWritten(t *testing.T) {
 }
 
 // TestDeclaredContentLength checks the Content-Length a Handler declares, as on net/http: a Write that would go past it
-// fails whole with http.ErrContentLength, one that fits is written, and a buffered body that falls short goes out with the
-// length it has.
+// fails whole with http.ErrContentLength, one that fits is written, and a body that falls short of it goes out cut short,
+// with the connection closed after it, so that the client sees the response is incomplete (say http.ServeContent whose
+// file fails to read halfway).
 func TestDeclaredContentLength(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
 		writes []string
 		errs   []error // what each Write returns
 		body   string
+		short  bool // the body falls short of the declared length
 	}{
-		{"fits", []string{"abc", "de"}, []error{nil, nil}, "abcde"},
-		{"exceeded", []string{"abc", "defg"}, []error{nil, http.ErrContentLength}, "abc"},
-		{"exceeded, then fits", []string{"abc", "defg", "de"}, []error{nil, http.ErrContentLength, nil}, "abcde"},
-		{"short", []string{"abc"}, []error{nil}, "abc"},
+		{"fits", []string{"abc", "de"}, []error{nil, nil}, "abcde", false},
+		{"exceeded", []string{"abc", "defg"}, []error{nil, http.ErrContentLength}, "abc", true},
+		{"exceeded, then fits", []string{"abc", "defg", "de"}, []error{nil, http.ErrContentLength, nil}, "abcde", false},
+		{"short", []string{"abc"}, []error{nil}, "abc", true},
 	} {
 		rc := &recordConn{}
 		c := queueConn(rc)
@@ -735,10 +750,15 @@ func TestDeclaredContentLength(t *testing.T) {
 		})
 		c.onData([]byte("GET / HTTP/1.1\r\nHost: a\r\n\r\n"))
 		c.serve()
-		resp, body := readResp(t, bufio.NewReader(strings.NewReader(strings.Join(rc.writes, ""))))
-		if !slices.Equal(errs, tt.errs) || body != tt.body || resp.ContentLength != int64(len(tt.body)) || rc.closed {
-			t.Errorf("%s: Writes returned %v, body %q with Content-Length %d, closed=%v; want %v, %q", tt.name, errs, body,
-				resp.ContentLength, rc.closed, tt.errs, tt.body)
+		resp, err := http.ReadResponse(bufio.NewReader(strings.NewReader(strings.Join(rc.writes, ""))), nil)
+		if err != nil {
+			t.Fatalf("%s: %v", tt.name, err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		if !slices.Equal(errs, tt.errs) || string(body) != tt.body || resp.ContentLength != 5 || (readErr != nil) != tt.short ||
+			rc.closed != tt.short {
+			t.Errorf("%s: Writes returned %v, body %q (%v) with Content-Length %d, closed=%v; want %v, %q, cut short=%v", tt.name,
+				errs, body, readErr, resp.ContentLength, rc.closed, tt.errs, tt.body, tt.short)
 		}
 	}
 }

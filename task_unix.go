@@ -86,8 +86,8 @@ func (c *conn) run() {
 // close of a connection whose deadline expired or whose server is closing (see onClosing), and finally a check for
 // whether the connection has to be closed.
 // A close request (including one made from a callback in this round) is handled in the next round: data the peer has
-// already sent but that has not been read yet is read away first, so that the socket holds no unread data at close
-// time, which would make the peer receive an RST instead of a FIN.
+// already sent but that has not been read yet is read away first, without being passed on, so that the socket holds no
+// unread data at close time, which would make the peer receive an RST instead of a FIN.
 func (c *conn) handle(ev uint32) {
 	if ev&evHup != 0 {
 		c.peerClosed = true
@@ -135,7 +135,7 @@ func (c *conn) handle(ev uint32) {
 	switch {
 	case ev&evShutdown != 0:
 		err = ErrServerClosed
-	case ev&evExpired != 0 && c.expiredBy(time.Now().UnixNano()):
+	case ev&evExpired != 0 && c.expiredBy(clockNow()):
 		err = os.ErrDeadlineExceeded
 	}
 	if err != nil {
@@ -170,7 +170,7 @@ func (c *conn) read() {
 	case err != nil:
 		c.requestClose(err)
 		return
-	case n <= 0:
+	case n <= 0 || c.closing.Load(): // nothing read, or read away after a close request (see handle)
 		return
 	}
 	data := c.in.Join(b[:pending+n], pending)
@@ -261,7 +261,7 @@ func (c *conn) flush() (drained, writable bool) {
 // read EOF, where the first non-nil err becomes the close reason. Writes after the request return net.ErrClosed.
 func (c *conn) requestClose(err error) {
 	c.mu.Lock()
-	c.closing = true
+	c.closing.Store(true)
 	if err != nil && !closesNow(c.closeErr) {
 		c.closeErr = err
 	}
@@ -275,8 +275,8 @@ func (c *conn) requestClose(err error) {
 // (nil for a local close).
 func (c *conn) requestCloseOnEOF() {
 	c.mu.Lock()
-	if !c.closing {
-		c.closing, c.closeErr = true, io.EOF
+	if c.closing.CompareAndSwap(false, true) {
+		c.closeErr = io.EOF
 	}
 	c.mu.Unlock()
 	c.notify(evClose)
@@ -289,7 +289,7 @@ func closesNow(err error) bool { return err != nil && err != io.EOF }
 // onClosing invokes the OnClosing callback of a ClosingHandler before the engine requests the close of the connection on
 // its own, err being the reason, unless a close has been requested already.
 func (c *conn) onClosing(err error) {
-	if h, ok := c.loop.srv.handler.(ClosingHandler); ok && !c.closeRequested() {
+	if h, ok := c.loop.srv.handler.(ClosingHandler); ok && !c.closing.Load() {
 		h.OnClosing(c, err)
 	}
 }
@@ -298,25 +298,18 @@ func (c *conn) onClosing(err error) {
 // the connection is then not read again. A connection a close has been requested for is not asked.
 func (c *conn) halfClose() bool {
 	h, ok := c.loop.srv.handler.(HalfCloseHandler)
-	if !ok || c.closeRequested() || !h.OnHalfClose(c) {
+	if !ok || c.closing.Load() || !h.OnHalfClose(c) {
 		return false
 	}
 	c.readClosed = true
 	return true
 }
 
-// closeRequested reports whether a close has been requested, see requestClose.
-func (c *conn) closeRequested() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.closing
-}
-
 // closeIfRequested closes the connection when a close has been requested and either its reason closes it at once (see
 // closesNow) or the send buffer has already been sent.
 func (c *conn) closeIfRequested() {
 	c.mu.Lock()
-	closing, err, backlog := c.closing, c.closeErr, c.out.Len() > 0
+	closing, err, backlog := c.closing.Load(), c.closeErr, c.out.Len() > 0
 	c.mu.Unlock()
 	if closing && (closesNow(err) || !backlog) {
 		c.close(err)
@@ -361,7 +354,7 @@ const lingerTimeout = time.Second
 // Server.checkDeadlines finds in place of the deadline, see expiredBy.
 func (c *conn) beginLinger() {
 	unix.Shutdown(c.fd, unix.SHUT_WR)
-	end := time.Now().Add(lingerTimeout).UnixNano()
+	end := clockNow() + int64(lingerTimeout)
 	c.lingerEnd.Store(end)
 	connsByFd.noteDeadline(c.fd, end)
 	// What has arrived already raises no new event: it is read here once, and linger goes on in another round only when
@@ -377,7 +370,7 @@ func (c *conn) lingering() bool { return c.lingerEnd.Load() != 0 }
 // linger handles the events of a lingering connection: it reads away what arrives, a read per round as in read, and
 // closes the fd once the peer has closed, a read has failed, the linger has timed out or the server is closing.
 func (c *conn) linger(ev uint32) {
-	if ev&evShutdown != 0 || ev&evExpired != 0 && c.expiredBy(time.Now().UnixNano()) {
+	if ev&evShutdown != 0 || ev&evExpired != 0 && c.expiredBy(clockNow()) {
 		c.endLinger()
 		return
 	}

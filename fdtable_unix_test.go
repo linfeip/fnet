@@ -131,25 +131,30 @@ func TestFdTableConcurrentReadWrite(t *testing.T) {
 }
 
 // TestFdTableDeadlines checks page-level minDeadline tracking and pruning: a page whose minDeadline is 0 or in the
-// future is skipped, an expired connection is notified, and scanning a page folds the earliest remaining deadline (including
-// one that was pushed back) into minDeadlines.
+// future is skipped, an expired connection is notified, whatever its server (another server checking at the same time
+// may skip the page this scan has reset), and scanning a page folds the earliest remaining deadline (including one that
+// was pushed back) into minDeadlines.
 func TestFdTableDeadlines(t *testing.T) {
 	var table fdTable
-	srv := &Server{opts: Options{Executor: func(_ int, _ func()) {}}}
-	l := &loop{srv: srv}
+	newLoop := func() *loop { return &loop{srv: &Server{opts: Options{Executor: func(_ int, _ func()) {}}}} }
+	l, other := newLoop(), newLoop()
 
 	c1 := &conn{fd: 1, loop: l}
 	c2 := &conn{fd: 2, loop: l}
 	c3 := &conn{fd: fdPageSize + 1, loop: l}
+	c4 := &conn{fd: 3, loop: other}
 	table.store(c1)
 	table.store(c2)
 	table.store(c3)
+	table.store(c4)
 	c1.deadline.Store(100)
 	table.noteDeadline(c1.fd, 100)
 	c2.deadline.Store(300)
 	table.noteDeadline(c2.fd, 300)
 	c3.deadline.Store(500)
 	table.noteDeadline(c3.fd, 500)
+	c4.deadline.Store(300)
+	table.noteDeadline(c4.fd, 300)
 
 	if got := table.minDeadlines[0].Load(); got != 100 {
 		t.Fatalf("page 0 minDeadline = %d, want 100", got)
@@ -159,7 +164,7 @@ func TestFdTableDeadlines(t *testing.T) {
 	}
 
 	// Before any deadline has passed: nothing is notified and minDeadlines stay intact.
-	table.checkDeadlines(srv, 50)
+	table.checkDeadlines(50)
 	if c1.state.Load()&evExpired != 0 || table.minDeadlines[0].Load() != 100 {
 		t.Fatal("checkDeadlines notified or cleared a page before its minDeadline")
 	}
@@ -167,7 +172,7 @@ func TestFdTableDeadlines(t *testing.T) {
 	// Put c1's deadline off to 400 without lowering minDeadlines[0]; scanning at 100 must see 400, notify nothing, and
 	// advance minDeadlines[0] to c2's 300.
 	c1.deadline.Store(400)
-	table.checkDeadlines(srv, 100)
+	table.checkDeadlines(100)
 	if c1.state.Load()&evExpired != 0 || c2.state.Load()&evExpired != 0 {
 		t.Fatal("a connection whose deadline was put off was notified")
 	}
@@ -175,10 +180,11 @@ func TestFdTableDeadlines(t *testing.T) {
 		t.Fatalf("page 0 minDeadline after scan = %d, want 300", got)
 	}
 
-	// At 300: c2 expires and is notified, minDeadlines[0] advances to c1's 400, and page 1 (500) is still untouched.
-	table.checkDeadlines(srv, 300)
-	if c2.state.Load()&evExpired == 0 {
-		t.Fatal("expired c2 was not notified")
+	// At 300: c2 and c4, another server's, expire and are notified, minDeadlines[0] advances to c1's 400, and page 1 (500)
+	// is still untouched.
+	table.checkDeadlines(300)
+	if c2.state.Load()&evExpired == 0 || c4.state.Load()&evExpired == 0 {
+		t.Fatal("expired c2 or c4 was not notified")
 	}
 	if c1.state.Load()&evExpired != 0 || c3.state.Load()&evExpired != 0 {
 		t.Fatal("unexpired connection was notified")

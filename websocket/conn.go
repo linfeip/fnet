@@ -51,11 +51,10 @@ type Conn struct {
 	messageFinished bool   // a data message was received in full during this OnData
 	corking         bool   // this OnData has taken the cork buffer and has not written it out yet, see cork
 
-	frameBuffer  [maxSmallFrameSize]byte // encodes the frame header, and payloads that fit alongside it, while holding writeMu
-	writeBuffers [3][]byte               // scratch slice backing for Writev while holding writeMu, avoiding an allocation per call
-	writeMu      sync.Mutex              // guarantees that no frame is sent after the close frame
-	connection   fnet.Conn
-	handler      Handler
+	frameBuffer [maxSmallFrameSize]byte // encodes the frame header, and payloads that fit alongside it, while holding writeMu
+	writeMu     sync.Mutex              // guarantees that no frame is sent after the close frame
+	connection  fnet.Conn
+	handler     Handler
 	// The cork buffer is embedded in the connection to avoid allocating a wrapper per batch; it is accessed only while
 	// holding writeMu. A nil Bytes means nothing is corked, and the underlying array is returned at the end of each
 	// round so idle connections do not keep it.
@@ -112,6 +111,12 @@ func (c *Conn) WriteMessage(op OpCode, data []byte) error {
 	return err
 }
 
+// Writable reports whether no more than 64KB waits to be sent, see fnet.Conn.Writable: a handler that sends on its own (say
+// a broadcast), rather than in reply to what it receives, checks it before sending more, and while it reports false
+// waits for WritableHandler.OnWritable, or drops what it would send. It always reports true on other platforms than
+// Linux/macOS, where writes block.
+func (c *Conn) Writable() bool { return c.connection.Writable() }
+
 // Close sends a close frame (1000) and then closes the connection. After Close returns, OnMessage is no longer
 // called: messages not yet delivered, the one being received included, and data arriving afterwards are all discarded,
 // while a callback that is already running is unaffected.
@@ -149,7 +154,8 @@ func (c *Conn) closeWith(code StatusCode, err error) {
 //
 // A small frame is copied together with its header into one buffer and written with a single write: for a few KB the
 // copy costs less than the kernel taking in the iovec array of a writev. A larger frame is written with a single
-// writev of the header and the payload, so the payload is not copied.
+// writev of the header and the payload, so the payload is not copied; the two segments cost an allocation, which
+// a connection keeping room for them would hold for good.
 func (c *Conn) writeFrame(op OpCode, payload []byte) error {
 	header := appendFrameHeader(c.frameBuffer[:0], op, len(payload))
 	if len(header)+len(payload) <= len(c.frameBuffer) {
@@ -164,9 +170,7 @@ func (c *Conn) writeFrame(op OpCode, payload []byte) error {
 		frame.Release()
 		return err
 	}
-	c.writeBuffers = [3][]byte{header, payload}
-	_, err := c.connection.Writev(c.writeBuffers[:2])
-	c.writeBuffers = [3][]byte{}
+	_, err := c.connection.Writev([][]byte{header, payload})
 	return err
 }
 
@@ -187,9 +191,7 @@ func (c *Conn) writeCorked(op OpCode, payload []byte) error {
 		b.Write(payload)
 		return nil
 	}
-	c.writeBuffers = [3][]byte{b.Bytes(), header, payload}
-	_, err := c.connection.Writev(c.writeBuffers[:])
-	c.writeBuffers = [3][]byte{}
+	_, err := c.connection.Writev([][]byte{b.Bytes(), header, payload})
 	b.Reset()
 	return err
 }
@@ -374,6 +376,14 @@ func (c *Conn) deliver(op OpCode, data []byte) {
 		return
 	}
 	c.handler.OnMessage(c, op, data)
+}
+
+// OnWritable implements fhttp.WritableProtocol: it passes the engine's OnWritable on to the handler, if it is a
+// WritableHandler, once OnOpen has returned, as OnData does.
+func (c *Conn) OnWritable() {
+	if h, ok := c.handler.(WritableHandler); ok && c.phase.Load() == phaseOpened {
+		h.OnWritable(c)
+	}
 }
 
 // OnClose implements fhttp.Protocol: it calls Handler.OnClose after the connection is closed. fnet guarantees that

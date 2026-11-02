@@ -44,6 +44,32 @@ func TestHandleEventOwnLoopOnly(t *testing.T) {
 	}
 }
 
+// TestHandleEventIdleWrite checks that a writable event alone submits no task for a connection with nothing backed up,
+// and does for one with a backlog.
+func TestHandleEventIdleWrite(t *testing.T) {
+	var tasks atomic.Int32
+	opened := make(chan Conn, 2)
+	srv := startServerWith(t, &funcHandler{open: func(c Conn) { opened <- c }}, Options{NumLoops: 1, Executor: func(_ int, task func()) {
+		tasks.Add(1)
+		go task()
+	}})
+	dial(t, srv)
+	idle := (<-opened).(*conn)
+	dial(t, srv) // reads nothing
+	backlogged := (<-opened).(*conn)
+	backlogged.Write(make([]byte, 16<<20)) // far more than the socket takes
+	time.Sleep(100 * time.Millisecond)     // let the connections settle: their tasks have finished
+	before := tasks.Load()
+	idle.loop.handleEvent(idle.fd, poll.EventWrite)
+	if got := tasks.Load(); got != before {
+		t.Fatalf("a writable event with nothing backed up submitted %d tasks", got-before)
+	}
+	backlogged.loop.handleEvent(backlogged.fd, poll.EventWrite)
+	if got := tasks.Load(); got != before+1 {
+		t.Fatalf("a writable event with a backlog submitted %d tasks, want 1", got-before)
+	}
+}
+
 // loopFds returns the fds of the connections the loop still holds.
 func loopFds(l *loop) []int {
 	var fds []int

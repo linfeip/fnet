@@ -81,6 +81,51 @@ func TestUpgradeAfterFullQueue(t *testing.T) {
 	}
 }
 
+// contextConn is a recordConn that keeps the context in which the engine's callbacks find the connection's state.
+type contextConn struct {
+	recordConn
+	ctx any
+}
+
+func (c *contextConn) Context() any       { return c.ctx }
+func (c *contextConn) SetContext(ctx any) { c.ctx = ctx }
+
+// writableProtocol is an echoProtocol that counts its OnWritable calls.
+type writableProtocol struct {
+	echoProtocol
+	writable int
+}
+
+func (p *writableProtocol) OnWritable() { p.writable++ }
+
+// TestProtocolTakesContext checks that the protocol that took a connection over gets the connection's context with the
+// first event after the switch, OnResume (websocket resumes reading once its OnOpen has returned) or OnWritable, before
+// any data has come, so that the HTTP state can go, and that it gets OnWritable as a WritableProtocol.
+func TestProtocolTakesContext(t *testing.T) {
+	var h engineHandler
+	for name, event := range map[string]func(fnet.Conn){"OnResume": h.OnResume, "OnWritable": h.OnWritable} {
+		cc := &contextConn{}
+		hc := queueConn(&cc.recordConn)
+		cc.ctx = hc
+		event(cc)
+		if cc.ctx != any(hc) {
+			t.Fatalf("%s took the context from HTTP, which is in charge", name)
+		}
+		p := &writableProtocol{}
+		var protocol Protocol = p
+		hc.protocol.Store(&protocol)
+		event(cc)
+		if cc.ctx != any(p) {
+			t.Fatalf("%s did not hand the context to the protocol that took the connection over", name)
+		}
+		writable := p.writable
+		h.OnWritable(cc)
+		if p.writable != writable+1 {
+			t.Fatalf("after %s, the protocol did not get OnWritable", name)
+		}
+	}
+}
+
 // wrappedWriter simulates a middleware wrapping the ResponseWriter.
 type wrappedWriter struct{ http.ResponseWriter }
 
@@ -218,6 +263,53 @@ func TestUpgradeHTTP10(t *testing.T) {
 	br := dialRaw(t, s, "GET / HTTP/1.0\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n")
 	if resp, body := readResp(t, br); resp.StatusCode != http.StatusOK || body != http.ErrNotSupported.Error() {
 		t.Fatalf("got %d %q, want 200 %q", resp.StatusCode, body, http.ErrNotSupported.Error())
+	}
+}
+
+// TestUpgradeDropsWrittenResponse checks that an Upgrade that fails after the Handler wrote some of its own response
+// sends none of it: the client that did not wait for the 101 gets the 400 alone, not after a header cut short.
+func TestUpgradeDropsWrittenResponse(t *testing.T) {
+	rc := &recordConn{}
+	c := queueConn(rc)
+	c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/upgrade" {
+			return
+		}
+		w.Header().Set("X-Before", "1")
+		io.WriteString(w, "partial") // commits the header
+		Upgrade(w, func(fnet.Conn) Protocol { return &echoProtocol{} })
+	})
+	c.onData([]byte("GET /upgrade HTTP/1.1\r\nHost: a\r\n\r\nGET /next HTTP/1.1\r\nHost: a\r\n\r\n"))
+	c.serve()
+	if wire := strings.Join(rc.writes, ""); !strings.HasPrefix(wire, "HTTP/1.1 400 ") || strings.Contains(wire, "X-Before") {
+		t.Fatalf("got %q, want the 400 alone", wire)
+	}
+}
+
+// TestUpgradeThenPanic checks a Handler that panics once Upgrade has switched the protocol: the responses that went out
+// before the 101 do not go out again, onto the new protocol's stream, and the request's context ends with the Handler.
+func TestUpgradeThenPanic(t *testing.T) {
+	rc := &recordConn{}
+	c := queueConn(rc)
+	var done <-chan struct{}
+	c.srv.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/upgrade" {
+			io.WriteString(w, "hello")
+			return
+		}
+		done = r.Context().Done()
+		Upgrade(w, func(fnet.Conn) Protocol { return &echoProtocol{} })
+		panic(http.ErrAbortHandler)
+	})
+	c.onData([]byte("GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /upgrade HTTP/1.1\r\nHost: a\r\n\r\n"))
+	c.serve()
+	if wire := strings.Join(rc.writes, ""); strings.Count(wire, "hello") != 1 || !strings.HasSuffix(wire, "Switching Protocols\r\n\r\n") {
+		t.Fatalf("got %q, want the first response once, then the 101", wire)
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("the request's context did not end with its Handler")
 	}
 }
 
