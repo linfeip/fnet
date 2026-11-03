@@ -3,10 +3,11 @@
 //
 // Each shard uses a bounded lock-free queue and keeps at most maxWorkers workers; after enqueuing a task the shard wakes
 // a worker only when none is already on its way to the queue.
-// The number of running workers is bounded only by maxWorkers; there is no GOMAXPROCS soft budget any more: a worker
-// whose callback blocks still counts as running, and a soft budget keeps the pool from growing enough to absorb the
-// blocking while leaving ready tasks waiting in the queue, which in measurements only raised tail latency without
-// saving measurable scheduling cost.
+// Under normal non-blocking load each shard keeps at most softWorkers workers serving its queue at once, so short tasks
+// stay in the FIFO ring buffer instead of waking hundreds of competing goroutines into the scheduler. When a shard's
+// serving workers take fewer tasks than their number in a stallInterval while tasks remain queued (for example because
+// callbacks block on database or network I/O) and fewer goroutines than GOMAXPROCS wait in run queues, a background
+// monitor doubles the workers allowed to serve the shard, so additional workers wake or start up to maxWorkers.
 // The total worker limit is shards * maxWorkers, shared by all shards: when every worker of a shard is running a task
 // (the shard has reached its own limit), its tasks are taken by a suspended worker of another shard, or a new worker
 // is started in a shard that still has room (see Pool.borrow); when no worker is available anywhere in the pool the
@@ -25,7 +26,9 @@ import (
 	"math"
 	"math/bits"
 	"runtime"
+	"runtime/metrics"
 	"sync/atomic"
+	"time"
 	_ "unsafe"
 )
 
@@ -36,7 +39,12 @@ const MaxWorkers = 512
 // idleWords is the number of words in a shard's bitmap of suspended workers.
 const idleWords = MaxWorkers / 64
 
-const defaultQueueCapacity = 8192
+const (
+	// softWorkers is the number of workers serving a shard concurrently while tasks complete within stallInterval.
+	softWorkers          = 2
+	stallInterval        = time.Millisecond
+	defaultQueueCapacity = 8192
+)
 
 // NewDefault creates a Pool with one shard per P, MaxWorkers workers per shard, and a queue capacity of 8192 per shard.
 // Workers start only once there are tasks, and a worker started stays resident until the pool is closed.
@@ -48,12 +56,13 @@ func NewDefault() *Pool {
 type Pool struct {
 	shards []shard
 	closed atomic.Bool         // set by Close; read by every Submit along with shards, so it shares their cache line
-	_      [cacheLineSize]byte // every Submit reads shards: keep it off the cache line of starving
+	_      [cacheLineSize]byte // every Submit reads shards: keep it off the cache line of starving and monitoring
 	// starving is set when a shard had tasks queued and found no suspended worker and no room for a new one anywhere in
 	// the pool; the next worker to suspend clears it and notifies every shard once (see shard.work). It is written only
 	// while the whole pool is saturated.
-	starving atomic.Bool
-	_        [cacheLineSize - 4]byte
+	starving   atomic.Bool
+	monitoring atomic.Bool // set while the stall monitor goroutine is active (see watchStall)
+	_          [cacheLineSize - 2]byte
 }
 
 // New creates a Pool: shards shards, at most maxWorkers workers per shard (1 to MaxWorkers), and a queue capacity of
@@ -72,6 +81,7 @@ func New(shards, maxWorkers, capacity int) *Pool {
 		s.mask = uint64(size - 1)
 		s.wakeups = make([]chan *shard, maxWorkers)
 		s.maxWorkers = int32(maxWorkers)
+		s.servingLimit.Store(softWorkers)
 	}
 	return p
 }
@@ -156,15 +166,17 @@ type shard struct {
 	_          [cacheLineSize]byte
 	tail       atomic.Uint64 // the position the next task is written to
 	_          [cacheLineSize - 8]byte
-	head       atomic.Uint64 // the position the next task is taken from
+	head       atomic.Uint64 // the position the next task is taken from; Pool.monitor samples it to see the queue move
 	_          [cacheLineSize - 8]byte
 	// wakingWorkers is the number of workers (of this shard, or lent by another) that have been woken or newly started
 	// for this queue but have not reached it yet: once they get there they will take the queued tasks, so there is no
 	// need to wake another worker.
-	wakingWorkers atomic.Int32
-	liveWorkers   atomic.Int32             // the number of started workers, numbered 0 through liveWorkers-1
-	idleWorkers   [idleWords]atomic.Uint64 // the suspended workers, bit i%64 of word i/64 standing for id i
-	_             [cacheLineSize]byte
+	wakingWorkers  atomic.Int32
+	servingWorkers atomic.Int32             // workers currently woken for or draining this shard's queue
+	servingLimit   atomic.Int32             // servingWorkers notify wakes up to: softWorkers unless Pool.monitor raised it
+	liveWorkers    atomic.Int32             // the number of started workers, numbered 0 through liveWorkers-1
+	idleWorkers    [idleWords]atomic.Uint64 // the suspended workers, bit i%64 of word i/64 standing for id i
+	_              [cacheLineSize]byte
 }
 
 // push puts a task into the queue and returns false when the queue is full.
@@ -217,39 +229,139 @@ func (s *shard) hasTask() bool {
 }
 
 // notify makes sure a worker comes for the tasks in the queue: when a worker is already on its way (holding
-// wakingWorkers) it does nothing; otherwise it wakes a suspended worker of this shard or starts a new one, and when
-// the shard is at its limit with every worker running a task it borrows one from another shard (see Pool.borrow). The
-// worker it finds takes over the wakingWorkers this function acquired and releases them on reaching the queue; on the
-// failure path this function releases them. When the whole pool has no available worker it sets starving, and the next
-// worker to suspend comes for the tasks.
+// wakingWorkers) it does nothing, nor while starving is set (the next worker to suspend notifies every shard); when
+// servingLimit workers already serve this shard it leaves the tasks to them and has Pool.monitor watch for a stall (see
+// watchStall); otherwise it wakes a suspended worker of this shard or starts a new one, and when the shard is at its
+// limit with every worker running a task it borrows one from another shard (see Pool.borrow). The worker it finds takes
+// over wakingWorkers and servingWorkers; on the failure path this function releases them. When the whole pool has no
+// available worker it sets starving, and the next worker to suspend comes for the tasks.
 //
 // Wakeups are never lost. Within a shard: the submitter writes the task before looking at the workers and a worker
-// registers as suspended before looking at the queue, so at least one side sees the other. Across shards: this sets
-// wakingWorkers and starving before looking once more for suspended workers pool-wide, while a worker registers as
-// suspended before reading starving, so either it sees the flag (by then wakingWorkers has been released, and its
-// notify can acquire it) or the second pass here sees it and retries.
+// registers as suspended and decrements servingWorkers before looking at the queue, so at least one side sees the other.
+// Across shards: this sets wakingWorkers and starving before looking once more for suspended workers pool-wide, while a
+// worker registers as suspended before reading starving, so either it sees the flag or the check here sees it.
 func (s *shard) notify() {
 	p := s.pool
-	for s.hasTask() && s.wakingWorkers.Load() == 0 && s.wakingWorkers.CompareAndSwap(0, 1) {
-		if s.wakeIdle(s) || s.start(s) || p.borrow(s) {
-			return
+	if !s.hasTask() || (p.starving.Load() && !p.closed.Load()) || s.wakingWorkers.Load() != 0 {
+		return
+	}
+	if s.servingWorkers.Load() >= s.servingLimit.Load() && !p.closed.Load() {
+		p.watchStall()
+		return
+	}
+	if !s.wakingWorkers.CompareAndSwap(0, 1) {
+		return
+	}
+	s.servingWorkers.Add(1)
+	if s.wakeIdle(s) || s.start(s) || p.borrow(s) {
+		return
+	}
+	s.servingWorkers.Add(-1)
+	s.wakingWorkers.Add(-1)
+	if p.closed.Load() { // the workers have left, so the next to suspend would not come: a goroutine of its own does
+		go s.help(s.pop())
+		return
+	}
+	p.starving.Store(true)
+	if p.hasIdleWorker() && p.starving.CompareAndSwap(true, false) {
+		for i := range p.shards {
+			p.shards[i].notify()
 		}
-		s.wakingWorkers.Add(-1)
-		if p.closed.Load() { // the workers have left, so the next to suspend would not come: a goroutine of its own does
-			go s.help(s.pop())
-			return
+	}
+}
+
+// watchStall starts the stall monitor goroutine when none is running yet.
+func (p *Pool) watchStall() {
+	if !p.monitoring.Load() && p.monitoring.CompareAndSwap(false, true) {
+		go p.monitor()
+	}
+}
+
+// monitor runs while tasks wait behind the servingLimit of some shard: every stallInterval it raises the limit of the
+// shards whose serving workers stopped taking tasks (see boost). It exits once no shard has such a backlog, or the pool
+// is closed.
+func (p *Pool) monitor() {
+	heads := make([]uint64, len(p.shards))
+	for i := range p.shards {
+		heads[i] = p.shards[i].head.Load()
+	}
+	var cpu cpuSampler
+	ticker := time.NewTicker(stallInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !p.closed.Load() && p.boost(heads, &cpu) {
+			continue
 		}
-		if !p.starving.Load() {
-			p.starving.Store(true)
-		}
-		if !p.hasIdleWorker() {
+		p.monitoring.Store(false)
+		// A notify that found monitoring still set left its backlog to this monitor: look once more before exiting.
+		if p.closed.Load() || !p.hasBacklog() || !p.monitoring.CompareAndSwap(false, true) {
 			return
 		}
 	}
 }
 
+// boost raises the servingLimit of every shard whose queue stalls behind it: its serving workers took fewer tasks than
+// their number since the last round, blocking on a database or network call for example. It doubles the workers allowed
+// to serve the shard, up to the number of queued tasks, provided the run queues have room for them, which it samples at
+// most once per round and only for a stalled shard (see cpuSampler.hasHeadroom). It reports whether any shard has tasks
+// queued behind its servingLimit.
+func (p *Pool) boost(heads []uint64, cpu *cpuSampler) bool {
+	backlog, sampled, headroom := false, false, false
+	for i := range p.shards {
+		s := &p.shards[i]
+		head := s.head.Load()
+		taken := head - heads[i]
+		heads[i] = head
+		serving := s.servingWorkers.Load()
+		if !s.hasTask() || serving < s.servingLimit.Load() {
+			continue
+		}
+		backlog = true
+		if taken >= uint64(serving) {
+			continue
+		}
+		if !sampled {
+			sampled, headroom = true, cpu.hasHeadroom()
+		}
+		if headroom {
+			s.servingLimit.Store(serving + int32(min(uint64(serving), s.tail.Load()-head)))
+			s.notify()
+		}
+	}
+	return backlog
+}
+
+// cpuSampler reads the scheduler's runnable goroutine count, reusing its sample slice so reading allocates nothing.
+type cpuSampler struct {
+	samples [1]metrics.Sample
+}
+
+// hasHeadroom reports whether fewer than GOMAXPROCS goroutines are waiting in run queues: waking more workers when every P
+// already has runnable work queued behind it only lengthens scheduling tail latency; when the runtime does not export the
+// metric, it reports true.
+func (c *cpuSampler) hasHeadroom() bool {
+	c.samples[0].Name = "/sched/goroutines/runnable:goroutines"
+	metrics.Read(c.samples[:])
+	runnable := c.samples[0].Value
+	if runnable.Kind() != metrics.KindUint64 {
+		return true
+	}
+	return runnable.Uint64() < uint64(runtime.GOMAXPROCS(0))
+}
+
+// hasBacklog reports whether any shard has tasks queued behind its servingLimit, which notify leaves to Pool.monitor.
+func (p *Pool) hasBacklog() bool {
+	for i := range p.shards {
+		s := &p.shards[i]
+		if s.hasTask() && s.servingWorkers.Load() >= s.servingLimit.Load() {
+			return true
+		}
+	}
+	return false
+}
+
 // wakeIdle wakes the suspended worker of s with the lowest id (its stack and caches are the hottest) to serve target,
-// handing it the target's wakingWorkers the caller holds; it reports false when s has none suspended.
+// handing it the target's wakingWorkers and servingWorkers the caller holds; it reports false when s has none suspended.
 func (s *shard) wakeIdle(target *shard) bool {
 	for w := range (s.liveWorkers.Load() + 63) / 64 {
 		word := &s.idleWorkers[w]
@@ -268,8 +380,8 @@ func (s *shard) wakeIdle(target *shard) bool {
 	return false
 }
 
-// start starts a new worker of s that serves target first, handing it the target's wakingWorkers the caller holds; it
-// reports false when s has maxWorkers workers already.
+// start starts a new worker of s that serves target first, handing it the target's wakingWorkers and servingWorkers the
+// caller holds; it reports false when s has maxWorkers workers already.
 func (s *shard) start(target *shard) bool {
 	for {
 		live := s.liveWorkers.Load()
@@ -287,7 +399,7 @@ func (s *shard) start(target *shard) bool {
 
 // borrow finds a worker for target, a shard whose workers are all running tasks with no room for another: a suspended
 // worker of another shard, or else a new worker started in another shard that has room. The worker takes over the
-// target's wakingWorkers the caller holds; borrow reports false when the whole pool has none to give.
+// target's wakingWorkers and servingWorkers the caller holds; borrow reports false when the whole pool has none to give.
 func (p *Pool) borrow(target *shard) bool {
 	count := len(p.shards)
 	first := int(cheaprandn(uint32(count)))
@@ -322,7 +434,7 @@ func (p *Pool) hasIdleWorker() bool {
 func (s *shard) work(id int32, wakeup chan *shard, target *shard) {
 	// The loop ends only with Pool.Close. The other way out is a task calling runtime.Goexit (which recover cannot stop).
 	// A replacement worker is then started with the same id, on its way back to the same queue: it is still counted in
-	// liveWorkers, and without the replacement this shard would be one worker short forever.
+	// liveWorkers and target.servingWorkers, and without the replacement this shard would be one worker short forever.
 	closed := false
 	defer func() {
 		if !closed {
@@ -335,24 +447,35 @@ func (s *shard) work(id int32, wakeup chan *shard, target *shard) {
 	for {
 		target.wakingWorkers.Add(-1) // the queue has been reached
 		for task := target.pop(); task != nil; task = target.pop() {
-			// While tasks are still queued, first make sure a worker comes to take them, then run this one: it may take
-			// a while, and the tasks behind it need not wait for it.
+			// While tasks are still queued, first make sure a worker comes to take them (up to target's servingLimit),
+			// then run this one.
 			if target.hasTask() {
 				target.notify()
 			}
 			run(task)
 		}
-		word.Or(bit)
-		// Look at the queue once more after registering as suspended: a submitter may have enqueued only after the last
-		// pop above, at a time when this worker was not yet visible as suspended.
-		if s.hasTask() {
-			s.notify()
+		// The queue is drained, and with it any backlog for which Pool.monitor raised servingLimit.
+		if target.servingLimit.Load() != softWorkers {
+			target.servingLimit.Store(softWorkers)
 		}
+		// Registered as suspended before leaving servingWorkers: a notify that sees room under servingLimit then finds this
+		// worker to wake, instead of starting another.
+		word.Or(bit)
+		target.servingWorkers.Add(-1)
 		// A shard found no worker anywhere in the pool: now that this one is suspended, notify every shard once. The
 		// flag is cleared first, so a shard that still finds none sets it again.
 		if p.starving.Load() && p.starving.CompareAndSwap(true, false) {
 			for i := range p.shards {
 				p.shards[i].notify()
+			}
+		} else {
+			// Look at the queues once more after registering as suspended and decrementing servingWorkers: a submitter
+			// may have enqueued before this worker was visible as suspended or just before servingWorkers dropped.
+			if target != s && target.hasTask() {
+				target.notify()
+			}
+			if s.hasTask() {
+				s.notify()
 			}
 		}
 		// Once the pool is closed this worker leaves, unless a waker has taken its bit: a shard, or Close's nil, is then on

@@ -349,18 +349,21 @@ func waitUntil(t *testing.T, condition func() bool, message string) {
 	}
 }
 
-// waitQuiescent waits until every worker is suspended and every shard's wakingWorkers is back to 0; otherwise a wakeup
-// or a suspension was leaked.
+// waitQuiescent waits until every worker is suspended, the stall monitor has exited, and every shard's wakingWorkers
+// and servingWorkers are back to 0; otherwise a wakeup or a suspension was leaked.
 func waitQuiescent(t *testing.T, p *Pool) {
 	t.Helper()
 	waitUntil(t, func() bool {
+		if p.monitoring.Load() {
+			return false
+		}
 		for i := range p.shards {
 			s := &p.shards[i]
 			idle := 0
 			for w := range s.idleWorkers {
 				idle += bits.OnesCount64(s.idleWorkers[w].Load())
 			}
-			if s.wakingWorkers.Load() != 0 || idle != int(s.liveWorkers.Load()) {
+			if s.wakingWorkers.Load() != 0 || s.servingWorkers.Load() != 0 || idle != int(s.liveWorkers.Load()) {
 				return false
 			}
 		}
@@ -493,6 +496,58 @@ func saturatedStress(t *testing.T, capacity int) {
 	waitQuiescent(t, p)
 }
 
+// TestSoftLimitHoldsShortBursts verifies that a burst of fast non-blocking tasks stays within softWorkers instead of
+// waking up to maxWorkers goroutines, and that once blocking tasks stall the shard the monitor scales workers up and
+// subsequent fast bursts stay bounded by softWorkers again.
+func TestSoftLimitHoldsShortBursts(t *testing.T) {
+	p := New(1, 32, 1024)
+	defer p.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(500)
+	for range 500 {
+		submitTo(p, 0, wg.Done)
+	}
+	waitGroup(t, &wg)
+	if live := p.shards[0].liveWorkers.Load(); live > softWorkers {
+		t.Fatalf("fast burst started %d workers, want at most %d", live, softWorkers)
+	}
+
+	// Now block 16 tasks at once: the monitor scales past softWorkers so all 16 run concurrently.
+	release := make(chan struct{})
+	var started sync.WaitGroup
+	started.Add(16)
+	for range 16 {
+		submitTo(p, 0, func() { started.Done(); <-release })
+	}
+	waitGroup(t, &started)
+	close(release)
+	waitQuiescent(t, p)
+
+	// With 16+ resident idle workers, another fast burst still wakes at most softWorkers at a time.
+	var concurrent, peak atomic.Int32
+	wg.Add(500)
+	for range 500 {
+		submitTo(p, 0, func() {
+			defer wg.Done()
+			if cur := concurrent.Add(1); cur > peak.Load() {
+				for {
+					old := peak.Load()
+					if cur <= old || peak.CompareAndSwap(old, cur) {
+						break
+					}
+				}
+			}
+			concurrent.Add(-1)
+		})
+	}
+	waitGroup(t, &wg)
+	if got := peak.Load(); got > softWorkers {
+		t.Fatalf("after scaling, fast burst ran %d workers concurrently, want at most %d", got, softWorkers)
+	}
+	waitQuiescent(t, p)
+}
+
 func TestShardCacheLineSeparation(t *testing.T) {
 	var s shard
 	if unsafe.Offsetof(s.head)-unsafe.Offsetof(s.tail) < cacheLineSize ||
@@ -501,7 +556,7 @@ func TestShardCacheLineSeparation(t *testing.T) {
 		t.Fatal("the queue head/tail or the worker state of adjacent shards is not isolated on its own cache line")
 	}
 	var p Pool
-	if unsafe.Offsetof(p.starving)-unsafe.Offsetof(p.shards) < cacheLineSize {
+	if unsafe.Offsetof(p.starving)-unsafe.Offsetof(p.closed) < cacheLineSize {
 		t.Fatal("starving shares a cache line with shards, which every Submit reads")
 	}
 }

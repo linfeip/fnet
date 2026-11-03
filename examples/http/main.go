@@ -62,6 +62,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "hello world")
+	})
 	mux.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "hello world")
 	})
