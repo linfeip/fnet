@@ -167,6 +167,46 @@ Any `tls.Config` works (`GetCertificate` for SNI or autocert, client certificate
 
 For a custom TCP protocol, wrap its handler: `fnet.NewServer(":9443", ftls.NewHandler(echo{}, config, 0), fnet.Options{})`, where the last argument is the handshake timeout (0 means 10s).
 
+### Gin
+
+`*gin.Engine` implements `http.Handler`, so Gin routes, middleware and binding run on `fhttp.Server` unchanged (full version in [examples/http-gin](examples/http-gin/main.go)):
+
+```go
+package main
+
+import (
+	"log"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"github.com/linfeip/fnet/fhttp"
+)
+
+func main() {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+
+	r.GET("/hello", func(c *gin.Context) {
+		c.String(http.StatusOK, "hello world")
+	})
+	r.POST("/json", func(c *gin.Context) {
+		var v map[string]any
+		if err := c.ShouldBindJSON(&v); err != nil {
+			c.String(http.StatusBadRequest, "%s\n", err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"received": v})
+	})
+
+	srv, err := fhttp.NewServer(":8080", r, fhttp.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Fatal(srv.Serve())
+}
+```
+
 ### WebSocket
 
 An echo server, the same as [examples/websocket](examples/websocket/main.go):
@@ -210,16 +250,64 @@ On Linux, `fhttp.Options{Engine: fnet.Options{ReusePort: true}}` gives every sub
 
 ## Examples
 
-The examples are a separate module (`examples/go.mod`, built against the fnet in this repository), so their dependencies, such as fiber for the HTTP benchmark, stay out of fnet's own `go.mod`.
+The examples are a separate module (`examples/go.mod`, built against the fnet in this repository), so their dependencies, such as Gin, stay out of fnet's own `go.mod`.
 
 ```bash
 cd examples
 go run ./echo        # TCP echo
 go run ./http        # HTTP: GET, forms, JSON, PUT/PATCH/DELETE/OPTIONS, chunked, multipart uploads
 go run ./http -addr :8443 -tls   # HTTPS, with a self-signed certificate generated at startup (curl -k)
+go run ./http-gin    # HTTP with Gin: routes, middleware, binding, multipart uploads (-tls for HTTPS)
 go run ./websocket   # WebSocket echo
-go test ./http -run XXX -bench GET   # GET benchmark: fhttp vs net/http vs fiber (fasthttp)
 ```
+
+---
+
+## Benchmarks
+
+Results from [HttpArena](https://http-arena.com/) (Alpha Round, Linux, AMD Ryzen Threadripper PRO 3995WX, server container and load generator pinned to 32 physical cores / 64 threads each, best of 3 runs). Both [`fnet-h1`](https://http-arena.com/frameworks/fnet-h1/) and [`fnet-ws`](https://http-arena.com/frameworks/fnet-ws/) run in standard configuration with `ReusePort: true`.
+
+### HTTP/1.1: `fnet-h1` vs `go-stdlib` (`net/http`)
+
+`fnet-h1` parses requests with `http.ReadRequest`, serves standard `http.Handler` routes on `fhttp`, and runs `crypto/tls` via `ftls` for the HTTPS profiles. In the [head-to-head comparison](https://http-arena.com/compare/all/#fnet-h1-vs-go-stdlib), **`fnet-h1` leads on 11 of the 12 shared profiles** (`Latency-10K` is a fixed 10k req/sec rate test):
+
+| Profile | Conns | `fnet-h1` req/sec | `go-stdlib` req/sec | Delta | `fnet-h1` p99 | `go-stdlib` p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 4,096 | **2,404,492** | 504,598 | **+377%** | **8.09ms** | 60.80ms |
+| Pipelined | 4,096 | **13,726,828** | 1,180,568 | **+1063%** | **21.70ms** | 1.86s |
+| Short-lived | 4,096 | **2,010,211** | 169,377 | **+1087%** | **9.10ms** | 246.60ms |
+| Latency-10K | 1,024 | 9,981 | **9,983** | -0% | 124.0us | **116.0us** |
+| Latency-1M | 1,024 | **997,258** | 455,847 | **+119%** | **518.0us** | 10760192.0us |
+| Latency-500K/8 | 1,024 | **404,289** | 213,531 | **+89%** | **4004864.0us** | 11309056.0us |
+| JSON Comp | 4,096 | **230,866** | 192,578 | **+20%** | 248.80ms | **188.80ms** |
+| JSON Comp | 16,384 | **228,590** | 193,771 | **+18%** | 701.70ms | **245.10ms** |
+| JSON TLS | 4,096 | **457,968** | 369,093 | **+24%** | **801.33ms** | 1.89s |
+| 8Gbit | 512 | **49,243** | 48,986 | **+1%** | **171.0us** | 2321.0us |
+| Static TLS | 1,024 | **244,877** | 150,056 | **+63%** | 564.47ms | **370.15ms** |
+| Async DB | 1,024 | **116,347** | 86,296 | **+35%** | **20.60ms** | 27.10ms |
+
+`fnet-h1` also completes the 32,000-connection `Async Delay` profile at **1,494,896 req/sec** (p99 `41.20ms`, `841 MiB`).
+
+### WebSocket: `fnet-ws`
+
+From the **2026-10-12** [HttpArena WebSocket composite leaderboard](https://http-arena.com/#scope=ws&type=flagship,emerging,experimental&tuned=1) across `Flagship`, `Emerging`, and `Experimental` frameworks (including `Tuned`, 22 entries across languages), **`fnet-ws` ranked #1 overall** (composite score **2903**, #1 in Go):
+
+| # | Framework | Language | Composite | Echo (msg/sec · Mem) | Echo Pipelined (msg/sec · Mem) | Echo Short-lived (msg/sec · Mem) |
+| ---: | --- | --- | ---: | ---: | ---: | ---: |
+| **1** | **fnet-ws** | Go | **2903** | 3.93M · 96 MiB | 56.80M · 91 MiB | 2.17M · 219 MiB |
+| 2 | fib | Go | 2790 | 3.75M · 166 MiB | 48.86M · 167 MiB | 2.33M · 262 MiB |
+| 3 | nilo | Zig | 2673 | 3.86M · 223 MiB | 56.87M · 234 MiB | 1.67M · 158 MiB |
+| 4 | genhttp-ioxide | C# | 2440 | 3.40M · 1.60 GiB | 37.19M · 1.60 GiB | 2.20M · 1.50 GiB |
+| 5 | wtx | Rust | 2346 | 4.01M · 179 MiB | 19.66M · 179 MiB | 2.35M · 143 MiB |
+| 6 | fulmine.js | JS | 2310 | 3.66M · 2.27 GiB | 23.34M · 2.30 GiB | 2.32M · 2.25 GiB |
+| 7 | uio-ws | Go | 2123 | 3.46M · 100 MiB | 46.80M · 100 MiB | 1.03M · 65 MiB |
+| 8 | dusty | Zig | 1956 | 3.92M · 219 MiB | 5.08M · 194 MiB | 2.08M · 71 MiB |
+| 9 | hical | C++ | 1847 | 3.53M · 235 MiB | 4.14M · 244 MiB | 2.10M · 118 MiB |
+| 10 | morojs | JS | 1692 | 3.32M · 3.93 GiB | 4.35M · 4.03 GiB | 1.85M · 4.70 GiB |
+| 11 | bun-websocket *(tuned)* | TS | 1667 | 3.59M · 688 MiB | 43.91M · 930 MiB | — |
+| 12 | fiber | Go | 1634 | 3.06M · 549 MiB | 4.74M · 618 MiB | 1.85M · 543 MiB |
+
+Profile columns report the mean throughput and memory across connection tiers (`512`, `4,096`, and `16,384` concurrent connections; `512` and `4,096` for `Echo Short-lived`).
 
 ---
 
@@ -232,7 +320,7 @@ go test ./http -run XXX -bench GET   # GET benchmark: fhttp vs net/http vs fiber
 - TLS is server side only. `ftls` relies on how `crypto/tls` treats a temporary read error (the connection stays usable, and so does a record cut short), which `go test ./ftls` checks: run it after upgrading Go. A custom `fnet.Options.Executor` must not lock its goroutines to OS threads.
 - WebSocket: no permessage-deflate; messages are always sent as a single frame.
 - Half-close is supported only by a `HalfCloseHandler` (as `fhttp` is, on Linux/macOS): for any other Handler, after EOF the connection is closed once the buffered data has been sent, and a reply another goroutine writes later is discarded.
-- The kqueue path is fully tested on macOS; the epoll path has run HttpArena's WebSocket benchmarks on Linux and passes their validation. Run `go test -race ./...` on your Linux target before going live.
+- The kqueue path is fully tested on macOS; the epoll path has run HttpArena's HTTP/1.1 and WebSocket benchmarks on Linux and passes their validation. Run `go test -race ./...` on your Linux target before going live.
 
 ---
 

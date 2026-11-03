@@ -166,6 +166,46 @@ srv, err := fhttp.NewServer(":8443", mux, fhttp.Options{
 
 自定义 TCP 协议直接包装它的 handler：`fnet.NewServer(":9443", ftls.NewHandler(echo{}, config, 0), fnet.Options{})`，最后一个参数是握手超时（0 表示 10s）。
 
+### Gin
+
+`*gin.Engine` 实现了 `http.Handler`，因此 Gin 的路由、中间件和参数绑定可以直接运行在 `fhttp.Server` 上而无需改动（完整示例见 [examples/http-gin](examples/http-gin/main.go)）：
+
+```go
+package main
+
+import (
+	"log"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"github.com/linfeip/fnet/fhttp"
+)
+
+func main() {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+
+	r.GET("/hello", func(c *gin.Context) {
+		c.String(http.StatusOK, "hello world")
+	})
+	r.POST("/json", func(c *gin.Context) {
+		var v map[string]any
+		if err := c.ShouldBindJSON(&v); err != nil {
+			c.String(http.StatusBadRequest, "%s\n", err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"received": v})
+	})
+
+	srv, err := fhttp.NewServer(":8080", r, fhttp.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Fatal(srv.Serve())
+}
+```
+
 ### WebSocket
 
 一个 echo 服务端，与 [examples/websocket](examples/websocket/main.go) 相同：
@@ -209,16 +249,64 @@ Linux 上设置 `fhttp.Options{Engine: fnet.Options{ReusePort: true}}` 后，每
 
 ## 示例
 
-示例是一个独立的 module（`examples/go.mod`，编译时使用本仓库里的 fnet），它的依赖（例如 HTTP 压测用到的 fiber）不会进入 fnet 自己的 `go.mod`。
+示例是一个独立的 module（`examples/go.mod`，编译时使用本仓库里的 fnet），它的依赖（例如 Gin）不会进入 fnet 自己的 `go.mod`。
 
 ```bash
 cd examples
 go run ./echo        # TCP echo
 go run ./http        # HTTP：GET、表单、JSON、PUT/PATCH/DELETE/OPTIONS、chunked、multipart 上传
 go run ./http -addr :8443 -tls   # HTTPS，启动时自动生成自签名证书（curl 需加 -k）
+go run ./http-gin    # 基于 Gin 的 HTTP 服务：路由、中间件、JSON 绑定、文件上传（支持 -tls）
 go run ./websocket   # WebSocket echo
-go test ./http -run XXX -bench GET   # GET 压测：fhttp、net/http、fiber对比
 ```
+
+---
+
+## 性能压测
+
+数据来自独立基准测试平台 [HttpArena](https://http-arena.com/)（Alpha Round，Linux，AMD Ryzen Threadripper PRO 3995WX，服务端容器与压测端各绑定独立的 32 物理核 / 64 线程，取 3 轮最佳成绩）。[`fnet-h1`](https://http-arena.com/frameworks/fnet-h1/) 与 [`fnet-ws`](https://http-arena.com/frameworks/fnet-ws/) 均使用标准配置并开启 `ReusePort: true`。
+
+### HTTP/1.1：`fnet-h1` vs `go-stdlib`（标准库 `net/http`）
+
+`fnet-h1` 使用标准库 `http.ReadRequest` 解析请求，在 `fhttp` 上直接运行标准 `http.Handler`，HTTPS 场景通过 `ftls` 调用标准库 `crypto/tls`。在 [一对一对比](https://http-arena.com/compare/all/#fnet-h1-vs-go-stdlib) 共同运行的 12 项测试中，**`fnet-h1` 在 11 项上领先**（`Latency-10K` 为固定 10k req/sec 恒定速率测试）：
+
+| Profile | 连接数 | `fnet-h1` req/sec | `go-stdlib` req/sec | 提升幅度 | `fnet-h1` p99 | `go-stdlib` p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 4,096 | **2,404,492** | 504,598 | **+377%** | **8.09ms** | 60.80ms |
+| Pipelined | 4,096 | **13,726,828** | 1,180,568 | **+1063%** | **21.70ms** | 1.86s |
+| Short-lived | 4,096 | **2,010,211** | 169,377 | **+1087%** | **9.10ms** | 246.60ms |
+| Latency-10K | 1,024 | 9,981 | **9,983** | -0% | 124.0us | **116.0us** |
+| Latency-1M | 1,024 | **997,258** | 455,847 | **+119%** | **518.0us** | 10760192.0us |
+| Latency-500K/8 | 1,024 | **404,289** | 213,531 | **+89%** | **4004864.0us** | 11309056.0us |
+| JSON Comp | 4,096 | **230,866** | 192,578 | **+20%** | 248.80ms | **188.80ms** |
+| JSON Comp | 16,384 | **228,590** | 193,771 | **+18%** | 701.70ms | **245.10ms** |
+| JSON TLS | 4,096 | **457,968** | 369,093 | **+24%** | **801.33ms** | 1.89s |
+| 8Gbit | 512 | **49,243** | 48,986 | **+1%** | **171.0us** | 2321.0us |
+| Static TLS | 1,024 | **244,877** | 150,056 | **+63%** | 564.47ms | **370.15ms** |
+| Async DB | 1,024 | **116,347** | 86,296 | **+35%** | **20.60ms** | 27.10ms |
+
+此外，`fnet-h1` 还完成了 32,000 并发连接的 `Async Delay` 测试，吞吐达到 **1,494,896 req/sec**（p99 `41.20ms`，内存 `841 MiB`）。
+
+### WebSocket：`fnet-ws`
+
+数据来自 **2026-10-12** 的 [HttpArena WebSocket 综合榜单](https://http-arena.com/#scope=ws&type=flagship,emerging,experimental&tuned=1)（涵盖跨语言 `Flagship`、`Emerging`、`Experimental` 及 `Tuned` 共 22 个框架），**`fnet-ws` 综合得分排名总榜第 1**（总分 **2903**，Go 语言第 1）：
+
+| # | 框架 | 语言 | 综合得分 | Echo（吞吐 · 内存） | Echo Pipelined（吞吐 · 内存） | Echo Short-lived（吞吐 · 内存） |
+| ---: | --- | --- | ---: | ---: | ---: | ---: |
+| **1** | **fnet-ws** | Go | **2903** | 3.93M · 96 MiB | 56.80M · 91 MiB | 2.17M · 219 MiB |
+| 2 | fib | Go | 2790 | 3.75M · 166 MiB | 48.86M · 167 MiB | 2.33M · 262 MiB |
+| 3 | nilo | Zig | 2673 | 3.86M · 223 MiB | 56.87M · 234 MiB | 1.67M · 158 MiB |
+| 4 | genhttp-ioxide | C# | 2440 | 3.40M · 1.60 GiB | 37.19M · 1.60 GiB | 2.20M · 1.50 GiB |
+| 5 | wtx | Rust | 2346 | 4.01M · 179 MiB | 19.66M · 179 MiB | 2.35M · 143 MiB |
+| 6 | fulmine.js | JS | 2310 | 3.66M · 2.27 GiB | 23.34M · 2.30 GiB | 2.32M · 2.25 GiB |
+| 7 | uio-ws | Go | 2123 | 3.46M · 100 MiB | 46.80M · 100 MiB | 1.03M · 65 MiB |
+| 8 | dusty | Zig | 1956 | 3.92M · 219 MiB | 5.08M · 194 MiB | 2.08M · 71 MiB |
+| 9 | hical | C++ | 1847 | 3.53M · 235 MiB | 4.14M · 244 MiB | 2.10M · 118 MiB |
+| 10 | morojs | JS | 1692 | 3.32M · 3.93 GiB | 4.35M · 4.03 GiB | 1.85M · 4.70 GiB |
+| 11 | bun-websocket *(tuned)* | TS | 1667 | 3.59M · 688 MiB | 43.91M · 930 MiB | — |
+| 12 | fiber | Go | 1634 | 3.06M · 549 MiB | 4.74M · 618 MiB | 1.85M · 543 MiB |
+
+表中各场景列为多档并发连接（`512`、`4,096`、`16,384` 连接；`Echo Short-lived` 为 `512`、`4,096` 连接）的平均吞吐（msg/sec）与平均内存。
 
 ---
 
@@ -231,7 +319,7 @@ go test ./http -run XXX -bench GET   # GET 压测：fhttp、net/http、fiber对�
 - TLS 只支持服务端。`ftls` 依赖 `crypto/tls` 对临时性读错误的处理方式：连接继续可用，读到一半的 record 也保留，这一点由 `go test ./ftls` 检查，升级 Go 后请先跑一遍。自定义的 `fnet.Options.Executor` 不能把它的 goroutine 锁定到系统线程上（`LockOSThread`）。
 - WebSocket：不支持 permessage-deflate，发送的消息总是单帧。
 - 只有 `HalfCloseHandler` 支持半关闭（`fhttp` 就是，仅 Linux/macOS）：其他 Handler 读到 EOF 后，发完已缓冲的数据就关闭连接，其他 goroutine 之后才写的回复会被丢弃。
-- kqueue 路径已在 macOS 上完整测试；epoll 路径已在 Linux 上跑过 HttpArena 的 WebSocket 压测，并通过其校验。上线前请在目标 Linux 环境执行 `go test -race ./...`。
+- kqueue 路径已在 macOS 上完整测试；epoll 路径已在 Linux 上跑过 HttpArena 的 HTTP/1.1 与 WebSocket 压测，并通过其校验。上线前请在目标 Linux 环境执行 `go test -race ./...`。
 
 ---
 
