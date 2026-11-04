@@ -3,6 +3,7 @@
 package fnet
 
 import (
+	"net"
 	"net/netip"
 	"syscall"
 	"unsafe"
@@ -107,4 +108,71 @@ func rawIO(trap uintptr, fd int, p unsafe.Pointer, n, flags int) (int, error) {
 		return int(r), errno
 	}
 	return int(r), nil
+}
+
+// recvDatagram receives one datagram into b and decodes the sender without allocating.
+func recvDatagram(fd int, b []byte) (int, netip.AddrPort, error) {
+	var rsa unix.RawSockaddrAny
+	for {
+		size := uint32(unix.SizeofSockaddrAny)
+		r, _, errno := syscall.RawSyscall6(unix.SYS_RECVFROM,
+			uintptr(fd), uintptr(unsafe.Pointer(unsafe.SliceData(b))), uintptr(len(b)), 0,
+			uintptr(unsafe.Pointer(&rsa)), uintptr(unsafe.Pointer(&size)))
+		if errno == unix.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return int(r), netip.AddrPort{}, errno
+		}
+		switch rsa.Addr.Family {
+		case unix.AF_INET:
+			sa := (*unix.RawSockaddrInet4)(unsafe.Pointer(&rsa))
+			return int(r), netip.AddrPortFrom(netip.AddrFrom4(sa.Addr), networkPort(sa.Port)), nil
+		case unix.AF_INET6:
+			sa := (*unix.RawSockaddrInet6)(unsafe.Pointer(&rsa))
+			return int(r), inet6AddrPort(sa.Addr, networkPort(sa.Port), sa.Scope_id), nil
+		}
+		return int(r), netip.AddrPort{}, nil
+	}
+}
+
+// sendDatagram sends b as one datagram to addr; ipv4 says the socket family is AF_INET.
+func sendDatagram(fd int, b []byte, addr netip.AddrPort, ipv4 bool) error {
+	if !addr.IsValid() {
+		return &net.AddrError{Err: "invalid address", Addr: addr.String()}
+	}
+	var (
+		ptr  unsafe.Pointer
+		size uintptr
+	)
+	if ipv4 {
+		ip := addr.Addr().Unmap()
+		if !ip.Is4() {
+			return &net.AddrError{Err: "non-IPv4 address", Addr: ip.String()}
+		}
+		var sa unix.RawSockaddrInet4
+		sa.Family = unix.AF_INET
+		sa.Port = networkPort(addr.Port())
+		sa.Addr = ip.As4()
+		ptr, size = unsafe.Pointer(&sa), unix.SizeofSockaddrInet4
+	} else {
+		var sa unix.RawSockaddrInet6
+		sa.Family = unix.AF_INET6
+		sa.Port = networkPort(addr.Port())
+		sa.Addr = addr.Addr().As16() // IPv4 becomes v4-mapped, as the standard library does
+		sa.Scope_id = zoneToUint32(addr.Addr().Zone())
+		ptr, size = unsafe.Pointer(&sa), unix.SizeofSockaddrInet6
+	}
+	for {
+		_, _, errno := syscall.RawSyscall6(unix.SYS_SENDTO,
+			uintptr(fd), uintptr(unsafe.Pointer(unsafe.SliceData(b))), uintptr(len(b)),
+			unix.MSG_NOSIGNAL, uintptr(ptr), size)
+		if errno == unix.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	}
 }

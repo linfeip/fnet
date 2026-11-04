@@ -289,3 +289,18 @@ func addrPortToTCPAddr(ap netip.AddrPort) net.Addr {
 	}
 	return net.TCPAddrFromAddrPort(ap)
 }
+
+// zoneToUint32 turns an IPv6 zone into an interface index, like net's zoneToInt: a decimal number is taken as the
+// index, a name is looked up, and an unknown zone is 0.
+func zoneToUint32(zone string) uint32 {
+	if zone == "" {
+		return 0
+	}
+	if n, err := strconv.ParseUint(zone, 10, 32); err == nil {
+		return uint32(n)
+	}
+	if ifi, err := net.InterfaceByName(zone); err == nil {
+		return uint32(ifi.Index)
+	}
+	return 0
+}

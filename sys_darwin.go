@@ -3,6 +3,7 @@
 package fnet
 
 import (
+	"net"
 	"net/netip"
 	"syscall"
 
@@ -60,3 +61,47 @@ func setKeepAlive(fd int) {
 func sysRead(fd int, b []byte) (int, error)      { return unix.Read(fd, b) }
 func sysWrite(fd int, b []byte) (int, error)     { return unix.Write(fd, b) }
 func sysWritev(fd int, bs [][]byte) (int, error) { return unix.Writev(fd, bs) }
+
+func recvDatagram(fd int, b []byte) (int, netip.AddrPort, error) {
+	for {
+		n, sa, err := unix.Recvfrom(fd, b, 0)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return n, netip.AddrPort{}, err
+		}
+		return n, sockaddrToAddrPort(sa), nil
+	}
+}
+
+func sendDatagram(fd int, b []byte, addr netip.AddrPort, ipv4 bool) error {
+	sa, err := addrPortToSockaddr(addr, ipv4)
+	if err != nil {
+		return err
+	}
+	for {
+		err := unix.Sendto(fd, b, unix.MSG_NOSIGNAL, sa)
+		if err != unix.EINTR {
+			return err
+		}
+	}
+}
+
+func addrPortToSockaddr(addr netip.AddrPort, ipv4 bool) (unix.Sockaddr, error) {
+	if !addr.IsValid() {
+		return nil, &net.AddrError{Err: "invalid address", Addr: addr.String()}
+	}
+	if ipv4 {
+		ip := addr.Addr().Unmap()
+		if !ip.Is4() {
+			return nil, &net.AddrError{Err: "non-IPv4 address", Addr: ip.String()}
+		}
+		return &unix.SockaddrInet4{Port: int(addr.Port()), Addr: ip.As4()}, nil
+	}
+	return &unix.SockaddrInet6{
+		Port:   int(addr.Port()),
+		Addr:   addr.Addr().As16(),
+		ZoneId: zoneToUint32(addr.Addr().Zone()),
+	}, nil
+}

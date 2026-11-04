@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-面向大量并发连接、低内存占用的 Go 高性能事件驱动网络库：在同一套事件循环上提供 TCP 引擎、兼容 `net/http` 的 HTTP/1.x 服务器和 WebSocket 服务端。
+面向大量并发连接、低内存占用的 Go 高性能事件驱动网络库：在同一套事件循环上提供 TCP/UDP 引擎、兼容 `net/http` 的 HTTP/1.x 服务器和 WebSocket 服务端。
 
 底层采用主从 Reactor 模型，由原生 I/O 多路复用驱动：**Linux 使用 epoll，macOS 使用 kqueue**。其它平台（含 Windows）基于标准库实现同一套 API。
 
@@ -24,7 +24,7 @@
 
 | 包 | 职责 |
 | --- | --- |
-| `fnet` | TCP 引擎：主从 Reactor、一连接一任务、并发安全的写（`Handler`、`Conn`、`Options`） |
+| `fnet` | TCP/UDP 引擎：共享 Reactor 底座，`Server`（`Handler`、`Conn`、`Options`）与独立的 `UDPServer`（`UDPHandler`、`UDPConn`、`UDPOptions`） |
 | `ftls` | 基于 `fnet` 的 TLS：包装任意 `Handler`，在回调里运行标准库 `crypto/tls` |
 | `fhttp` | 基于 `fnet` 的 HTTP/1.x 服务器：请求调度、`http.Handler`、协议升级、HTTPS（经由 `ftls`） |
 | `websocket` | 基于 `fhttp` 的 WebSocket 服务端：握手、帧处理、消息回调、合并写 |
@@ -98,6 +98,27 @@ log.Fatal(srv.Serve())
 ```
 
 Handler 还可以实现几个可选接口：`ClosingHandler`（`OnClosing`，引擎自行关闭连接前写出数据）、`WritableHandler`（`OnWritable`，`Conn.Writable` 重新为 true 时恢复写出，仅 Linux/macOS）、`HalfCloseHandler`（`OnHalfClose`，对端关闭写方向后保持连接以便继续应答，仅 Linux/macOS）和 `ResumeHandler`（`OnResume`，把暂停读取期间自己留下的数据继续交出）。
+
+### UDP
+
+```go
+type udpEcho struct{}
+
+func (udpEcho) OnPacket(c fnet.UDPConn, data []byte, from netip.AddrPort) {
+	c.WriteToUDPAddrPort(data, from)
+}
+
+srv, err := fnet.NewUDPServer(":9000", udpEcho{}, fnet.UDPOptions{ReusePort: true})
+if err != nil {
+	log.Fatal(err)
+}
+log.Fatal(srv.Serve())
+```
+
+- **多 socket 并行策略（`UDPOptions.ReusePort`）**：单个 UDP socket 的 `OnPacket` 回调始终串行执行。在 Linux 上开启 `ReusePort: true` 时，`NewUDPServer` 会通过 `SO_REUSEPORT` 创建 `GOMAXPROCS` 个 socket 分散挂载到各子 Reactor；内核按四元组哈希分流，既保证同一对端的数据报落在同一 socket 保序处理，又让不同对端在多核上并行回调。未开启 `ReusePort` 或在 macOS 上固定使用 1 个 socket。
+- **非阻塞发送（`EAGAIN` 丢包语义）**：在 Linux/macOS 上，`WriteToUDPAddrPort` 可从任意 goroutine 并发调用且永不阻塞；当内核发送缓冲满时直接返回 `EAGAIN`（或 `ENOBUFS`）并丢弃该数据报，不会像标准库 `net.UDPConn` 那样阻塞等待或做用户态排队。
+- **双栈与 v4-mapped 地址**：双栈 socket（如监听 `":9000"`）收到 IPv4 对端发来的包时，`from` 表现为 IPv4-mapped IPv6 地址（`::ffff:a.b.c.d`，可用 `from.Addr().Unmap()` 还原纯 IPv4 地址），直接原样传回 `WriteToUDPAddrPort` 即可回包。
+- **打洞与 KCP 集成**：引擎内部不保存 per-peer 状态。NAT 打洞可通过 `srv.Conn()` 在收到任何包之前从监听端口主动外发探测包（见 [examples/udp-punch](examples/udp-punch/main.go)）；叠加 KCP 等有状态协议时，由应用层按对端地址维护会话表（需配置会话上限、idle 淘汰及共享 ticker，见 [examples/udp-kcp](examples/udp-kcp/main.go)、[examples/udp-echo](examples/udp-echo/main.go)）。
 
 ### HTTP
 

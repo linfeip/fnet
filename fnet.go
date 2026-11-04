@@ -1,4 +1,4 @@
-// Package fnet is an event-driven TCP network library based on the Reactor model.
+// Package fnet is an event-driven TCP and UDP network library based on the Reactor model.
 //
 // On Linux (epoll) / macOS (kqueue) it uses a main/sub-reactor structure:
 //   - listeners (a server may listen on several addresses): the first sub-reactor's Poller watches the one
@@ -16,14 +16,18 @@
 //   - a connection does not occupy a goroutine of its own and an idle connection holds no read or write
 //     buffer, so a small number of goroutines can carry a million connections.
 //
+// UDP servers (see NewUDPServer) run on the same reactor foundation: each socket is watched edge-triggered for reading,
+// and its task reads the datagrams and passes each on to UDPHandler.OnPacket.
+//
 // Other platforms (such as Windows) implement the same API on top of the standard library net: one goroutine
-// per connection.
+// per connection, and one per UDP socket.
 package fnet
 
 import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"runtime"
 	"time"
 )
@@ -182,6 +186,36 @@ type Conn interface {
 	Detach() (net.Conn, error)
 }
 
+// UDPHandler is the callback interface of a UDP server, see NewUDPServer.
+type UDPHandler interface {
+	// OnPacket is called for every datagram received; from is its sender, an IPv4-mapped IPv6 address when an IPv4 peer
+	// sends to a dual-stack socket (netip.Addr.Unmap gives the IPv4 address), to which a reply goes back all the same.
+	// data is only valid within this callback (on Linux/macOS it is a read buffer borrowed by the engine that is reused
+	// once the callback returns, and it may be modified in place); it holds the whole datagram, up to the 64KB UDP allows.
+	//
+	// The datagrams of one socket are passed on serially, in the order they arrived; on Linux/macOS the callbacks run in a
+	// goroutine of the executor, like those of Handler, and must not block. With UDPOptions.ReusePort on Linux a server
+	// has one socket per P, whose callbacks run in parallel: the kernel picks the socket by the datagram's addresses and
+	// ports, so the datagrams of one peer keep arriving at the same socket, in order.
+	OnPacket(c UDPConn, data []byte, from netip.AddrPort)
+}
+
+// UDPConn is a UDP socket of a UDPServer. Its methods may be called concurrently from any goroutine.
+type UDPConn interface {
+	// LocalAddr returns the address the socket is bound to, the same for every socket of the server.
+	LocalAddr() net.Addr
+	// WriteToUDPAddrPort sends b as one datagram to addr, from the server's address whichever of its sockets sends it.
+	// An IPv4 addr is sent IPv4-mapped from a dual-stack socket, as the standard library does. On Linux/macOS it never
+	// blocks: when the socket's send buffer is full it returns the error (EAGAIN, or ENOBUFS) and the datagram is
+	// dropped, which UDP allows, whereas the standard library's waits; nothing is queued. Errors do not close the socket.
+	// The caller may reuse b once it returns; it returns net.ErrClosed once the server is closed.
+	WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error)
+}
+
+// maxDatagramSize is the size of the buffer a UDP socket reads into: more than the largest datagram, 65507 bytes over
+// IPv4 and 65527 over IPv6, so that none is truncated.
+const maxDatagramSize = 64 << 10
+
 // detachedConn is a connection taken out of the engine by Conn.Detach. Read first returns the data OnData left
 // unconsumed; the *net.TCPConn is embedded so that the rest of its methods (CloseWrite, ReadFrom, ...) stay
 // available, which net/http uses.
@@ -248,6 +282,30 @@ func (o Options) withDefaults() Options {
 	}
 	if o.ReadBufferSize <= 0 {
 		o.ReadBufferSize = 16 << 10
+	}
+	return o
+}
+
+// UDPOptions holds the engine parameters of a UDPServer; the zero value is the default configuration.
+type UDPOptions struct {
+	// NumLoops is the number of sub-reactors (event loops); max(2, runtime.GOMAXPROCS(0)/8) when <=0. Linux/macOS only.
+	NumLoops int
+	// Executor runs a UDP socket's tasks (reading datagrams into a borrowed 64KB buffer, invoking UDPHandler.OnPacket,
+	// closing): a socket has at most one task at a time, keyed by its fd. When a callback panics the socket stays open,
+	// queues one continuation task and re-panics so Executor can recover and log it.
+	// When nil, NewUDPServer creates a private taskpool.NewDefault() executor whose workers end when the server stops
+	// (an executor of your own is yours to end). Linux/macOS only.
+	Executor func(key int, task func())
+	// ReusePort gives a UDPServer one socket per P on Linux, shared through SO_REUSEPORT and spread over the loops: a
+	// socket's datagrams are passed on serially, so multiple sockets let callbacks run in parallel while the kernel's
+	// 4-tuple hash keeps one peer's datagrams on the same socket in order. Without it, or on macOS, the server uses one
+	// socket.
+	ReusePort bool
+}
+
+func (o UDPOptions) withDefaults() UDPOptions {
+	if o.NumLoops <= 0 {
+		o.NumLoops = max(2, runtime.GOMAXPROCS(0)/8)
 	}
 	return o
 }

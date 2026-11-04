@@ -2,7 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
-A high-performance, event-driven network library for Go, built for large numbers of concurrent connections with a small memory footprint: a TCP engine, an `net/http`-compatible HTTP/1.x server and a WebSocket server, all on the same set of event loops.
+A high-performance, event-driven network library for Go, built for large numbers of concurrent connections with a small memory footprint: a TCP and UDP engine, an `net/http`-compatible HTTP/1.x server and a WebSocket server, all on the same set of event loops.
 
 I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, kqueue on macOS**. Other platforms (such as Windows) get the same API on top of the standard library.
 
@@ -24,7 +24,7 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 
 | Package | Responsibility |
 | --- | --- |
-| `fnet` | TCP engine: main/sub-reactors, one task per connection, concurrency-safe writes (`Handler`, `Conn`, `Options`) |
+| `fnet` | TCP and UDP engine: shared reactor, `Server` (`Handler`, `Conn`, `Options`) and `UDPServer` (`UDPHandler`, `UDPConn`, `UDPOptions`) |
 | `ftls` | TLS on `fnet`: wraps any `Handler`, running the standard `crypto/tls` inside the callbacks |
 | `fhttp` | HTTP/1.x server on `fnet`: request dispatch, `http.Handler`, protocol upgrade, HTTPS (through `ftls`) |
 | `websocket` | WebSocket server on `fhttp`: handshake, framing, message callbacks, write coalescing |
@@ -99,6 +99,27 @@ log.Fatal(srv.Serve())
 ```
 
 A handler can also implement optional interfaces: `ClosingHandler` (`OnClosing`, write something before the engine closes the connection on its own), `WritableHandler` (`OnWritable`, resume writing once `Conn.Writable` reports true again, Linux/macOS only), `HalfCloseHandler` (`OnHalfClose`, keep the connection open to answer a peer that closed its write direction, Linux/macOS only) and `ResumeHandler` (`OnResume`, pass on data it kept while reading was paused).
+
+### UDP
+
+```go
+type udpEcho struct{}
+
+func (udpEcho) OnPacket(c fnet.UDPConn, data []byte, from netip.AddrPort) {
+	c.WriteToUDPAddrPort(data, from)
+}
+
+srv, err := fnet.NewUDPServer(":9000", udpEcho{}, fnet.UDPOptions{ReusePort: true})
+if err != nil {
+	log.Fatal(err)
+}
+log.Fatal(srv.Serve())
+```
+
+- **Socket parallelism (`UDPOptions.ReusePort`)**: `OnPacket` callbacks of a single UDP socket run serially. With `ReusePort: true` on Linux, `NewUDPServer` opens `GOMAXPROCS` sockets sharing the address via `SO_REUSEPORT` and spreads them across the sub-reactors; the kernel hashes the 4-tuple so one peer's datagrams stay in order on the same socket while different peers run in parallel. Without `ReusePort`, or on macOS, the server uses one socket.
+- **Non-blocking sends (`EAGAIN` drop)**: on Linux/macOS `WriteToUDPAddrPort` may be called from any goroutine and never blocks. When the kernel send buffer is full it returns `EAGAIN` (or `ENOBUFS`) immediately and drops the datagram rather than queueing it, unlike `net.UDPConn` which blocks waiting for buffer space.
+- **Dual-stack addresses**: an IPv4 peer sending to a dual-stack socket (such as `":9000"`) appears as an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, `from.Addr().Unmap()` yields the plain IPv4 address), and passing `from` straight back to `WriteToUDPAddrPort` replies to it.
+- **Hole punching and KCP**: `fnet` keeps no per-peer state inside the engine. Use `srv.Conn()` to send outbound probes from the listening port before any packet has been received ([examples/udp-punch](examples/udp-punch/main.go)), and manage per-peer sessions (with a session cap, idle eviction and a shared ticker) in the application when layering protocols such as KCP ([examples/udp-kcp](examples/udp-kcp/main.go), [examples/udp-echo](examples/udp-echo/main.go)).
 
 ### HTTP
 

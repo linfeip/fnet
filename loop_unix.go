@@ -3,32 +3,18 @@
 package fnet
 
 import (
-	"runtime"
 	"slices"
-	"sync/atomic"
 
 	"github.com/linfeip/fnet/poll"
 )
 
-// loop is a sub-reactor: a Poller watching the connections it owns, and the worker polling it (see worker), which hands
-// the tasks of the connections it finds ready to the Executor.
+// loop is a TCP sub-reactor: a Poller watching the connections it owns, paired with a reactorWorker (see reactor_unix.go)
+// that hands ready connection tasks to the Executor and accepts on ready listening sockets.
 type loop struct {
 	srv         *Server
-	poller      *poll.Poller // the readiness of the loop's connections, see poll.New
+	poller      *poll.Poller // the readiness of the loop's connections, owned by the paired subReactor
 	listenerFds []int        // the listening sockets the Poller watches as well (see accept), set before Serve
-	active      atomic.Bool  // the last poll retrieved events; other loops' workers help only while it is set (see help)
 }
-
-func newLoop(s *Server) (*loop, error) {
-	p, err := poll.New()
-	if err != nil {
-		return nil, err
-	}
-	return &loop{srv: s, poller: p}, nil
-}
-
-// close releases the Poller; it must be called after the workers have exited.
-func (l *loop) close() { l.poller.Close() }
 
 // watchListener has the loop's Poller watch the listening socket fd as well.
 func (l *loop) watchListener(fd int) error {
@@ -77,92 +63,13 @@ func (l *loop) watch(c *conn) bool {
 	return true
 }
 
-// startWorker starts the loop's worker.
-func (l *loop) startWorker() {
-	l.srv.workersWg.Add(1)
-	w := &worker{home: l}
-	go w.run()
-}
-
-// worker is the goroutine serving a loop: it polls the loop's Poller and hands the tasks of the connections it reports
-// ready to the Executor, accepting itself on a ready listening socket. When the loop has nothing to do it helps the
-// other loops in the same way, and only when none of them has anything either does it wait in its own loop's Poller,
-// blocking its thread in the kernel: under load the worker fetches the events itself, without waiting for the
-// scheduler to run some goroutine for it, and an idle one costs nothing. It never runs user code itself.
-type worker struct {
-	home  *loop
-	batch poll.Batch
-	next  int // where helping the other loops starts next time, so that it spreads over them
-}
-
-// run is the worker's loop until the server stops.
-//
-// After every round that had something to do the worker gives up its P. A goroutine that is woken waits on the P of
-// the goroutine that woke it, so the Executor's goroutines woken for the tasks just handed over wait on this one, and a
-// busy worker never waits: they would run only when another P steals them or the scheduler preempts the worker, after
-// 10ms. Yielding runs them at once, and the events that arrive meanwhile are retrieved together by the next poll: with
-// a yield only once a millisecond, 4096 echoing connections on 24 CPUs ran about 3% slower.
-func (w *worker) run() {
-	l := w.home
-	defer l.srv.workersWg.Done()
-	for !l.srv.stopping.Load() {
-		if w.serve(l) || w.help() {
-			runtime.Gosched()
-			continue
-		}
-		// Serve wakes every loop after setting stopping: a wakeup that comes after the check below ends Block.
-		if l.srv.stopping.Load() {
-			break
-		}
-		l.poller.Block(&w.batch)
-		w.runBatch(l)
-	}
-	// The wakeups for stopping may have been taken by workers of other loops: pass them on.
-	for _, other := range l.srv.loops {
-		other.poller.Wake()
-	}
-}
-
-// serve polls l's Poller once and hands over the tasks of the connections it reports ready; it reports whether l had
-// anything to do. A wakeup (sent only when the server stops) counts as something to do, so that run looks at stopping.
-func (w *worker) serve(l *loop) bool {
-	woken := l.poller.Poll(&w.batch)
-	if w.batch.Len() == 0 {
-		l.active.Store(false)
-		return woken
-	}
-	w.runBatch(l)
-	return true
-}
-
-// help serves the other loops that had events on their last poll, until one has something to do; it reports whether one
-// had. A loop whose last poll found nothing is skipped, so idle workers do not contend on its Poller.
-func (w *worker) help() bool {
-	loops := w.home.srv.loops
-	w.next++
-	for i := range loops {
-		l := loops[(w.next+i)%len(loops)]
-		if l == w.home || !l.active.Load() {
-			continue
-		}
-		if w.serve(l) {
-			return true
-		}
-	}
-	return false
-}
-
 // runBatch hands over the tasks of the connections in the batch just retrieved from l's Poller, then accepts if the
 // batch reported a listening socket: accepting until none is left takes a while during a burst of connections, and the
 // connections already reported ready need not wait for it.
-func (w *worker) runBatch(l *loop) {
-	if w.batch.Len() == 0 {
-		return
-	}
-	l.active.Store(true)
+func (l *loop) runBatch(batch *poll.Batch) {
 	accepting := false
-	for i := range w.batch.Len() {
-		fd, ev := w.batch.Event(i)
+	for i := range batch.Len() {
+		fd, ev := batch.Event(i)
 		accepting = l.handleEvent(fd, ev) || accepting
 	}
 	if accepting {
