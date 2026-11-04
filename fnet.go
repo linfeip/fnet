@@ -301,6 +301,12 @@ type UDPOptions struct {
 	// 4-tuple hash keeps one peer's datagrams on the same socket in order. Without it, or on macOS, the server uses one
 	// socket.
 	ReusePort bool
+	// ReadBufferSize sets the kernel receive buffer size (SO_RCVBUF) of each UDP socket in bytes when >0; <=0 keeps
+	// the operating system default. Raising it absorbs larger bursts before the kernel drops incoming datagrams.
+	ReadBufferSize int
+	// WriteBufferSize sets the kernel send buffer size (SO_SNDBUF) of each UDP socket in bytes when >0; <=0 keeps
+	// the operating system default.
+	WriteBufferSize int
 }
 
 func (o UDPOptions) withDefaults() UDPOptions {

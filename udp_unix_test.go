@@ -209,6 +209,26 @@ func TestUDPLocalAddr(t *testing.T) {
 	}
 }
 
+func TestUDPSocketBufferSizes(t *testing.T) {
+	const want = 512 << 10
+	srv := startUDPServer(t, udpHandlerFunc(echoUDP), UDPOptions{
+		ReadBufferSize:  want,
+		WriteBufferSize: want,
+	})
+	fd := srv.sockets[0].fd
+	rcv, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snd, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rcv < want || snd < want {
+		t.Fatalf("SO_RCVBUF=%d SO_SNDBUF=%d, want >= %d", rcv, snd, want)
+	}
+}
+
 func TestUDPWriteAfterClose(t *testing.T) {
 	connCh := make(chan UDPConn, 1)
 	srv := startUDPServer(t, udpHandlerFunc(func(c UDPConn, data []byte, from netip.AddrPort) {

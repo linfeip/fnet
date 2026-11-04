@@ -57,7 +57,7 @@ func NewUDPServer(addr string, handler UDPHandler, opts UDPOptions) (*UDPServer,
 		loops[i] = ul
 	}
 	for i, fd := range fds {
-		p, err := newUDPSocket(s, fd, laddr)
+		p, err := newUDPSocket(s, fd, laddr, opts)
 		if err != nil {
 			for _, rest := range fds[i:] {
 				unix.Close(rest)
@@ -149,7 +149,17 @@ type udpSocket struct {
 	closed bool
 }
 
-func newUDPSocket(srv *UDPServer, fd int, localAddr net.Addr) (*udpSocket, error) {
+func newUDPSocket(srv *UDPServer, fd int, localAddr net.Addr, opts UDPOptions) (*udpSocket, error) {
+	if opts.ReadBufferSize > 0 {
+		if err := setSocketBuffer(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, opts.ReadBufferSize); err != nil {
+			return nil, os.NewSyscallError("setsockopt", err)
+		}
+	}
+	if opts.WriteBufferSize > 0 {
+		if err := setSocketBuffer(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, opts.WriteBufferSize); err != nil {
+			return nil, os.NewSyscallError("setsockopt", err)
+		}
+	}
 	sa, err := unix.Getsockname(fd)
 	if err != nil {
 		return nil, os.NewSyscallError("getsockname", err)
@@ -170,6 +180,17 @@ func newUDPSocket(srv *UDPServer, fd int, localAddr net.Addr) (*udpSocket, error
 	}
 	p.task = p.run
 	return p, nil
+}
+
+// setSocketBuffer sets SO_RCVBUF or SO_SNDBUF, stepping down on ENOBUFS/EINVAL where BSD kernels reject values above
+// kern.ipc.maxsockbuf instead of clamping them as Linux does.
+func setSocketBuffer(fd, level, opt, size int) error {
+	for s := size; s >= 64<<10; s /= 2 {
+		if err := unix.SetsockoptInt(fd, level, opt, s); err != unix.ENOBUFS && err != unix.EINVAL {
+			return err
+		}
+	}
+	return unix.SetsockoptInt(fd, level, opt, size)
 }
 
 func (p *udpSocket) notify(ev uint32) {

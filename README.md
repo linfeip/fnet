@@ -25,6 +25,7 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 | Package | Responsibility |
 | --- | --- |
 | `fnet` | TCP and UDP engine: shared reactor, `Server` (`Handler`, `Conn`, `Options`) and `UDPServer` (`UDPHandler`, `UDPConn`, `UDPOptions`) |
+| `fkcp` | Wire-compatible KCP reliable-UDP server on `fnet.UDPServer`: sharded zero-alloc session table, pooled ARQ buffers, shared ticker (`Server`, `Conn`, `Handler`, `Options`) |
 | `ftls` | TLS on `fnet`: wraps any `Handler`, running the standard `crypto/tls` inside the callbacks |
 | `fhttp` | HTTP/1.x server on `fnet`: request dispatch, `http.Handler`, protocol upgrade, HTTPS (through `ftls`) |
 | `websocket` | WebSocket server on `fhttp`: handshake, framing, message callbacks, write coalescing |
@@ -32,7 +33,7 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 | `poll` | epoll / kqueue wrapper |
 | `internal/bytepool` | Size-class byte buffer pool |
 
-Dependencies are one-way: `websocket → fhttp → ftls → fnet → poll`, and `fnet`, `fhttp` → `taskpool`.
+Dependencies are one-way: `websocket → fhttp → ftls → fnet → poll`, `fkcp → fnet`, and `fnet`, `fhttp` → `taskpool`.
 
 ```text
 user Handler (the only place that sees application data)
@@ -119,7 +120,29 @@ log.Fatal(srv.Serve())
 - **Socket parallelism (`UDPOptions.ReusePort`)**: `OnPacket` callbacks of a single UDP socket run serially. With `ReusePort: true` on Linux, `NewUDPServer` opens `GOMAXPROCS` sockets sharing the address via `SO_REUSEPORT` and spreads them across the sub-reactors; the kernel hashes the 4-tuple so one peer's datagrams stay in order on the same socket while different peers run in parallel. Without `ReusePort`, or on macOS, the server uses one socket.
 - **Non-blocking sends (`EAGAIN` drop)**: on Linux/macOS `WriteToUDPAddrPort` may be called from any goroutine and never blocks. When the kernel send buffer is full it returns `EAGAIN` (or `ENOBUFS`) immediately and drops the datagram rather than queueing it, unlike `net.UDPConn` which blocks waiting for buffer space.
 - **Dual-stack addresses**: an IPv4 peer sending to a dual-stack socket (such as `":9000"`) appears as an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, `from.Addr().Unmap()` yields the plain IPv4 address), and passing `from` straight back to `WriteToUDPAddrPort` replies to it.
-- **Hole punching and KCP**: `fnet` keeps no per-peer state inside the engine. Use `srv.Conn()` to send outbound probes from the listening port before any packet has been received ([examples/udp-punch](examples/udp-punch/main.go)), and manage per-peer sessions (with a session cap, idle eviction and a shared ticker) in the application when layering protocols such as KCP ([examples/udp-kcp](examples/udp-kcp/main.go), [examples/udp-echo](examples/udp-echo/main.go)).
+- **Socket buffers and hole punching**: `UDPOptions.ReadBufferSize` / `WriteBufferSize` tune `SO_RCVBUF` / `SO_SNDBUF`, and `srv.Conn()` lets the application send outbound probes from the listening port before any packet has been received ([examples/udp-punch](examples/udp-punch/main.go), [examples/udp-echo](examples/udp-echo/main.go)).
+
+### KCP
+
+`fkcp` layers wire-compatible KCP ARQ (interoperable with `kcp-go` and C `ikcp` peers, with zero third-party dependencies) on top of `fnet.UDPServer`, with 64-shard session management, pooled buffers, a session cap and shared idle eviction ([examples/udp-kcp](examples/udp-kcp/main.go)):
+
+```go
+type kcpEcho struct{}
+
+func (kcpEcho) OnOpen(c *fkcp.Conn)             {}
+func (kcpEcho) OnData(c *fkcp.Conn, data []byte) { c.Write(data) }
+func (kcpEcho) OnClose(c *fkcp.Conn, err error) {}
+
+srv, err := fkcp.NewServer(":9000", kcpEcho{}, fkcp.Options{
+	UDP:        fnet.UDPOptions{ReusePort: true},
+	NoDelay:    true,
+	StreamMode: true,
+})
+if err != nil {
+	log.Fatal(err)
+}
+log.Fatal(srv.Serve())
+```
 
 ### HTTP
 

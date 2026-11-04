@@ -37,9 +37,8 @@ func (p *stdUDPConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, err
 	return n, err
 }
 
-// NewUDPServer creates a UDP socket on addr; datagrams start being handled once Serve is called. opts is ignored on
-// this platform.
-func NewUDPServer(addr string, handler UDPHandler, _ UDPOptions) (*UDPServer, error) {
+// NewUDPServer creates a UDP socket on addr; datagrams start being handled once Serve is called.
+func NewUDPServer(addr string, handler UDPHandler, opts UDPOptions) (*UDPServer, error) {
 	pc, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		return nil, err
@@ -48,6 +47,18 @@ func NewUDPServer(addr string, handler UDPHandler, _ UDPOptions) (*UDPServer, er
 	if !ok {
 		pc.Close()
 		return nil, errors.New("fnet: not a UDP socket")
+	}
+	if opts.ReadBufferSize > 0 {
+		if err := conn.SetReadBuffer(opts.ReadBufferSize); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+	if opts.WriteBufferSize > 0 {
+		if err := conn.SetWriteBuffer(opts.WriteBufferSize); err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
 	return &UDPServer{
 		handler: handler,

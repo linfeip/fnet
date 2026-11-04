@@ -25,6 +25,7 @@
 | 包 | 职责 |
 | --- | --- |
 | `fnet` | TCP/UDP 引擎：共享 Reactor 底座，`Server`（`Handler`、`Conn`、`Options`）与独立的 `UDPServer`（`UDPHandler`、`UDPConn`、`UDPOptions`） |
+| `fkcp` | 基于 `fnet.UDPServer` 的零依赖 KCP 可靠流服务端：分片零分配会话表、池化 ARQ 缓冲、共享 ticker（`Server`、`Conn`、`Handler`、`Options`） |
 | `ftls` | 基于 `fnet` 的 TLS：包装任意 `Handler`，在回调里运行标准库 `crypto/tls` |
 | `fhttp` | 基于 `fnet` 的 HTTP/1.x 服务器：请求调度、`http.Handler`、协议升级、HTTPS（经由 `ftls`） |
 | `websocket` | 基于 `fhttp` 的 WebSocket 服务端：握手、帧处理、消息回调、合并写 |
@@ -32,7 +33,7 @@
 | `poll` | epoll / kqueue 封装 |
 | `internal/bytepool` | 按大小分级的字节缓冲池 |
 
-依赖方向是单向的：`websocket → fhttp → ftls → fnet → poll`，以及 `fnet`、`fhttp` → `taskpool`。
+依赖方向是单向的：`websocket → fhttp → ftls → fnet → poll`、`fkcp → fnet`，以及 `fnet`、`fhttp` → `taskpool`。
 
 ```text
 用户 Handler（只有它看到业务数据）
@@ -118,7 +119,29 @@ log.Fatal(srv.Serve())
 - **多 socket 并行策略（`UDPOptions.ReusePort`）**：单个 UDP socket 的 `OnPacket` 回调始终串行执行。在 Linux 上开启 `ReusePort: true` 时，`NewUDPServer` 会通过 `SO_REUSEPORT` 创建 `GOMAXPROCS` 个 socket 分散挂载到各子 Reactor；内核按四元组哈希分流，既保证同一对端的数据报落在同一 socket 保序处理，又让不同对端在多核上并行回调。未开启 `ReusePort` 或在 macOS 上固定使用 1 个 socket。
 - **非阻塞发送（`EAGAIN` 丢包语义）**：在 Linux/macOS 上，`WriteToUDPAddrPort` 可从任意 goroutine 并发调用且永不阻塞；当内核发送缓冲满时直接返回 `EAGAIN`（或 `ENOBUFS`）并丢弃该数据报，不会像标准库 `net.UDPConn` 那样阻塞等待或做用户态排队。
 - **双栈与 v4-mapped 地址**：双栈 socket（如监听 `":9000"`）收到 IPv4 对端发来的包时，`from` 表现为 IPv4-mapped IPv6 地址（`::ffff:a.b.c.d`，可用 `from.Addr().Unmap()` 还原纯 IPv4 地址），直接原样传回 `WriteToUDPAddrPort` 即可回包。
-- **打洞与 KCP 集成**：引擎内部不保存 per-peer 状态。NAT 打洞可通过 `srv.Conn()` 在收到任何包之前从监听端口主动外发探测包（见 [examples/udp-punch](examples/udp-punch/main.go)）；叠加 KCP 等有状态协议时，由应用层按对端地址维护会话表（需配置会话上限、idle 淘汰及共享 ticker，见 [examples/udp-kcp](examples/udp-kcp/main.go)、[examples/udp-echo](examples/udp-echo/main.go)）。
+- **内核缓冲与 NAT 打洞**：`UDPOptions.ReadBufferSize` / `WriteBufferSize` 可配置内核 `SO_RCVBUF` / `SO_SNDBUF`；通过 `srv.Conn()` 可在收到任何包之前从监听端口主动外发探测包（见 [examples/udp-punch](examples/udp-punch/main.go)、[examples/udp-echo](examples/udp-echo/main.go)）。
+
+### KCP
+
+`fkcp` 在 `fnet.UDPServer` 之上提供零第三方依赖的标准 KCP ARQ 服务端（与 `kcp-go` 及 C 版 `ikcp` 线协议兼容），内置 64 分片会话表、`bytepool` 池化收发缓冲、会话上限与共享空闲回收（见 [examples/udp-kcp](examples/udp-kcp/main.go)）：
+
+```go
+type kcpEcho struct{}
+
+func (kcpEcho) OnOpen(c *fkcp.Conn)             {}
+func (kcpEcho) OnData(c *fkcp.Conn, data []byte) { c.Write(data) }
+func (kcpEcho) OnClose(c *fkcp.Conn, err error) {}
+
+srv, err := fkcp.NewServer(":9000", kcpEcho{}, fkcp.Options{
+	UDP:        fnet.UDPOptions{ReusePort: true},
+	NoDelay:    true,
+	StreamMode: true,
+})
+if err != nil {
+	log.Fatal(err)
+}
+log.Fatal(srv.Serve())
+```
 
 ### HTTP
 
