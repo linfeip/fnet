@@ -1,4 +1,4 @@
-package fh2
+package http2
 
 import (
 	"context"
@@ -903,7 +903,7 @@ func (c *conn) runHandler(w *response, req *http.Request) (ok bool) {
 		if err := recover(); err != nil {
 			if err != http.ErrAbortHandler {
 				buf := make([]byte, 64<<10)
-				slog.Error("fh2: panic serving stream", "remoteAddr", c.state.remoteAddr, "streamID", w.stream.id,
+				slog.Error("http2: panic serving stream", "remoteAddr", c.state.remoteAddr, "streamID", w.stream.id,
 					"panic", err, "stack", string(buf[:runtime.Stack(buf, false)]))
 			}
 			ok = false

@@ -25,7 +25,7 @@
 | 包 | 职责 |
 | --- | --- |
 | `fnet` | TCP/UDP 引擎：共享 Reactor 底座，`Server`（`Handler`、`Conn`、`Options`）与独立的 `UDPServer`（`UDPHandler`、`UDPConn`、`UDPOptions`） |
-| `fkcp` | 基于 `fnet.UDPServer` 的零依赖 KCP 可靠流服务端：分片零分配会话表、池化 ARQ 缓冲、共享 ticker（`Server`、`Conn`、`Handler`、`Options`） |
+| `kcp` | 基于 `fnet.UDPServer` 的零依赖 KCP 可靠流服务端：分片零分配会话表、池化 ARQ 缓冲、共享 ticker（`Server`、`Conn`、`Handler`、`Options`） |
 | `ftls` | 基于 `fnet` 的 TLS：包装任意 `Handler`，在回调里运行标准库 `crypto/tls` |
 | `fhttp` | 基于 `fnet` 的 HTTP/1.x 服务器：请求调度、`http.Handler`、协议升级、HTTPS（经由 `ftls`） |
 | `websocket` | 基于 `fhttp` 的 WebSocket 服务端：握手、帧处理、消息回调、合并写 |
@@ -33,7 +33,7 @@
 | `poll` | epoll / kqueue 封装 |
 | `internal/bytepool` | 按大小分级的字节缓冲池 |
 
-依赖方向是单向的：`websocket → fhttp → ftls → fnet → poll`、`fkcp → fnet`，以及 `fnet`、`fhttp` → `taskpool`。
+依赖方向是单向的：`websocket → fhttp → ftls → fnet → poll`、`kcp → fnet`，以及 `fnet`、`fhttp` → `taskpool`。
 
 ```text
 用户 Handler（只有它看到业务数据）
@@ -123,16 +123,16 @@ log.Fatal(srv.Serve())
 
 ### KCP
 
-`fkcp` 在 `fnet.UDPServer` 之上提供零第三方依赖的标准 KCP ARQ 服务端（与 `kcp-go` 及 C 版 `ikcp` 线协议兼容），内置 64 分片会话表、`bytepool` 池化收发缓冲、会话上限与共享空闲回收（见 [examples/udp-kcp](examples/udp-kcp/main.go)）：
+`kcp` 在 `fnet.UDPServer` 之上提供零第三方依赖的标准 KCP ARQ 服务端（与 `kcp-go` 及 C 版 `ikcp` 线协议兼容），内置 64 分片会话表、`bytepool` 池化收发缓冲、会话上限与共享空闲回收（见 [examples/udp-kcp](examples/udp-kcp/main.go)）：
 
 ```go
 type kcpEcho struct{}
 
-func (kcpEcho) OnOpen(c *fkcp.Conn)             {}
-func (kcpEcho) OnData(c *fkcp.Conn, data []byte) { c.Write(data) }
-func (kcpEcho) OnClose(c *fkcp.Conn, err error) {}
+func (kcpEcho) OnOpen(c *kcp.Conn)             {}
+func (kcpEcho) OnData(c *kcp.Conn, data []byte) { c.Write(data) }
+func (kcpEcho) OnClose(c *kcp.Conn, err error) {}
 
-srv, err := fkcp.NewServer(":9000", kcpEcho{}, fkcp.Options{
+srv, err := kcp.NewServer(":9000", kcpEcho{}, kcp.Options{
 	UDP:        fnet.UDPOptions{ReusePort: true},
 	NoDelay:    true,
 	StreamMode: true,

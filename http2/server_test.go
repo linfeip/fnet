@@ -1,6 +1,6 @@
 //go:build go1.24
 
-package fh2
+package http2
 
 import (
 	"bufio"
@@ -553,7 +553,7 @@ func TestStreamCancelCancelsRequestContext(t *testing.T) {
 	}
 }
 
-// rawH2Conn drives low-level wire-protocol conformance tests against fh2.
+// rawH2Conn drives low-level wire-protocol conformance tests against http2.
 type rawH2Conn struct {
 	test          *testing.T
 	netConnection net.Conn

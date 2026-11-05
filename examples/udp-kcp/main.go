@@ -1,4 +1,4 @@
-// udp-kcp is an example KCP reliable-UDP echo server built on fkcp.
+// udp-kcp is an example KCP reliable-UDP echo server built on fnet/kcp.
 //
 // Run a standalone echo server:
 //
@@ -18,19 +18,19 @@ import (
 	"time"
 
 	"github.com/linfeip/fnet"
-	"github.com/linfeip/fnet/fkcp"
-	"github.com/xtaci/kcp-go/v5"
+	"github.com/linfeip/fnet/kcp"
+	kcpgo "github.com/xtaci/kcp-go/v5"
 )
 
 type echo struct{}
 
-func (echo) OnOpen(c *fkcp.Conn) {}
+func (echo) OnOpen(c *kcp.Conn) {}
 
-func (echo) OnData(c *fkcp.Conn, data []byte) {
+func (echo) OnData(c *kcp.Conn, data []byte) {
 	_, _ = c.Write(data)
 }
 
-func (echo) OnClose(c *fkcp.Conn, err error) {}
+func (echo) OnClose(c *kcp.Conn, err error) {}
 
 func main() {
 	addr := flag.String("addr", ":9000", "listen address")
@@ -44,7 +44,7 @@ func main() {
 		return
 	}
 
-	srv, err := fkcp.NewServer(*addr, echo{}, fkcp.Options{
+	srv, err := kcp.NewServer(*addr, echo{}, kcp.Options{
 		UDP:         fnet.UDPOptions{ReusePort: true},
 		NoDelay:     true,
 		StreamMode:  true,
@@ -61,7 +61,7 @@ func main() {
 }
 
 func runDemo() {
-	srv, err := fkcp.NewServer("127.0.0.1:0", echo{}, fkcp.Options{
+	srv, err := kcp.NewServer("127.0.0.1:0", echo{}, kcp.Options{
 		UDP:         fnet.UDPOptions{ReusePort: true},
 		NoDelay:     true,
 		StreamMode:  true,
@@ -75,7 +75,7 @@ func runDemo() {
 	go func() { served <- srv.Serve() }()
 
 	// Connect an unmodified kcp-go client (pure ARQ, no encryption/FEC) to verify wire compatibility.
-	client, err := kcp.DialWithOptions(srv.Addr().String(), nil, 0, 0)
+	client, err := kcpgo.DialWithOptions(srv.Addr().String(), nil, 0, 0)
 	if err != nil {
 		panic(err)
 	}
@@ -100,13 +100,13 @@ func runDemo() {
 		panic("kcp echo payload mismatch")
 	}
 	_ = client.Close()
-	slog.Info("fkcp <-> kcp-go wire interop verified", "bytes", len(payload), "activeSessions", srv.SessionCount())
+	slog.Info("fnet/kcp <-> kcp-go wire interop verified", "bytes", len(payload), "activeSessions", srv.SessionCount())
 
 	time.Sleep(250 * time.Millisecond)
 	if remaining := srv.SessionCount(); remaining != 0 {
 		panic("expected idle session to be evicted")
 	}
-	slog.Info("fkcp idle session eviction verified", "activeSessions", srv.SessionCount())
+	slog.Info("kcp idle session eviction verified", "activeSessions", srv.SessionCount())
 
 	_ = srv.Close()
 	if err := <-served; !errors.Is(err, fnet.ErrServerClosed) {

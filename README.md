@@ -25,7 +25,7 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 | Package | Responsibility |
 | --- | --- |
 | `fnet` | TCP and UDP engine: shared reactor, `Server` (`Handler`, `Conn`, `Options`) and `UDPServer` (`UDPHandler`, `UDPConn`, `UDPOptions`) |
-| `fkcp` | Wire-compatible KCP reliable-UDP server on `fnet.UDPServer`: sharded zero-alloc session table, pooled ARQ buffers, shared ticker (`Server`, `Conn`, `Handler`, `Options`) |
+| `kcp` | Wire-compatible KCP reliable-UDP server on `fnet.UDPServer`: sharded zero-alloc session table, pooled ARQ buffers, shared ticker (`Server`, `Conn`, `Handler`, `Options`) |
 | `ftls` | TLS on `fnet`: wraps any `Handler`, running the standard `crypto/tls` inside the callbacks |
 | `fhttp` | HTTP/1.x server on `fnet`: request dispatch, `http.Handler`, protocol upgrade, HTTPS (through `ftls`) |
 | `websocket` | WebSocket server on `fhttp`: handshake, framing, message callbacks, write coalescing |
@@ -33,7 +33,7 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 | `poll` | epoll / kqueue wrapper |
 | `internal/bytepool` | Size-class byte buffer pool |
 
-Dependencies are one-way: `websocket → fhttp → ftls → fnet → poll`, `fkcp → fnet`, and `fnet`, `fhttp` → `taskpool`.
+Dependencies are one-way: `websocket → fhttp → ftls → fnet → poll`, `kcp → fnet`, and `fnet`, `fhttp` → `taskpool`.
 
 ```text
 user Handler (the only place that sees application data)
@@ -124,16 +124,16 @@ log.Fatal(srv.Serve())
 
 ### KCP
 
-`fkcp` layers wire-compatible KCP ARQ (interoperable with `kcp-go` and C `ikcp` peers, with zero third-party dependencies) on top of `fnet.UDPServer`, with 64-shard session management, pooled buffers, a session cap and shared idle eviction ([examples/udp-kcp](examples/udp-kcp/main.go)):
+`kcp` layers wire-compatible KCP ARQ (interoperable with `kcp-go` and C `ikcp` peers, with zero third-party dependencies) on top of `fnet.UDPServer`, with 64-shard session management, pooled buffers, a session cap and shared idle eviction ([examples/udp-kcp](examples/udp-kcp/main.go)):
 
 ```go
 type kcpEcho struct{}
 
-func (kcpEcho) OnOpen(c *fkcp.Conn)             {}
-func (kcpEcho) OnData(c *fkcp.Conn, data []byte) { c.Write(data) }
-func (kcpEcho) OnClose(c *fkcp.Conn, err error) {}
+func (kcpEcho) OnOpen(c *kcp.Conn)             {}
+func (kcpEcho) OnData(c *kcp.Conn, data []byte) { c.Write(data) }
+func (kcpEcho) OnClose(c *kcp.Conn, err error) {}
 
-srv, err := fkcp.NewServer(":9000", kcpEcho{}, fkcp.Options{
+srv, err := kcp.NewServer(":9000", kcpEcho{}, kcp.Options{
 	UDP:        fnet.UDPOptions{ReusePort: true},
 	NoDelay:    true,
 	StreamMode: true,

@@ -1,4 +1,4 @@
-package fkcp
+package kcp
 
 import (
 	"bytes"
@@ -59,7 +59,7 @@ func startTestServer(t *testing.T, h Handler, opts Options) *Server {
 	return srv
 }
 
-// testClient wraps a UDP socket and an arqState so fkcp tests have zero external dependencies.
+// testClient wraps a UDP socket and an arqState so kcp tests have zero external dependencies.
 type testClient struct {
 	udp   *net.UDPConn
 	mu    sync.Mutex

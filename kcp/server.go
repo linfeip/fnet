@@ -1,4 +1,4 @@
-// Package fkcp is a zero-dependency KCP reliable-UDP server built on fnet.UDPServer.
+// Package kcp is a zero-dependency KCP reliable-UDP server built on fnet.UDPServer.
 //
 // It implements the wire-compatible KCP ARQ protocol directly over fnet's non-blocking UDP sockets without spawning a
 // goroutine per session:
@@ -6,7 +6,7 @@
 //   - Segment payloads and temporary packet encoding buffers borrow from fnet's internal bytepool, so an idle session
 //     holds no packet buffers and steady-state echo allocates nothing on the heap.
 //   - A single background ticker drives periodic retransmissions and idle eviction across all shards.
-package fkcp
+package kcp
 
 import (
 	"encoding/binary"
@@ -292,7 +292,7 @@ func (s *Server) closeAllSessions() {
 
 func recoverCallbackPanic() {
 	if r := recover(); r != nil {
-		slog.Error("fkcp: panic in callback", "panic", r, "stack", string(debug.Stack()))
+		slog.Error("kcp: panic in callback", "panic", r, "stack", string(debug.Stack()))
 	}
 }
 

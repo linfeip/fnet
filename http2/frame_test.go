@@ -1,4 +1,4 @@
-package fh2
+package http2
 
 import (
 	"bytes"

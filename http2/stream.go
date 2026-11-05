@@ -1,4 +1,4 @@
-package fh2
+package http2
 
 import (
 	"context"
@@ -12,10 +12,10 @@ import (
 )
 
 var (
-	errStreamReset           = errors.New("fh2: stream reset")
-	errClientDisconnected    = errors.New("fh2: client disconnected")
-	errBodyClosedByHandler   = errors.New("fh2: request body closed by handler")
-	errContentLengthMismatch = errors.New("fh2: request body size does not match Content-Length")
+	errStreamReset           = errors.New("http2: stream reset")
+	errClientDisconnected    = errors.New("http2: client disconnected")
+	errBodyClosedByHandler   = errors.New("http2: request body closed by handler")
+	errContentLengthMismatch = errors.New("http2: request body size does not match Content-Length")
 )
 
 type streamState uint8

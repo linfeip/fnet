@@ -1,6 +1,6 @@
 //go:build !race
 
-package fkcp
+package kcp
 
 import "testing"
 

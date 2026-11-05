@@ -1,4 +1,4 @@
-package fkcp
+package kcp
 
 import (
 	"encoding/binary"
@@ -39,7 +39,7 @@ const (
 // ErrMessageTooLarge is returned by Conn.Write in message mode (Options.StreamMode == false) when b splits into more
 // segments than ReceiveWindow (or 256) allows to be reassembled at once. Enable Options.StreamMode for arbitrarily
 // large writes.
-var ErrMessageTooLarge = errors.New("fkcp: message exceeds receive window in message mode")
+var ErrMessageTooLarge = errors.New("kcp: message exceeds receive window in message mode")
 
 type ackItem struct {
 	sequence  uint32

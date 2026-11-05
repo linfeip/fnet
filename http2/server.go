@@ -1,4 +1,4 @@
-// Package fh2 is an HTTP/2 (RFC 9113) server built on the fnet engine.
+// Package http2 is an HTTP/2 (RFC 9113) server built on the fnet engine.
 //
 // Architecture:
 //   - Framing, HPACK decoding and connection-level control frames (SETTINGS, PING, WINDOW_UPDATE, RST_STREAM, GOAWAY)
@@ -12,7 +12,7 @@
 //     windows and fnet.Conn.Writable.
 //   - With Options.TLSConfig set, TLS and ALPN ("h2") run in-callback via package ftls; otherwise the server speaks
 //     cleartext HTTP/2 with prior knowledge (h2c).
-package fh2
+package http2
 
 import (
 	"crypto/tls"

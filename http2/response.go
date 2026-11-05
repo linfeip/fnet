@@ -1,4 +1,4 @@
-package fh2
+package http2
 
 import (
 	"fmt"
@@ -169,7 +169,7 @@ func (w *response) Header() http.Header { return w.header }
 
 func (w *response) WriteHeader(code int) {
 	if code < 100 || code > 999 {
-		panic(fmt.Sprintf("fh2: invalid WriteHeader code %v", code))
+		panic(fmt.Sprintf("http2: invalid WriteHeader code %v", code))
 	}
 	if w.wroteHeader {
 		return

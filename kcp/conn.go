@@ -1,4 +1,4 @@
-package fkcp
+package kcp
 
 import (
 	"errors"
@@ -11,7 +11,7 @@ import (
 )
 
 // ErrDeadLink is the OnClose reason when a peer stops acknowledging retransmissions after 20 attempts.
-var ErrDeadLink = errors.New("fkcp: dead link")
+var ErrDeadLink = errors.New("kcp: dead link")
 
 const (
 	cbRead      uint32 = 1 << 0
