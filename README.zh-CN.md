@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-面向大量并发连接、低内存占用的 Go 高性能事件驱动网络库：在同一套事件循环上提供 TCP/UDP 引擎、兼容 `net/http` 的 HTTP/1.x 服务器和 WebSocket 服务端。
+面向大量并发连接、低内存占用的 Go 高性能事件驱动网络库：在同一套事件循环上提供 TCP/UDP 引擎、兼容 `net/http` 的 HTTP/1.x 与 HTTP/2 服务器，以及 WebSocket 服务端。
 
 底层采用主从 Reactor 模型，由原生 I/O 多路复用驱动：**Linux 使用 epoll，macOS 使用 kqueue**。其它平台（含 Windows）基于标准库实现同一套 API。
 
@@ -14,7 +14,7 @@
 - 🧵 **空闲连接 0 协程常驻**：空闲套接字只挂在 Poller 上，不占用 goroutine，也不持有缓冲；读缓冲只在任务读取时借用。
 - ⚡ **并发安全的直接写**：`Conn.Write` / `Writev` 可在任意 goroutine 调用，永不阻塞，直接写 socket（头部 + 负载用 `writev` 一次写出）。
 - 🔌 **自定义 TCP 协议**：实现 `OnOpen` / `OnData` / `OnClose`，由你告诉引擎消费了多少字节。
-- 🛡️ **符合标准**：直接使用 `http.Handler` / `http.ServeMux`；WebSocket 遵循 RFC 6455。
+- 🛡️ **符合标准**：直接使用 `http.Handler` / `http.ServeMux`，支持 HTTP/1.x 与 HTTP/2；HTTP/2 遵循 RFC 9113，WebSocket 遵循 RFC 6455。
 - 🔒 **TLS 不需要每连接一个 goroutine**：HTTPS 和 WSS 只需一个选项（`fhttp.Options.TLSConfig`）；标准库 `crypto/tls` 直接在连接的回调里运行，`ftls` 可以给任意 `fnet.Handler` 加上 TLS。
 - ⏱️ **截止时间式超时**：慢速客户端无法靠一点一点送字节来占住连接。
 
@@ -28,12 +28,13 @@
 | `kcp` | 基于 `fnet.UDPServer` 的零依赖 KCP 可靠流服务端：分片零分配会话表、池化 ARQ 缓冲、共享 ticker（`Server`、`Conn`、`Handler`、`Options`） |
 | `ftls` | 基于 `fnet` 的 TLS：包装任意 `Handler`，在回调里运行标准库 `crypto/tls` |
 | `fhttp` | 基于 `fnet` 的 HTTP/1.x 服务器：请求调度、`http.Handler`、协议升级、HTTPS（经由 `ftls`） |
+| `http2` | 基于 `fnet` 的 HTTP/2 服务器：TLS ALPN `h2` 或 h2c prior knowledge、多路复用流、通过 `http.Handler` 调度请求 |
 | `websocket` | 基于 `fhttp` 的 WebSocket 服务端：握手、帧处理、消息回调、合并写 |
 | `taskpool` | 按 CPU 分片的无锁 goroutine 池，连接任务的默认执行器 |
 | `poll` | epoll / kqueue 封装 |
 | `internal/bytepool` | 按大小分级的字节缓冲池 |
 
-依赖方向是单向的：`websocket → fhttp → ftls → fnet → poll`、`kcp → fnet`，以及 `fnet`、`fhttp` → `taskpool`。
+依赖方向是单向的：`websocket → fhttp → ftls → fnet → poll`、`http2 → ftls → fnet`、`kcp → fnet`，以及 `fnet`、`fhttp`、`http2` → `taskpool`。
 
 ```text
 用户 Handler（只有它看到业务数据）
@@ -65,6 +66,7 @@ Conn.Write 没有积压时直接写 socket，其余进发送缓冲，可写时�
 - **零拷贝读取，内核背压**：数据直接从借用的缓冲交给 `OnData`。回调返回之前不会再读取该连接，发送缓冲积压超过 64KB 时也不读取，因此处理慢或客户端不读回复时由 TCP 流量控制限速，而不是在内存里堆积。
 - **优雅关闭**：引擎自行关闭连接时（对端 EOF、截止时间到期、服务器关闭），`ClosingHandler` 可以先写出数据；`ftls` 在这里发送 TLS close_notify。
 - **HTTP**：回调里只找每个请求的结束位置（头部结束符 `\r\n\r\n`，头部不超过 `MaxHeaderBytes`（默认 16KB）和 500 个字段行，以及不超过 `MaxBufferedBodyBytes`（默认 1MB）、带 `Content-Length` 或普通 chunked 的请求体）。每个请求都交给标准库 `http.ReadRequest` 解析；Handler 运行在 executor（`Options.Executor`，默认是该服务器私有的 `taskpool.NewDefault()`）的 goroutine 上，只在连接有待处理请求时占用。客户端连接关闭，或客户端关闭其写方向时，`Request.Context` 被取消（它发出的请求仍会得到响应，和 `net/http` 一致）。一起排队的多个请求（pipelining）的响应合并成一次写出；客户端不接收响应时（积压超过 64KB，见 `Conn.Writable`），在它接收之前不再继续应答。超过 64KB 的响应体在 Handler 写入时就边写边发，`Write` 同样会等客户端接收，所以向慢客户端发送大文件时，内存里最多只有约 192KB 的响应体。更大的或分帧方式特殊的请求体（例如大文件上传）改由 `net/http` 流式处理：连接从 `fnet` 摘下（`Conn.Detach`），交给运行同一个 Handler 的内部 `http.Server`，处理完这个请求后关闭连接。需要 `http.Flusher` 的 Server-Sent Events 请求也这样处理。
+- **HTTP/2**：帧解析、HPACK 和连接级控制帧在各连接的 `fnet` 回调中串行执行；完整请求交给 `Options.Executor`，因此并发流共享同一连接，不会为每条流常驻一个读协程。支持 TLS ALPN `h2` 以及带 prior knowledge 的明文 h2c。
 - **WebSocket**：帧在连接的任务里切分、解掩码，直接回调 `OnMessage`，没有消息队列；处理同一批帧期间写出的回复会合并成一次写。
 - **TLS**：`ftls` 自己不实现 TLS 协议，握手和加解密都由标准库 `crypto/tls` 完成，它底下的 `net.Conn` 由连接的回调供给数据。阻塞式的握手放在协程（`iter.Pull`）里运行，`OnData` 每收到一段数据就恢复它一次，所以没有 goroutine 在等客户端；握手完成后，`OnData` 直接解密手头的 record，把明文交给业务。空闲的 TLS 连接不占 goroutine；流式请求体交给 `net/http` 时，TLS 会话一并移交。
 
@@ -192,6 +194,26 @@ func main() {
 }
 ```
 
+### HTTP/2
+
+`http2.Server` 接受普通的 `net/http` Handler，支持通过 TLS ALPN `h2` 提供 HTTP/2，或使用 prior knowledge 提供明文 h2c。完整示例包含 `http.Flusher` 流式响应与响应 trailer，见 [examples/http2](examples/http2/main.go)。
+
+```go
+cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+if err != nil {
+	log.Fatal(err)
+}
+srv, err := http2.NewServer(":8443", mux, http2.Options{
+	TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+})
+if err != nil {
+	log.Fatal(err)
+}
+log.Fatal(srv.Serve())
+```
+
+使用 h2c 时传入 `http2.Options{}`，客户端必须使用 prior knowledge，例如 `curl --http2-prior-knowledge http://localhost:8080/hello`。该包不会把 HTTP/1.1 连接升级为 HTTP/2；TLS 客户端通过 ALPN 协商 `h2`。
+
 ### HTTPS
 
 同一个服务器加上证书即可；WSS 用的也是这个选项：
@@ -300,6 +322,7 @@ cd examples
 go run ./echo        # TCP echo
 go run ./http        # HTTP：GET、表单、JSON、PUT/PATCH/DELETE/OPTIONS、chunked、multipart 上传
 go run ./http -addr :8443 -tls   # HTTPS，启动时自动生成自签名证书（curl 需加 -k）
+go run ./http2       # HTTP/2 over HTTPS（ALPN h2）；使用 -tls=false 启动 h2c
 go run ./http-gin    # 基于 Gin 的 HTTP 服务：路由、中间件、JSON 绑定、文件上传（支持 -tls）
 go run ./websocket   # WebSocket echo
 ```
@@ -358,7 +381,7 @@ go run ./websocket   # WebSocket echo
 
 - 没有写超时，发送缓冲也没有硬上限：积压超过 64KB 时连接暂停读取，从不读取的客户端不会让回复无限堆积；但应用自己主动写出的数据（例如广播）仍会让它增长，除非像 `fhttp` 那样先检查 `Conn.Writable`，再等待 `WritableHandler.OnWritable`（`websocket` 也提供同样的一对接口）。反过来，客户端在开始读取之前写入的数据超过 socket 缓冲能容纳的量，就会和回显它的连接互相等待而卡死，与阻塞式服务端的行为相同。
 - `fhttp` 交给 `net/http` 的请求沿用 `net/http` 的默认超时，读完请求头后不再有超时：读取流式请求体的 Handler 请用 `http.ResponseController.SetReadDeadline` 自行限定。
-- 不支持 HTTP/2：HTTPS 只有 HTTP/1.1。不支持 `http.Flusher` / `http.Hijacker`（超过 64KB 的响应体按 64KB 一段边写边发），交给 `net/http` 的连接除外：带流式请求体的请求，以及 Server-Sent Events（`Accept` 中带有 `text/event-stream` 的请求，`EventSource` 总会发送）。这类连接和在 `net/http` 上一样，每条占一个 goroutine。
+- `fhttp` 只支持 HTTP/1.x：不支持 HTTP/2，也不支持 `http.Flusher` / `http.Hijacker`（超过 64KB 的响应体按 64KB 一段边写边发），交给 `net/http` 的连接除外：带流式请求体的请求，以及 Server-Sent Events（`Accept` 中带有 `text/event-stream` 的请求，`EventSource` 总会发送）。这类连接和在 `net/http` 上一样，每条占一个 goroutine。需要 HTTP/2 时请使用 `http2` 包，它支持 TLS ALPN `h2` 或带 prior knowledge 的明文 h2c。
 - 向慢客户端写大响应体的 Handler，在 `Write` 等待期间会一直占用 Handler executor 的一个 goroutine，和其他阻塞的 Handler 一样。默认 Handler executor 与引擎执行器分开，所以 Handler 等待时引擎仍能继续刷新连接。如果有大量大响应要发给慢客户端，请通过 `fhttp.Options.Executor` 配置足够 worker。在 Linux/macOS 以外的平台，这样的写在内核里阻塞，没有时间限制。
 - TLS 只支持服务端。`ftls` 依赖 `crypto/tls` 对临时性读错误的处理方式：连接继续可用，读到一半的 record 也保留，这一点由 `go test ./ftls` 检查，升级 Go 后请先跑一遍。自定义的 `fnet.Options.Executor` 不能把它的 goroutine 锁定到系统线程上（`LockOSThread`）。
 - WebSocket：不支持 permessage-deflate，发送的消息总是单帧。

@@ -2,7 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
-A high-performance, event-driven network library for Go, built for large numbers of concurrent connections with a small memory footprint: a TCP and UDP engine, an `net/http`-compatible HTTP/1.x server and a WebSocket server, all on the same set of event loops.
+A high-performance, event-driven network library for Go, built for large numbers of concurrent connections with a small memory footprint: a TCP and UDP engine, `net/http`-compatible HTTP/1.x and HTTP/2 servers, and a WebSocket server, all on the same set of event loops.
 
 I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, kqueue on macOS**. Other platforms (such as Windows) get the same API on top of the standard library.
 
@@ -14,7 +14,7 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 - 🧵 **Zero-goroutine idle connections**: idle sockets stay on the poller and hold no goroutine and no buffer; the read buffer is borrowed only while a task is reading.
 - ⚡ **Direct, concurrency-safe writes**: `Conn.Write` / `Writev` can be called from any goroutine, never block, and go straight to the socket (`writev` for header + payload).
 - 🔌 **Custom TCP protocols**: implement `OnOpen` / `OnData` / `OnClose`, and tell the engine how many bytes you consumed.
-- 🛡️ **Standards compatible**: use `http.Handler` / `http.ServeMux` as is; WebSocket follows RFC 6455.
+- 🛡️ **Standards compatible**: use `http.Handler` / `http.ServeMux` as is across HTTP/1.x and HTTP/2; HTTP/2 follows RFC 9113 and WebSocket follows RFC 6455.
 - 🔒 **TLS without a goroutine per connection**: HTTPS and WSS take one option (`fhttp.Options.TLSConfig`); the standard `crypto/tls` runs inside the connection's callbacks, and `ftls` adds TLS to any `fnet.Handler`.
 - ⏱️ **Deadline-style timeouts**: slow clients cannot hold a connection by trickling bytes.
 
@@ -28,12 +28,13 @@ I/O is driven by a main/sub-reactor model on native pollers: **epoll on Linux, k
 | `kcp` | Wire-compatible KCP reliable-UDP server on `fnet.UDPServer`: sharded zero-alloc session table, pooled ARQ buffers, shared ticker (`Server`, `Conn`, `Handler`, `Options`) |
 | `ftls` | TLS on `fnet`: wraps any `Handler`, running the standard `crypto/tls` inside the callbacks |
 | `fhttp` | HTTP/1.x server on `fnet`: request dispatch, `http.Handler`, protocol upgrade, HTTPS (through `ftls`) |
+| `http2` | HTTP/2 server on `fnet`: ALPN `h2` or h2c prior knowledge, multiplexed streams, request dispatch through `http.Handler` |
 | `websocket` | WebSocket server on `fhttp`: handshake, framing, message callbacks, write coalescing |
 | `taskpool` | Per-CPU sharded lock-free goroutine pool, the default executor of connection tasks |
 | `poll` | epoll / kqueue wrapper |
 | `internal/bytepool` | Size-class byte buffer pool |
 
-Dependencies are one-way: `websocket → fhttp → ftls → fnet → poll`, `kcp → fnet`, and `fnet`, `fhttp` → `taskpool`.
+Dependencies are one-way: `websocket → fhttp → ftls → fnet → poll`, `http2 → ftls → fnet`, `kcp → fnet`, and `fnet`, `fhttp`, `http2` → `taskpool`.
 
 ```text
 user Handler (the only place that sees application data)
@@ -66,6 +67,7 @@ to the send buffer, which the connection task flushes when the socket is writabl
 - **Zero-copy reads, kernel backpressure**: data is handed to `OnData` straight from a borrowed buffer. A connection is not read again until its callback returns, nor while more than 64KB waits in its send buffer, so a slow handler, or a client that does not read its replies, is throttled by TCP flow control instead of piling up memory.
 - **Graceful close**: a `ClosingHandler` gets to write before the engine closes a connection on its own (peer EOF, expired deadline, server shutdown); `ftls` sends TLS close_notify there.
 - **HTTP**: the callback only looks for the end of each request (the header terminator `\r\n\r\n`, within `MaxHeaderBytes`, 16KB by default, and 500 field lines, then a body of up to `MaxBufferedBodyBytes`, 1MB by default, with `Content-Length` or plain chunks). Each request is parsed by the standard library's `http.ReadRequest`, and the Handler runs on a goroutine of the executor (`Options.Executor`, a private `taskpool.NewDefault()` by default), held only while the connection has pending requests. `Request.Context` is canceled when the client connection closes, or the client closes its write direction (it still gets the responses to the requests it sent, as with `net/http`). The responses to requests queued together (pipelining) go out in one write, and a client that does not take them (more than 64KB waiting, see `Conn.Writable`) is not answered further until it does. A response body over 64KB goes out while the Handler writes it, and its `Write` waits for the client the same way, so a large download to a slow client keeps no more than about 192KB of it in memory. A larger body (say a big file upload), or one framed in an unusual way, is streamed by `net/http` instead: the connection is detached from `fnet` (`Conn.Detach`) and handed to an internal `http.Server` running the same Handler, which closes it after that request. So are Server-Sent Events requests, which need `http.Flusher`.
+- **HTTP/2**: framing, HPACK and connection-level control run serially inside each connection's `fnet` callback; complete requests are dispatched to `Options.Executor`, so concurrent streams share one connection without a read goroutine per stream. TLS with ALPN `h2` and cleartext h2c with prior knowledge are supported.
 - **WebSocket**: frames are split and unmasked inside the connection's task and passed to `OnMessage` without a message queue; replies written while handling a batch of frames are coalesced into one write.
 - **TLS**: `ftls` implements no TLS of its own. The standard `crypto/tls` does the handshake and the encryption, over a `net.Conn` fed by the connection's callbacks. Its blocking handshake runs as a coroutine (`iter.Pull`) that `OnData` resumes with each piece of data, so no goroutine waits for the client; from then on `OnData` decrypts the records at hand and passes the plaintext on. An idle TLS connection holds no goroutine, and a streamed request body goes to `net/http` together with the TLS session.
 
@@ -193,6 +195,26 @@ func main() {
 }
 ```
 
+### HTTP/2
+
+`http2.Server` accepts ordinary `net/http` handlers and supports HTTP/2 over TLS with ALPN `h2`, or cleartext h2c with prior knowledge. The full example, including streaming with `http.Flusher` and response trailers, is [examples/http2](examples/http2/main.go).
+
+```go
+cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+if err != nil {
+	log.Fatal(err)
+}
+srv, err := http2.NewServer(":8443", mux, http2.Options{
+	TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+})
+if err != nil {
+	log.Fatal(err)
+}
+log.Fatal(srv.Serve())
+```
+
+For h2c, pass `http2.Options{}` and make clients use prior knowledge, for example `curl --http2-prior-knowledge http://localhost:8080/hello`. The package does not upgrade HTTP/1.1 connections; TLS clients negotiate `h2` through ALPN.
+
 ### HTTPS
 
 The same server with a certificate; WSS takes the same option:
@@ -301,6 +323,7 @@ cd examples
 go run ./echo        # TCP echo
 go run ./http        # HTTP: GET, forms, JSON, PUT/PATCH/DELETE/OPTIONS, chunked, multipart uploads
 go run ./http -addr :8443 -tls   # HTTPS, with a self-signed certificate generated at startup (curl -k)
+go run ./http2       # HTTP/2 over HTTPS (ALPN h2); add -tls=false for h2c
 go run ./http-gin    # HTTP with Gin: routes, middleware, binding, multipart uploads (-tls for HTTPS)
 go run ./websocket   # WebSocket echo
 ```
@@ -359,7 +382,7 @@ Profile columns report the mean throughput and memory across connection tiers (`
 
 - There is no write timeout, and the send buffer has no hard upper bound: a connection is not read while more than 64KB waits in it, so the replies to a client that never reads stop piling up, but what the application writes on its own (say a broadcast) still makes it grow, unless it checks `Conn.Writable` and waits for `WritableHandler.OnWritable`, as `fhttp` does (`websocket` has the same pair). Conversely, a client that writes more than the socket buffers hold before it starts reading deadlocks against a connection that echoes it, just as it would against a blocking server.
 - A request `fhttp` hands to `net/http` has `net/http`'s default timeouts, none once its header has been read: a Handler reading a streamed body bounds it with `http.ResponseController.SetReadDeadline`.
-- No HTTP/2: HTTPS is HTTP/1.1 only. No `http.Flusher` / `http.Hijacker` (a response body over 64KB goes out while it is written, in pieces of 64KB), except on connections handed to `net/http`: those with a streamed request body, and Server-Sent Events (a request whose `Accept` mentions `text/event-stream`, as `EventSource` always sends), which then cost a goroutine each, as on `net/http`.
+- `fhttp` speaks HTTP/1.x only: no HTTP/2, and no `http.Flusher` / `http.Hijacker` (a response body over 64KB goes out while it is written, in pieces of 64KB), except on connections handed to `net/http`: those with a streamed request body, and Server-Sent Events (a request whose `Accept` mentions `text/event-stream`, as `EventSource` always sends), which then cost a goroutine each, as on `net/http`. Use `http2` for HTTP/2 over TLS (ALPN `h2`) or cleartext h2c with prior knowledge.
 - A Handler writing a large body to a slow client holds a goroutine of the Handler executor while its `Write` waits, as any blocking Handler does. The default Handler executor is separate from the engine executor, so the engine can continue flushing connections while Handlers wait. If many large responses go to slow clients, configure a Handler executor with enough workers through `fhttp.Options.Executor`. On other platforms than Linux/macOS such a write blocks in the kernel, with no time limit.
 - TLS is server side only. `ftls` relies on how `crypto/tls` treats a temporary read error (the connection stays usable, and so does a record cut short), which `go test ./ftls` checks: run it after upgrading Go. A custom `fnet.Options.Executor` must not lock its goroutines to OS threads.
 - WebSocket: no permessage-deflate; messages are always sent as a single frame.
