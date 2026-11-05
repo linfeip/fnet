@@ -570,6 +570,94 @@ func TestDetach(t *testing.T) {
 	}
 }
 
+func TestDetachConcurrentRead(t *testing.T) {
+	const chunk = 4 << 10
+	h := newTestHandler()
+	var ready atomic.Bool
+	h.onData = func(c fnet.Conn, data []byte) int {
+		if len(data) < chunk {
+			return 0
+		}
+		c.PauseRead()
+		ready.Store(true)
+		return 0
+	}
+	addr := serve(t, h, 0)
+
+	c0 := dial(t, addr)
+	conn0 := wait(t, h.opened)
+	conn0.PauseRead()
+	nc0, err := conn0.Detach()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc0.Close()
+	c0.Close()
+	if _, ok := nc0.(*tls.Conn); !ok {
+		t.Fatalf("Detach with no unconsumed data returned %T, want *tls.Conn", nc0)
+	}
+
+	c := dial(t, addr)
+	conn := wait(t, h.opened)
+	payload := make([]byte, 2*chunk)
+	for i := range payload {
+		payload[i] = byte(i * 31)
+	}
+	if _, err := c.Write(payload[:chunk]); err != nil {
+		t.Fatal(err)
+	}
+	var nc net.Conn
+	for deadline := time.Now().Add(5 * time.Second); nc == nil; time.Sleep(10 * time.Millisecond) {
+		if ready.Load() {
+			if nc, err = conn.Detach(); err != nil {
+				t.Fatal(err)
+			}
+		} else if time.Now().After(deadline) {
+			t.Fatal("reading was not paused")
+		}
+	}
+	defer nc.Close()
+	nc.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Write(payload[chunk:]); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+
+	var counts [256]atomic.Int32
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 37)
+			for {
+				n, err := nc.Read(buf)
+				for _, v := range buf[:n] {
+					counts[v].Add(1)
+				}
+				if err == io.EOF {
+					return
+				}
+				if err != nil {
+					t.Errorf("Read: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	var want [256]int32
+	for _, v := range payload {
+		want[v]++
+	}
+	for i := range want {
+		if got := counts[i].Load(); got != want[i] {
+			t.Fatalf("byte %d read %d times, want %d", i, got, want[i])
+		}
+	}
+}
+
 // openConn is the little of an fnet.Conn that Handler.OnOpen and OnClose ask for.
 type openConn struct {
 	fnet.Conn

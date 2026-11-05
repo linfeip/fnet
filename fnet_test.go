@@ -1103,6 +1103,100 @@ func TestDetach(t *testing.T) {
 	}
 }
 
+// TestDetachConcurrentRead checks that concurrent Read calls on a detached connection safely drain the unconsumed data
+// and carry on reading from the socket without losing or duplicating bytes, and that Detach with no unconsumed data
+// returns the *net.TCPConn directly.
+func TestDetachConcurrentRead(t *testing.T) {
+	const chunk = 4 << 10
+	detached := make(chan net.Conn, 1)
+	opened := make(chan Conn, 1)
+	srv := startServer(t, &funcHandler{
+		open: func(c Conn) { opened <- c },
+		data: func(c Conn, b []byte) int {
+			if len(b) < chunk {
+				return 0
+			}
+			c.PauseRead()
+			go func() {
+				nc, err := c.Detach()
+				if err != nil {
+					t.Errorf("Detach: %v", err)
+				}
+				detached <- nc
+			}()
+			return 0
+		},
+	})
+
+	// Empty inbound buffer: Detach returns the *net.TCPConn without wrapping it.
+	c0 := dial(t, srv)
+	sc0 := <-opened
+	sc0.PauseRead()
+	nc0, err := sc0.Detach()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc0.Close()
+	c0.Close()
+	if _, ok := nc0.(*net.TCPConn); !ok {
+		t.Fatalf("Detach with no unconsumed data returned %T, want *net.TCPConn", nc0)
+	}
+
+	c := dial(t, srv)
+	<-opened
+	payload := make([]byte, 2*chunk)
+	for i := range payload {
+		payload[i] = byte(i * 31)
+	}
+	if _, err := c.Write(payload[:chunk]); err != nil {
+		t.Fatal(err)
+	}
+	nc := <-detached
+	if nc == nil {
+		t.Fatal("Detach failed")
+	}
+	defer nc.Close()
+	nc.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Write(payload[chunk:]); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+
+	var counts [256]atomic.Int32
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 37)
+			for {
+				n, err := nc.Read(buf)
+				for _, v := range buf[:n] {
+					counts[v].Add(1)
+				}
+				if err == io.EOF {
+					return
+				}
+				if err != nil {
+					t.Errorf("Read: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	var want [256]int32
+	for _, v := range payload {
+		want[v]++
+	}
+	for i := range want {
+		if got := counts[i].Load(); got != want[i] {
+			t.Fatalf("byte %d read %d times, want %d", i, got, want[i])
+		}
+	}
+}
+
 // TestDetachClosed checks that a connection which is closed, or whose close has been requested, cannot be detached.
 func TestDetachClosed(t *testing.T) {
 	opened := make(chan Conn, 1)

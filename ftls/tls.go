@@ -15,6 +15,7 @@ import (
 	"io"
 	"iter"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -279,6 +280,9 @@ func (c *Conn) Detach() (net.Conn, error) {
 	c.detached.Store(true)
 	in := c.plaintext.Bytes() // leaves the pool with the detached connection
 	c.plaintext = bytepool.Buffer{}
+	if len(in) == 0 {
+		return c.tlsConn, nil
+	}
 	return &detachedConn{Conn: c.tlsConn, in: in}, nil
 }
 
@@ -450,16 +454,25 @@ func (r *rawConn) SetWriteDeadline(t time.Time) error {
 // detachedConn is the connection Detach returns: Read first returns the plaintext OnData left unconsumed.
 type detachedConn struct {
 	*tls.Conn
-	in []byte
+	mu      sync.Mutex
+	in      []byte
+	drained atomic.Bool
 }
 
 func (c *detachedConn) Read(b []byte) (int, error) {
+	if c.drained.Load() {
+		return c.Conn.Read(b)
+	}
+	c.mu.Lock()
 	if len(c.in) == 0 {
+		c.mu.Unlock()
 		return c.Conn.Read(b)
 	}
 	n := copy(b, c.in)
 	if c.in = c.in[n:]; len(c.in) == 0 {
 		c.in = nil
+		c.drained.Store(true)
 	}
+	c.mu.Unlock()
 	return n, nil
 }

@@ -29,6 +29,8 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -221,17 +223,26 @@ const maxDatagramSize = 64 << 10
 // available, which net/http uses.
 type detachedConn struct {
 	*net.TCPConn
-	in []byte
+	mu      sync.Mutex
+	in      []byte
+	drained atomic.Bool
 }
 
 func (c *detachedConn) Read(b []byte) (int, error) {
+	if c.drained.Load() {
+		return c.TCPConn.Read(b)
+	}
+	c.mu.Lock()
 	if len(c.in) == 0 {
+		c.mu.Unlock()
 		return c.TCPConn.Read(b)
 	}
 	n := copy(b, c.in)
 	if c.in = c.in[n:]; len(c.in) == 0 {
 		c.in = nil
+		c.drained.Store(true)
 	}
+	c.mu.Unlock()
 	return n, nil
 }
 

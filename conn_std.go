@@ -126,6 +126,9 @@ func (c *stdConn) Detach() (net.Conn, error) {
 	c.netConnection.SetReadDeadline(time.Unix(1, 0)) // wakes a Read in progress, in case reading was not paused
 	<-done
 	c.netConnection.SetDeadline(time.Time{})
+	if len(c.in) == 0 {
+		return c.netConnection, nil
+	}
 	return &detachedConn{TCPConn: c.netConnection.(*net.TCPConn), in: c.in}, nil
 }
 

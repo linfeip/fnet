@@ -231,6 +231,9 @@ func (c *conn) Detach() (net.Conn, error) {
 			return nil, err
 		}
 	}
+	if len(in) == 0 {
+		return nc, nil
+	}
 	return &detachedConn{TCPConn: nc.(*net.TCPConn), in: in}, nil
 }
 
